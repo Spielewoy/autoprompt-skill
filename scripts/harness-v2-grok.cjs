@@ -23,10 +23,14 @@ const payloadText = (value, name) => { if (typeof value !== 'string' || !value |
 const absolute = (value, name) => { if (!path.isAbsolute(value || '')) fail(name); return value }
 const toml = value => JSON.stringify(String(value))
 function runtimeProjection(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'mcpPort,nodeExecutable,platform,skillsPath' || value.platform !== 'win32') fail('runtime projection')
-  if (!path.win32.isAbsolute(value.nodeExecutable || '') || !path.win32.isAbsolute(value.skillsPath || '')) fail('runtime projection paths')
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !['win32', 'darwin'].includes(value.platform)) fail('runtime projection')
+  const names = value.platform === 'darwin' ? 'mcpPort,nodeExecutable,platform,proxyPort,skillsPath' : 'mcpPort,nodeExecutable,platform,skillsPath'
+  if (Object.keys(value).sort().join(',') !== names) fail('runtime projection')
+  const absolutePath = value.platform === 'win32' ? path.win32.isAbsolute : path.isAbsolute
+  if (!absolutePath(value.nodeExecutable || '') || !absolutePath(value.skillsPath || '')) fail('runtime projection paths')
   if (!Number.isSafeInteger(value.mcpPort) || value.mcpPort < 1024 || value.mcpPort > 65535) fail('runtime MCP port')
-  return Object.freeze({ platform: 'win32', nodeExecutable: value.nodeExecutable, skillsPath: value.skillsPath, mcpPort: value.mcpPort })
+  if (value.platform === 'darwin' && (!Number.isSafeInteger(value.proxyPort) || value.proxyPort < 1024 || value.proxyPort > 65535 || value.proxyPort === value.mcpPort)) fail('runtime proxy port')
+  return Object.freeze({ platform: value.platform, nodeExecutable: value.nodeExecutable, skillsPath: value.skillsPath, mcpPort: value.mcpPort, ...(value.platform === 'darwin' ? { proxyPort: value.proxyPort } : {}) })
 }
 function tomlArray(values) { return `[${values.map(toml).join(',')}]` }
 function sanitizeConnection(source = {}) {
@@ -63,7 +67,7 @@ function upstreamChatCompletionsUrl(baseUrl) {
 function configText({ model, baseUrl, proxyToken, effort, maxCompletionTokens, runtimeProjection: projection }) {
   if (maxCompletionTokens !== undefined && (!Number.isSafeInteger(maxCompletionTokens) || maxCompletionTokens <= 0)) fail('max completion tokens')
   const projected = projection === undefined ? null : runtimeProjection(projection)
-  const mcp = projected ? buildGrokInlineMcpClient({ nodeExecutable: projected.nodeExecutable, port: projected.mcpPort, platform: 'win32' }) : null
+  const mcp = projected ? buildGrokInlineMcpClient({ nodeExecutable: projected.nodeExecutable, port: projected.mcpPort, host: projected.platform === 'darwin' ? '::1' : '127.0.0.1', platform: projected.platform }) : null
   const skillsPath = projected ? projected.skillsPath : '/autoprompt/session/skills'
   const command = projected ? mcp.executable : '/usr/bin/node'
   const args = projected ? mcp.argv : ['/opt/autoprompt-grok/mcp-loopback.cjs', '--port', '19778']

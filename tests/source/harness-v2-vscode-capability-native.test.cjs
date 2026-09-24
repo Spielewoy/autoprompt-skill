@@ -123,11 +123,14 @@ async function scenario(t, options = {}) {
   f.execution.checkerScratchVerifier = record => record.checkerScratchBoundary || original?.(record)
   f.run = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
-    const failedTools = [], eventTypes = [], ownedErrors = [], originalEvent = record.onEvent
+    const startedAt = Date.now()
+    const failedTools = [], eventTypes = [], eventTimings = [], ownedErrors = [], originalEvent = record.onEvent
     record.onEvent = (event, raw) => {
       if (typeof event?.type === 'string') {
         eventTypes.push(event.type.slice(0, 96))
         if (eventTypes.length > 8) eventTypes.shift()
+        eventTimings.push({ type: event.type.slice(0, 96), elapsedMs: Date.now() - startedAt })
+        if (eventTimings.length > 16) eventTimings.shift()
       }
       if (event?.type === 'owned.tool.end' && event.error === true) {
         failedTools.push({ id: event.id, output: String(event.output || '').slice(0, 4096) })
@@ -143,13 +146,15 @@ async function scenario(t, options = {}) {
       ...nativeEnvironment(),
       ...Object.fromEntries(['DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR'].filter(name => process.env[name]).map(name => [name, process.env[name]])),
     })
-    record.signal = overrides.signal || AbortSignal.timeout(120000)
+    record.signal = overrides.signal || AbortSignal.timeout(options.runTimeoutMs || 120000)
     try { return await f.execution.launch(record) } catch (error) {
       // The runner's durable transcript remains private under the fixture root.
       // Emit bounded raw bytes only for failed native probes, so CI can distinguish
       // a provider startup failure from a controller-side classification.
       t.diagnostic(JSON.stringify({ vscodeNativeFailure: { code: error?.code || null, message: error?.message || String(error), failedTools, ownedErrors, lastEventTypes: eventTypes, sessionDriver: sessionDriverDiagnostic(f, record), proxy: f.proxyDiagnostic() } }))
       throw error
+    } finally {
+      t.diagnostic(JSON.stringify({ vscodeNativeTiming: { elapsedMs: Date.now() - startedAt, modelRequests: seen.length, events: eventTimings } }))
     }
   }
   return f
@@ -162,12 +167,16 @@ function good(result) {
   assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/)
 }
 
-test('vscode native capability isolation', { skip: !enabled, timeout: 180000 }, async t => {
+test('vscode native capability isolation', { skip: !enabled, timeout: 420000 }, async t => {
   let contacted = false
   const listener = net.createServer(socket => { contacted = true; socket.destroy() })
   await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
   try {
-    const f = await scenario(t, { command: (value, challenge) => {
+    // This probe includes a cold GUI host, fresh native sandbox admission,
+    // and the tool round trip. CI134 reached the controlled tool but the old
+    // two-minute fixture cancellation cut off Windows and Intel macOS before
+    // completion. Keep a bounded native budget and record phase timings.
+    const f = await scenario(t, { runTimeoutMs: 300000, command: (value, challenge) => {
       const candidate = path.join(value.target, 'candidate.txt'), secret = path.join(value.controller, 'private.txt'), scratch = scratchFor(value)
       return nodeCommand(`const fs=require('node:fs'),net=require('node:net');const candidate=${JSON.stringify(candidate)},secret=${JSON.stringify(secret)};process.stdout.write(fs.readFileSync(candidate));fs.writeFileSync(${JSON.stringify(path.join(scratch, 'isolation.txt'))},'scratch-ok');try{fs.writeFileSync(candidate,'forbidden');process.exit(18)}catch{};try{fs.readFileSync(secret);process.exit(19)}catch{};let done=false;const finish=()=>{if(done)return;done=true;process.stdout.write(${JSON.stringify(`CLOSED_CANARY_CHALLENGE:${challenge}\n`)})};const socket=net.connect(${listener.address().port},'127.0.0.1');socket.on('connect',()=>process.exit(21));socket.on('error',finish);setTimeout(finish,500)`)
     } })

@@ -105,7 +105,34 @@ function dependencies(overrides = {}) {
     buildWorker: overrides.buildWorker || buildGrokInlineWorker,
     createLauncher: overrides.createLauncher || (options => require('../../../agents/codex/workflow/windows-appcontainer.js').createWindowsAppContainerLauncher(options)),
     resources: overrides.resources || require('../../../agents/codex/workflow/windows-appcontainer-resources.js'),
+    helperDeployment: overrides.helperDeployment || require('../../../agents/codex/workflow/windows-helper-deployment.js'),
   }
+}
+function assertTrustedHelperDeployment(controlRoot, helperDeploymentRoot, helperDeploymentBinding, deps) {
+  // Portable closure tests model Windows paths on POSIX.  Native recovery must
+  // additionally bind an external short deployment to the current token
+  // profile and its protected direct child.
+  let trusted
+  if (process.platform !== 'win32') {
+    let stat
+    try {
+      if (fs.realpathSync.native(helperDeploymentRoot) !== path.resolve(helperDeploymentRoot)) throw new Error('noncanonical')
+      stat = fs.lstatSync(helperDeploymentRoot, { bigint: true })
+    } catch { fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok helper deployment is not an authenticated private root') }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok helper deployment is not an authenticated private root')
+    trusted = { identity: { dev: String(stat.dev), ino: String(stat.ino) } }
+  } else try { trusted = deps.helperDeployment.assertTrustedWindowsHelperDeployment(controlRoot, helperDeploymentRoot) }
+  catch { fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok helper deployment is not an authenticated private root') }
+  if (trusted.identity.dev !== helperDeploymentBinding.identity.dev || trusted.identity.ino !== helperDeploymentBinding.identity.ino) {
+    fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok helper deployment identity changed')
+  }
+}
+function cleanHelperDeploymentBinding(value, expectedRoot) {
+  if (!exact(value, ['root', 'identity']) || value.root !== expectedRoot || !exact(value.identity, ['dev', 'ino']) ||
+      !/^(?:0|[1-9][0-9]*)$/u.test(value.identity.dev || '') || !/^(?:0|[1-9][0-9]*)$/u.test(value.identity.ino || '')) {
+    fail('GROK_WINDOWS_SANDBOX_INVALID', 'Grok helper cleanup binding is invalid')
+  }
+  return deepFreeze({ root: value.root, identity: { dev: value.identity.dev, ino: value.identity.ino } })
 }
 function parseSemantic(requestBinding) {
   let semantic
@@ -127,7 +154,7 @@ function verifyPersistedClosure(semantic, moduleBinding, requestBinding, launchB
   if (!sameBinding(launcher.binding, semantic.launcherBinding)) fail('GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED', 'Grok AppContainer helper binding changed')
   return launcher
 }
-function semanticLaunch(options, policy, runtime, worker, launcher, lease, binding, appNodeBinding, brokerNodeBinding, resourceJournalBinding) {
+function semanticLaunch(options, policy, runtime, worker, launcher, lease, binding, appNodeBinding, brokerNodeBinding, resourceJournalBinding, helperDeploymentBinding) {
   const workerEnvironment = closedEnvironment(options.workerEnvironment, WORKER_ENVIRONMENT, REQUIRED_WORKER_ENVIRONMENT, 'Grok worker environment')
   const systemRoot = workerEnvironment.SystemRoot
   if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) fail('GROK_WINDOWS_SANDBOX_INVALID', 'Grok worker SystemRoot is invalid')
@@ -150,6 +177,7 @@ function semanticLaunch(options, policy, runtime, worker, launcher, lease, bindi
     worker: { payloadSha256: worker.payloadSha256, moduleSha256: worker.moduleSha256, executable: worker.executable, argv: worker.argv },
     launcherBinding: launcher.binding,
     helperDeploymentRoot: options.helperDeploymentRoot,
+    helperDeploymentBinding,
     lease: { profileName: lease.profileName, profileSid: lease.profileSid, recovery: lease.recovery, resourceJournalBinding },
     appLaunch: {
       profileName: lease.profileName, profileSid: lease.profileSid,
@@ -178,6 +206,8 @@ async function prepareWindowsGrokSandbox(options = {}) {
       !exact(options.pipe, ['socketPath']) || typeof options.pipe.socketPath !== 'string' || !/^\\\\\.\\pipe\\autoprompt-grok-[a-f0-9]{64}$/u.test(options.pipe.socketPath)) {
     fail('GROK_WINDOWS_SANDBOX_INVALID', 'Grok Windows sandbox launch options are invalid')
   }
+  const helperDeploymentBinding = cleanHelperDeploymentBinding(options.helperDeploymentBinding, options.helperDeploymentRoot)
+  assertTrustedHelperDeployment(options.controlRoot, options.helperDeploymentRoot, helperDeploymentBinding, deps)
   const runtime = deps.materializeRuntime(options.runtime)
   const appNodeBinding = boundFile(options.nodeExecutable, 512 * 1024 * 1024, false)
   const brokerNodeBinding = boundFile(options.brokerNodeExecutable, 512 * 1024 * 1024, false)
@@ -210,7 +240,7 @@ async function prepareWindowsGrokSandbox(options = {}) {
   let requestBinding
   try {
     const resourceJournalBinding = boundFile(lease.recovery.journalPath, 8 * 1024 * 1024)
-    const semantic = semanticLaunch(options, policy, runtime, worker, launcher, lease, binding, appNodeBinding, brokerNodeBinding, resourceJournalBinding)
+    const semantic = semanticLaunch(options, policy, runtime, worker, launcher, lease, binding, appNodeBinding, brokerNodeBinding, resourceJournalBinding, helperDeploymentBinding)
     const moduleBinding = boundFile(__filename)
     const requestPath = path.join(options.controlRoot, `grok-broker-${lease.recovery.leaseId}.json`)
     const bytes = Buffer.from(`${JSON.stringify(semantic)}\n`)
@@ -295,6 +325,8 @@ async function recoverWindowsGrokSandbox(options = {}) {
       !/^[a-f0-9]{32}$/u.test(semantic.lease?.recovery?.leaseId || '')) {
     fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery metadata differs from its owner binding')
   }
+  const helperDeploymentBinding = cleanHelperDeploymentBinding(semantic.helperDeploymentBinding, semantic.helperDeploymentRoot)
+  assertTrustedHelperDeployment(options.controlRoot, semantic.helperDeploymentRoot, helperDeploymentBinding, deps)
   verifyPersistedClosure(semantic, moduleBinding, requestBinding, expected.launchBindingHash, deps)
   const receipt = await processOwner.issueBoundDrainReceipt(expected)
   if (processOwner.verifyBoundDrainReceipt(receipt, expected) !== true) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery drain receipt is foreign')
@@ -302,6 +334,7 @@ async function recoverWindowsGrokSandbox(options = {}) {
     leaseBinding.leaseId === semantic.lease.recovery.leaseId && processOwner.verifyBoundDrainReceipt(evidence, expected) === true
   const result = await deps.resources.recoverWindowsAppContainerResources({ controlRoot: options.controlRoot,
     deploymentRoot: options.helperDeploymentRoot, ...semantic.lease.recovery, verifyDrainEvidence, evidence: receipt })
+  deps.helperDeployment.cleanupWindowsHelperDeployment(options.controlRoot, helperDeploymentBinding)
   removeExact(requestBinding.path, requestBinding)
   return result
 }
@@ -320,10 +353,8 @@ async function recoverDiscoveredWindowsGrokSandbox(options = {}) {
   if (records.length !== 1 || !HASH.test(records[0].launchBindingHash || '')) {
     fail('PROCESS_IDENTITY_INVALID', 'Grok broker has no unique bound process reservation')
   }
-  if (path.dirname(semantic.helperDeploymentRoot || '') !== options.controlRoot ||
-      !/^native-helpers-[A-Za-z0-9]{6}$/u.test(path.basename(semantic.helperDeploymentRoot || ''))) {
-    fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok discovered helper path is outside its private deployment')
-  }
+  const helperDeploymentBinding = cleanHelperDeploymentBinding(semantic.helperDeploymentBinding, semantic.helperDeploymentRoot)
+  assertTrustedHelperDeployment(options.controlRoot, semantic.helperDeploymentRoot, helperDeploymentBinding, dependencies(options._dependencies))
   return recoverWindowsGrokSandbox({ controlRoot: options.controlRoot, brokerRequestPath: options.brokerRequestPath,
     helperDeploymentRoot: semantic.helperDeploymentRoot, processOwner: owner,
     binding: { ...binding, launchBindingHash: records[0].launchBindingHash }, _dependencies: options._dependencies })

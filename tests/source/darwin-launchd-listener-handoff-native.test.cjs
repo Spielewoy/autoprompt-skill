@@ -9,7 +9,10 @@ const path = require('node:path')
 const test = require('node:test')
 
 const ROOT = path.resolve(__dirname, '../..')
-const SOURCE = path.join(ROOT, 'tests/helpers/darwin-launchd-listener-handoff.c')
+const PRODUCTION_SUPERVISOR = process.env.AUTOPROMPT_DARWIN_LISTENER_PRODUCTION === '1'
+const SOURCE = path.join(ROOT, PRODUCTION_SUPERVISOR
+  ? 'agents/codex/workflow/darwin-launchd-listener-supervisor.c'
+  : 'tests/helpers/darwin-launchd-listener-handoff.c')
 const COALITION_SOURCE = path.join(ROOT, 'agents/codex/workflow/darwin-coalition-helper.c')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const stable = value => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value && typeof value === 'object'
@@ -130,11 +133,11 @@ const crypto=require('node:crypto'),fs=require('node:fs'),net=require('node:net'
 const stable=v=>Array.isArray(v)?'['+v.map(stable).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}':JSON.stringify(v)
 const hash=b=>crypto.createHash('sha256').update(b).digest('hex')
 const refuse=(code,message)=>{console.error(message);process.exit(code)}
-if(process.argv.length!==6||process.argv[2]!=='--job'||process.argv[4]!=='--closed-fd'||!/^\d+$/.test(process.argv[5]))refuse(64,'Node listener arguments invalid')
+const production=${JSON.stringify(PRODUCTION_SUPERVISOR)}
+if(process.argv[2]!=='--job'||(production?process.argv.length!==4:process.argv.length!==6||process.argv[4]!=='--closed-fd'||!/^\d+$/.test(process.argv[5])))refuse(64,'Node listener arguments invalid')
 const request=JSON.parse(fs.readFileSync(process.argv[3],'utf8')),copy={...request};delete copy.checksum
 if(request.checksum!==hash(stable(copy))||request.node.path!==fs.realpathSync.native(process.execPath)||request.node.sha256!==hash(fs.readFileSync(process.execPath)))refuse(65,'Node listener request binding invalid')
-const requestIdentity=fs.statSync(process.argv[3])
-try{const leaked=fs.fstatSync(Number(process.argv[5]));if(leaked.dev===requestIdentity.dev&&leaked.ino===requestIdentity.ino)refuse(68,'Unexpected request descriptor survived CLOEXEC child spawn')}catch(error){if(error.code!=='EBADF')throw error}
+if(!production){const requestIdentity=fs.statSync(process.argv[3]);try{const leaked=fs.fstatSync(Number(process.argv[5]));if(leaked.dev===requestIdentity.dev&&leaked.ino===requestIdentity.ino)refuse(68,'Unexpected request descriptor survived CLOEXEC child spawn')}catch(error){if(error.code!=='EBADF')throw error}}
 fs.appendFileSync(${JSON.stringify(startupAttempts)},String(process.pid)+'\n',{encoding:'utf8',mode:0o600})
 fs.writeFileSync(${JSON.stringify(startupMarker)},JSON.stringify({pid:process.pid,ppid:process.ppid}),{flag:'wx',mode:0o600})
 const servers=[]
@@ -197,17 +200,22 @@ Promise.all(servers.map(([key,item,server])=>new Promise((resolve,reject)=>{serv
   assert.equal(guardGeneration.uid, guardInspection.uid)
   assert.equal(guardGeneration.pidVersion, guardInspection.pidVersion)
   assert.equal(guardGeneration.resourceCoalitionId, guardInspection.resourceCoalitionId)
-  assert.notEqual(guardGeneration.resourceCoalitionId, supervisorGeneration.resourceCoalitionId,
-    'restarted launchd guard must have a separately recorded native coalition')
+  assert.notEqual(`${guardGeneration.pid}:${guardGeneration.pidVersion}`, `${supervisorGeneration.pid}:${supervisorGeneration.pidVersion}`,
+    'restarted launchd guard must have a separately recorded native process identity')
   const bootout = launchctl(['bootout', `${domain}/${label}`]); assert.equal(bootout.status, 0, bootout.stderr)
   await waitFor(() => command('/bin/kill', ['-0', String(guardPid)]).status !== 0, 10000, 'exact bootout did not terminate the marker guard')
   await waitFor(() => { const absent = launchctl(['print', `${domain}/${label}`]); return absent.status === 113 && /Could not find service/.test(absent.stderr) }, 10000,
     'launchd listener service remained after exact bootout')
-  for (const generation of [supervisorGeneration, guardGeneration]) {
+  // launchd may retain one resource coalition for successive executions of
+  // the same submitted job. Generation authority is the authenticated
+  // pid/pidVersion record; drain each distinct recorded kernel cohort once.
+  const recordedCoalitions = [...new Set([supervisorGeneration, guardGeneration].map(generation => generation.resourceCoalitionId))]
+  assert.ok(recordedCoalitions.length >= 1 && recordedCoalitions.length <= 2)
+  for (const resourceCoalitionId of recordedCoalitions) {
     await waitFor(() => {
-      const state = usage(coalitionHelper, generation.resourceCoalitionId)
+      const state = usage(coalitionHelper, resourceCoalitionId)
       return state.live === 0n && state
-    }, 10000, `generation coalition ${generation.resourceCoalitionId} retained live tasks after exact bootout`)
+    }, 10000, `generation coalition ${resourceCoalitionId} retained live tasks after exact bootout`)
   }
   submitted = false
   // Service absence and guard death precede asynchronous socket retirement;

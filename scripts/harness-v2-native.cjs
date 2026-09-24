@@ -1687,9 +1687,12 @@ function createLaunch(options) {
     // The persistent native state is deliberately narrower than the controller
     // context root. Issued-call history remains outside this writable HOME.
     const sessionHome = path.join(sessionRoot, 'grok-home')
+    const grokBaseUrl = options.grokRuntimeProjection?.platform === 'darwin'
+      ? `http://[::1]:${options.grokRuntimeProjection.proxyPort}/v1`
+      : 'http://127.0.0.1:19777/v1'
     const prepared = grok.prepare({ sessionHome, toolBoundary: options.toolBoundary,
       executable: options.executable, model: model || connection.model,
-      baseUrl: 'http://127.0.0.1:19777/v1', proxyToken, prompt, input,
+      baseUrl: grokBaseUrl, proxyToken, prompt, input,
       continuationId, effort, outputSchema: options.outputSchema, maxCompletionTokens: options.maxCompletionTokens,
       runtimeProjection: options.grokRuntimeProjection })
     for (const key of descriptor(provider).credentials) delete env[key]

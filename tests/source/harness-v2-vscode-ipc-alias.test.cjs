@@ -107,10 +107,13 @@ function fixture(t, label = 'fixture') {
 function journal(file) { return JSON.parse(fs.readFileSync(file, 'utf8')) }
 
 test('Windows alias batches only physical independent roots for each fresh audit transition', async t => {
-  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-vscode-ipc-audit-')))
-  const controllerProfile = path.join(base, 'controller-profile')
-  const target = path.join(base, 'deep-target')
-  const journalRoot = path.join(base, 'journal-root')
+  // Keep this VM fixture inside the real production alias budget.  The
+  // production controller profile can legitimately be much longer than the
+  // old descriptive test prefix.
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'wv-')))
+  const controllerProfile = path.join(base, 'p')
+  const target = path.join(base, 't')
+  const journalRoot = path.join(base, 'j')
   fs.mkdirSync(controllerProfile, { recursive: true, mode: 0o700 })
   fs.mkdirSync(target, { recursive: true, mode: 0o700 })
   fs.mkdirSync(journalRoot, { recursive: true, mode: 0o700 })
@@ -119,6 +122,7 @@ test('Windows alias batches only physical independent roots for each fresh audit
   const journalPath = path.join(journalRoot, 'vscode-ipc.json')
   t.after(() => fs.rmSync(base, { recursive: true, force: true }))
   const resource = alias.prepare({ journalPath, targetPath: target, binding, processOwner: owner })
+  assert.ok(resource.userDataDir.length < 120, 'VM fixture remains within the Windows production alias limit')
   resource.markReservationEntered()
   await resource.release()
   const selected = entry => Array.from([entry.root, ...Array.from(entry.options.additionalPaths)])
@@ -140,10 +144,10 @@ test('Windows alias batches only physical independent roots for each fresh audit
 })
 
 test('Windows alias binds a fresh root batch back to the captured target identity', t => {
-  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-vscode-ipc-race-')))
-  const controllerProfile = path.join(base, 'controller-profile')
-  const target = path.join(base, 'deep-target')
-  const journalRoot = path.join(base, 'journal-root')
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'wv-')))
+  const controllerProfile = path.join(base, 'p')
+  const target = path.join(base, 't')
+  const journalRoot = path.join(base, 'j')
   fs.mkdirSync(controllerProfile, { recursive: true, mode: 0o700 })
   fs.mkdirSync(target, { recursive: true, mode: 0o700 })
   fs.mkdirSync(journalRoot, { recursive: true, mode: 0o700 })
@@ -155,6 +159,8 @@ test('Windows alias binds a fresh root batch back to the captured target identit
   }
   const alias = loadWindowsAliasForAudit(audits, controllerProfile)
   t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const expectedAlias = path.join(controllerProfile, 'ap-vsc', sha256(stableStringify(binding)).slice(0, 32), 'u')
+  assert.ok(expectedAlias.length < 120, 'race fixture remains within the Windows production alias limit')
   assert.throws(() => alias.prepare({ journalPath: path.join(journalRoot, 'vscode-ipc.json'), targetPath: target, binding, processOwner: new FakeOwner() }), {
     code: 'VSCODE_IPC_ALIAS_UNSAFE',
   })

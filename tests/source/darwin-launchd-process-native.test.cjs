@@ -4,17 +4,66 @@ const assert = require('node:assert/strict')
 const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
+const net = require('node:net')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const vm = require('node:vm')
+const { createRequire } = require('node:module')
 
 const ROOT = path.resolve(__dirname, '../..')
 const HELPER_SOURCE = path.join(ROOT, 'agents/codex/workflow/darwin-coalition-helper.c')
 const ADAPTER_SOURCE = path.join(ROOT, 'agents/codex/workflow/darwin-launchd-process.js')
 const LOADER = require('../../agents/codex/workflow/darwin-coalition-loader.js')
 const { createPlatformProcessAdapter, ProcessOwner } = require('../../agents/codex/workflow/process-owner.js')
+const { buildDarwinGrokProfile } = require('../../scripts/harness-v2-bridge/grok/darwin-profile.cjs')
 const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
+const reservePort = () => new Promise((resolve, reject) => {
+  const server = net.createServer()
+  server.once('error', reject)
+  server.listen({ host: '::1', port: 0, ipv6Only: true }, () => {
+    const port = server.address().port
+    server.close(error => error ? reject(error) : resolve(port))
+  })
+})
+const reserveDistinctPorts = () => new Promise((resolve, reject) => {
+  const first = net.createServer(), second = net.createServer()
+  const closeAll = callback => first.close(() => second.close(callback))
+  first.once('error', reject)
+  second.once('error', reject)
+  first.listen({ host: '::1', port: 0, ipv6Only: true }, () => {
+    const firstPort = first.address().port
+    second.listen({ host: '::1', port: 0, ipv6Only: true }, () => {
+      const secondPort = second.address().port
+      closeAll(error => error ? reject(error) : resolve([firstPort, secondPort]))
+    })
+  })
+})
+const assertIPv6PortHeld = port => new Promise((resolve, reject) => {
+  const server = net.createServer()
+  server.once('error', error => {
+    if (error?.code === 'EADDRINUSE') resolve()
+    else reject(error)
+  })
+  server.listen({ host: '::1', port, ipv6Only: true }, () => {
+    server.close(() => reject(new Error(`listener port ${port} unexpectedly rebound while launchd service remained live`)))
+  })
+})
+const assertIPv6PortReleased = port => new Promise((resolve, reject) => {
+  const server = net.createServer()
+  server.once('error', reject)
+  server.listen({ host: '::1', port, ipv6Only: true }, () => server.close(error => error ? reject(error) : resolve()))
+})
+const connectEcho = (port, value) => new Promise((resolve, reject) => {
+  const socket = net.createConnection({ host: '::1', port, family: 6 })
+  let received = ''
+  socket.setTimeout(10000, () => socket.destroy(new Error('listener echo timed out')))
+  socket.once('error', reject)
+  socket.on('data', bytes => { received += bytes.toString('utf8') })
+  socket.once('connect', () => socket.end(value))
+  socket.once('close', hadError => hadError ? undefined : resolve(received))
+})
 
 function command(executable, argv, options = {}) {
   return cp.spawnSync(executable, argv, {
@@ -144,6 +193,259 @@ test('Darwin launchd plist uses the explicitly bound controller Node executable'
   const plist = launchPlist('com.autoprompt.fixture', '/private/control/request.json', node)
   assert.ok(plist.includes(`<string>${node.replace('&', '&amp;').replace('<', '&lt;')}</string>`))
   assert.equal(plist.includes(`<string>${process.execPath}</string>`), node === process.execPath)
+})
+
+test('Darwin retained listener descriptor requires the exact FD3 and FD4 IPv6 pair', () => {
+  const { validateDarwinListeners } = require('../../agents/codex/workflow/darwin-launchd-process.js')
+  const descriptor = { proxy: { fd: 3, host: '::1', port: 19777 }, mcp: { fd: 4, host: '::1', port: 19778 } }
+  const validated = validateDarwinListeners(descriptor)
+  assert.deepEqual(validated, descriptor)
+  assert.equal(Object.isFrozen(validated), true)
+  assert.equal(Object.isFrozen(validated.proxy), true)
+  for (const changed of [
+    { proxy: descriptor.proxy },
+    { ...descriptor, extra: true },
+    { ...descriptor, proxy: { ...descriptor.proxy, fd: 4 } },
+    { ...descriptor, mcp: { ...descriptor.mcp, host: '127.0.0.1' } },
+    { ...descriptor, mcp: { ...descriptor.mcp, port: descriptor.proxy.port } },
+    { ...descriptor, proxy: { ...descriptor.proxy, extra: true } },
+  ]) assert.throws(() => validateDarwinListeners(changed), { code: 'LAUNCH_SPEC_INVALID' })
+})
+
+test('production Darwin listener supervisor publishes generation authority before socket activation', () => {
+  const source = fs.readFileSync(path.join(ROOT, 'agents/codex/workflow/darwin-launchd-listener-supervisor.c'), 'utf8')
+  assert.match(source, /publish_generation\(argv\[8\], argv\[7\]\)/)
+  assert.ok(source.indexOf('publish_generation(argv[8], argv[7])') < source.indexOf('acquire(MODEL_SOCKET'))
+  assert.match(source, /dup2\(model_copy, 3\)/)
+  assert.match(source, /dup2\(mcp_copy, 4\)/)
+  assert.match(source, /POSIX_SPAWN_CLOEXEC_DEFAULT/)
+  assert.doesNotMatch(source, /closed-fd|forbidden/)
+})
+
+test('Darwin generation inventory rejects permissive records and linked directory replacement', { skip: process.platform === 'win32' }, t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-darwin-generation-reader-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.chmodSync(root, 0o700)
+  const generationDirectory = path.join(root, 'generations'), foreignDirectory = path.join(root, 'foreign')
+  fs.mkdirSync(generationDirectory, { mode: 0o700 }); fs.mkdirSync(foreignDirectory, { mode: 0o700 })
+  const requestSha256 = 'a'.repeat(64), record = { schemaVersion: 1, requestSha256, pid: 41,
+    uid: process.getuid(), pidVersion: 7, resourceCoalitionId: '91' }
+  const recordPath = path.join(generationDirectory, 'generation-41-7.json')
+  fs.writeFileSync(recordPath, `${JSON.stringify(record)}\n`, { flag: 'wx', mode: 0o600 })
+  const module = { exports: {} }, localRequire = createRequire(ADAPTER_SOURCE)
+  vm.runInNewContext(`${fs.readFileSync(ADAPTER_SOURCE, 'utf8')}\nmodule.exports.readGenerationRecordsForTest=readGenerationRecords`, {
+    module, exports: module.exports, require: localRequire, __filename: ADAPTER_SOURCE, __dirname: path.dirname(ADAPTER_SOURCE),
+    process, Buffer, setTimeout, clearTimeout, SharedArrayBuffer, Atomics,
+  }, { filename: ADAPTER_SOURCE })
+  const read = module.exports.readGenerationRecordsForTest
+  assert.equal(read(generationDirectory, requestSha256, process.getuid()).length, 1)
+  fs.chmodSync(recordPath, 0o644)
+  assert.throws(() => read(generationDirectory, requestSha256, process.getuid()), { code: 'PROCESS_IDENTITY_INVALID' })
+  fs.chmodSync(recordPath, 0o600)
+  let recordStats = 0
+  const replacingRecordFs = { ...fs, lstatSync(pathname, ...args) {
+    if (pathname === recordPath && ++recordStats === 2) {
+      const bytes = fs.readFileSync(recordPath), held = `${recordPath}.held`
+      fs.renameSync(recordPath, held)
+      fs.writeFileSync(recordPath, bytes, { flag: 'wx', mode: 0o600 })
+    }
+    return fs.lstatSync(pathname, ...args)
+  } }
+  const recordModule = { exports: {} }
+  vm.runInNewContext(`${fs.readFileSync(ADAPTER_SOURCE, 'utf8')}\nmodule.exports.readGenerationRecordsForTest=readGenerationRecords`, {
+    module: recordModule, exports: recordModule.exports,
+    require: name => name === 'node:fs' ? replacingRecordFs : localRequire(name),
+    __filename: ADAPTER_SOURCE, __dirname: path.dirname(ADAPTER_SOURCE), process, Buffer, setTimeout, clearTimeout, SharedArrayBuffer, Atomics,
+  }, { filename: ADAPTER_SOURCE })
+  assert.throws(() => recordModule.exports.readGenerationRecordsForTest(generationDirectory, requestSha256, process.getuid()), { code: 'PROCESS_IDENTITY_CHANGED' })
+  fs.unlinkSync(recordPath)
+  fs.renameSync(`${recordPath}.held`, recordPath)
+  fs.renameSync(generationDirectory, path.join(root, 'held-generations'))
+  fs.symlinkSync(foreignDirectory, generationDirectory, 'dir')
+  assert.throws(() => read(generationDirectory, requestSha256, process.getuid()), { code: 'PROCESS_IDENTITY_INVALID' })
+  fs.unlinkSync(generationDirectory)
+  fs.renameSync(path.join(root, 'held-generations'), generationDirectory)
+  let directoryStats = 0
+  const replacingFs = { ...fs, lstatSync(pathname, ...args) {
+    if (pathname === generationDirectory && ++directoryStats === 2) {
+      fs.renameSync(generationDirectory, path.join(root, 'replaced-generations'))
+      fs.mkdirSync(generationDirectory, { mode: 0o700 })
+    }
+    return fs.lstatSync(pathname, ...args)
+  } }
+  const replacedModule = { exports: {} }
+  vm.runInNewContext(`${fs.readFileSync(ADAPTER_SOURCE, 'utf8')}\nmodule.exports.readGenerationRecordsForTest=readGenerationRecords`, {
+    module: replacedModule, exports: replacedModule.exports,
+    require: name => name === 'node:fs' ? replacingFs : localRequire(name),
+    __filename: ADAPTER_SOURCE, __dirname: path.dirname(ADAPTER_SOURCE), process, Buffer, setTimeout, clearTimeout, SharedArrayBuffer, Atomics,
+  }, { filename: ADAPTER_SOURCE })
+  assert.throws(() => replacedModule.exports.readGenerationRecordsForTest(generationDirectory, requestSha256, process.getuid()), { code: 'PROCESS_IDENTITY_CHANGED' })
+})
+
+test('Darwin adapter hands retained listeners through FD3 and FD4 and drains the final generation inventory', {
+  skip: process.platform !== 'darwin' && 'requires native macOS',
+  timeout: 120000,
+}, async t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join('/private/tmp', 'ap-darwin-listener-adapter-')))
+  fs.chmodSync(root, 0o700)
+  const controlRoot = path.join(root, 'control'), supervisor = path.join(root, 'listener-supervisor')
+  const script = path.join(root, 'listener-child.cjs'), observed = path.join(root, 'observed.json')
+  const compiler = requireSuccess(command('/usr/bin/xcrun', ['--find', 'clang']), 'locate clang').stdout.trim()
+  const sdk = requireSuccess(command('/usr/bin/xcrun', ['--show-sdk-path']), 'read SDK path').stdout.trim()
+  requireSuccess(command(compiler, ['-isysroot', sdk, '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
+    path.join(ROOT, 'agents/codex/workflow/darwin-launchd-listener-supervisor.c'), '-o', supervisor]), 'compile listener supervisor')
+  const node = fs.realpathSync.native(process.execPath)
+  fs.writeFileSync(script, String.raw`'use strict'
+const fs=require('node:fs'),net=require('node:net')
+const values=[]
+Promise.all([[3,'proxy'],[4,'mcp']].map(([fd,name])=>new Promise((resolve,reject)=>{const server=net.createServer();server.once('error',reject);server.listen({fd,exclusive:true},()=>{const address=server.address();values.push({name,address});resolve(server)})}))).then(servers=>{
+  fs.writeFileSync(process.argv[2],JSON.stringify(values),{flag:'wx',mode:0o600})
+  setTimeout(()=>Promise.all(servers.map(server=>new Promise(resolve=>server.close(resolve)))).then(()=>process.exit(0)),100)
+}).catch(error=>{console.error(error.stack||error);process.exit(70)})
+`, { mode: 0o600 })
+  const helper = LOADER.loadDarwinCoalitionHelper()
+  const { createDarwinCoalitionAdapter } = require('../../agents/codex/workflow/darwin-launchd-process.js')
+  const adapter = createDarwinCoalitionAdapter({ controlRoot, providerPrivateOwnershipRoot: root, helper,
+    listenerSupervisor: { path: supervisor, sha256: sha256(fs.readFileSync(supervisor)) } })
+  const reservationId = `listener-${crypto.randomUUID()}`
+  const record = { reservationId, reservationIdentity: adapter.reservationIdentity(reservationId),
+    startupDeadlineAt: new Date(Date.now() + 60000).toISOString(), targetKey: 'darwin-listener-adapter' }
+  record.reservationBinding = adapter.prepareReservation(record)
+  const [proxyPort, mcpPort] = await reserveDistinctPorts()
+  const listeners = { proxy: { fd: 3, host: '::1', port: proxyPort }, mcp: { fd: 4, host: '::1', port: mcpPort } }
+  let owned = null, drained = false, spawnAttempted = false
+  t.after(async () => {
+    if (owned && !drained) {
+      try {
+        await adapter.signalOwned(owned.groupIdentity, 'KILL')
+        await waitFor(async () => (await adapter.listOwned(owned.groupIdentity)).length === 0, 30000,
+          'fixture cleanup did not drain its exact retained listener service')
+        drained = true
+      } catch {
+        // An uncertain listener service retains the full authenticated control
+        // tree for recovery; root PID death alone is not cleanup authority.
+      }
+    }
+    if (drained || !spawnAttempted) fs.rmSync(root, { recursive: true, force: true })
+    else t.diagnostic?.('retained listener fixture root because spawn ownership was uncertain')
+  })
+  spawnAttempted = true
+  owned = await adapter.spawnOwned({ ...record, executable: node, argv: [script, observed], cwd: root,
+    env: { AUTOPROMPT_OWNERSHIP_RESERVATION: reservationId, AUTOPROMPT_GROK_PROXY_LISTENER_FD: '3',
+      AUTOPROMPT_GROK_MCP_LISTENER_FD: '4', AUTOPROMPT_GROK_PROXY_PORT: String(proxyPort), AUTOPROMPT_GROK_MCP_PORT: String(mcpPort) },
+    shell: false, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', darwinListeners: listeners })
+  const addresses = await waitFor(() => fs.existsSync(observed) && JSON.parse(fs.readFileSync(observed, 'utf8')), 30000,
+    'listener child did not publish inherited endpoints')
+  assert.deepEqual(addresses.map(value => [value.name, value.address.address, value.address.family, value.address.port]).sort(), [
+    ['mcp', '::1', 'IPv6', mcpPort], ['proxy', '::1', 'IPv6', proxyPort],
+  ])
+  const reservationDirectory = path.join(controlRoot, sha256(reservationId))
+  const request = JSON.parse(fs.readFileSync(path.join(reservationDirectory, 'request.json'), 'utf8'))
+  await waitFor(() => fs.existsSync(path.join(reservationDirectory, 'exit.json')), 30000,
+    'C supervisor did not reap the completed Node job')
+  const liveService = command('/bin/launchctl', ['print', `${request.domain}/${request.label}`])
+  assert.equal(liveService.status, 0, liveService.stderr)
+  await assertIPv6PortHeld(proxyPort)
+  await assertIPv6PortHeld(mcpPort)
+  await waitFor(async () => (await adapter.listOwned(owned.groupIdentity)).length === 0, 30000,
+    'authenticated child exit did not boot out and drain listener generations')
+  drained = true
+  const absentService = command('/bin/launchctl', ['print', `${request.domain}/${request.label}`])
+  assert.equal(absentService.status, 113, absentService.stderr)
+  await assertIPv6PortReleased(proxyPort)
+  await assertIPv6PortReleased(mcpPort)
+  assert.deepEqual(request.listeners, listeners)
+  assert.equal(request.listenerSupervisor.sha256, sha256(fs.readFileSync(supervisor)))
+  const generations = fs.readdirSync(path.join(reservationDirectory, 'generations')).filter(name => name.startsWith('generation-'))
+  assert.ok(generations.length >= 1)
+})
+
+test('Darwin Grok Seatbelt profile adopts only the retained IPv6 FD3/FD4 listeners', {
+  skip: process.platform !== 'darwin' && 'requires native macOS',
+  timeout: 120000,
+}, async t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join('/private/tmp', 'ap-darwin-grok-profile-')))
+  fs.chmodSync(root, 0o700)
+  const home = path.join(root, 'home'), cwd = path.join(root, 'cwd'), scratch = path.join(root, 'scratch')
+  const controlRoot = path.join(root, 'control'), supervisor = path.join(root, 'listener-supervisor')
+  for (const directory of [home, cwd, scratch, controlRoot]) fs.mkdirSync(directory, { mode: 0o700 })
+  const script = path.join(cwd, 'listener-child.cjs'), observed = path.join(home, 'observed.json')
+  const secret = path.join(root, 'controller-secret'), profilePath = path.join(home, 'grok.sb'), errorPath = path.join(home, 'child-error.json')
+  fs.writeFileSync(secret, 'controller-only-secret', { mode: 0o600 })
+  const compiler = requireSuccess(command('/usr/bin/xcrun', ['--find', 'clang']), 'locate clang').stdout.trim()
+  const sdk = requireSuccess(command('/usr/bin/xcrun', ['--show-sdk-path']), 'read SDK path').stdout.trim()
+  requireSuccess(command(compiler, ['-isysroot', sdk, '-mmacosx-version-min=13.5', '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2',
+    path.join(ROOT, 'agents/codex/workflow/darwin-launchd-listener-supervisor.c'), '-o', supervisor]), 'compile listener supervisor')
+  const node = fs.realpathSync.native(process.execPath)
+  const [proxyPort, mcpPort] = await reserveDistinctPorts()
+  const listeners = { proxy: { fd: 3, host: '::1', port: proxyPort }, mcp: { fd: 4, host: '::1', port: mcpPort } }
+  fs.writeFileSync(profilePath, buildDarwinGrokProfile({ nodeExecutable: node, grokExecutable: '/usr/bin/true', home, cwd, scratch, proxyPort, mcpPort }), { mode: 0o600 })
+  // Report profile/parser and Node startup errors directly; the owned job's
+  // ignored stdio cannot expose a failure that happens before the child runs.
+  const preflight = requireSuccess(command('/usr/bin/sandbox-exec', ['-f', profilePath, node, '-e', 'process.stdout.write("profile-ready")'], { cwd, env: {} }), 'validate Grok Seatbelt profile and Node startup')
+  assert.equal(preflight.stdout, 'profile-ready')
+  fs.writeFileSync(script, String.raw`'use strict'
+const fs=require('node:fs'),net=require('node:net')
+const observed=process.argv[2], secret=process.argv[3], errorPath=process.argv[4]
+const fail=error=>{try{fs.writeFileSync(errorPath,JSON.stringify({code:String(error&&error.code||'ERROR').slice(0,64),message:String(error&&error.message||error).replace(/[\r\n]+/g,' ').slice(0,256)}),{flag:'wx',mode:0o600})}catch{};process.exit(70)}
+let secretCode='READABLE'
+try{
+ try{fs.readFileSync(secret)}catch(error){secretCode=String(error.code||'ERROR')}
+ if(!['EACCES','EPERM'].includes(secretCode))throw Object.assign(new Error('controller secret was not denied'),{code:secretCode})
+ const values=[],servers=[];let completed=0
+ for(const [fd,name] of [[3,'proxy'],[4,'mcp']]){
+  const server=net.createServer(socket=>{let text='';socket.on('error',fail);socket.on('data',b=>text+=b);socket.on('end',()=>{socket.end(name+':'+text);if(++completed===2)Promise.all(servers.map(s=>new Promise(resolve=>s.close(resolve)))).catch(fail)})})
+  server.once('error',fail)
+  server.listen({fd,exclusive:true},()=>{try{const address=server.address();values.push({name,address});servers.push(server);if(values.length===2)fs.writeFileSync(observed,JSON.stringify({values,secretCode,ready:true}),{flag:'wx',mode:0o600})}catch(error){fail(error)}})
+ }
+}catch(error){fail(error)}
+`, { mode: 0o600 })
+  const helper = LOADER.loadDarwinCoalitionHelper()
+  const { createDarwinCoalitionAdapter } = require('../../agents/codex/workflow/darwin-launchd-process.js')
+  const adapter = createDarwinCoalitionAdapter({ controlRoot, providerPrivateOwnershipRoot: root, helper,
+    listenerSupervisor: { path: supervisor, sha256: sha256(fs.readFileSync(supervisor)) } })
+  const reservationId = `grok-profile-${crypto.randomUUID()}`
+  const record = { reservationId, reservationIdentity: adapter.reservationIdentity(reservationId),
+    startupDeadlineAt: new Date(Date.now() + 60000).toISOString(), targetKey: 'darwin-grok-profile' }
+  record.reservationBinding = adapter.prepareReservation(record)
+  let owned = null, drained = false, spawnAttempted = false
+  t.after(async () => {
+    if (owned && !drained) {
+      try {
+        await adapter.signalOwned(owned.groupIdentity, 'KILL')
+        await waitFor(async () => (await adapter.listOwned(owned.groupIdentity)).length === 0, 30000,
+          'profile fixture cleanup did not drain its exact retained listener service')
+        drained = true
+      } catch {}
+    }
+    if (drained || !spawnAttempted) fs.rmSync(root, { recursive: true, force: true })
+    else t.diagnostic?.('retained Grok profile fixture root because spawn ownership was uncertain')
+  })
+  spawnAttempted = true
+  owned = await adapter.spawnOwned({ ...record, executable: '/usr/bin/sandbox-exec', argv: ['-f', profilePath, node, script, observed, secret, errorPath], cwd,
+    env: { AUTOPROMPT_OWNERSHIP_RESERVATION: reservationId, AUTOPROMPT_GROK_PROXY_LISTENER_FD: '3',
+      AUTOPROMPT_GROK_MCP_LISTENER_FD: '4', AUTOPROMPT_GROK_PROXY_PORT: String(proxyPort), AUTOPROMPT_GROK_MCP_PORT: String(mcpPort) },
+    shell: false, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore', darwinListeners: listeners })
+  const ready = await waitFor(() => {
+    if (fs.existsSync(observed)) {
+      const value = JSON.parse(fs.readFileSync(observed, 'utf8'))
+      if (value.ready === true) return value
+    }
+    if (fs.existsSync(errorPath)) throw new Error(`Seatbelt child failed: ${fs.readFileSync(errorPath, 'utf8')}`)
+    return false
+  }, 30000,
+    'Seatbelt Grok listener child did not publish its FD adoption receipt')
+  assert.deepEqual(ready.values.map(value => [value.name, value.address.address, value.address.family, value.address.port]).sort(), [
+    ['mcp', '::1', 'IPv6', mcpPort], ['proxy', '::1', 'IPv6', proxyPort],
+  ])
+  assert.ok(['EACCES', 'EPERM'].includes(ready.secretCode), `Seatbelt child did not receive a permission denial for the controller secret: ${ready.secretCode}`)
+  assert.equal(await connectEcho(proxyPort, 'proxy-request'), 'proxy:proxy-request')
+  assert.equal(await connectEcho(mcpPort, 'mcp-request'), 'mcp:mcp-request')
+  await waitFor(async () => (await adapter.listOwned(owned.groupIdentity)).length === 0, 30000,
+    'profile child completion did not drain the exact retained listener service')
+  drained = true
+  await assertIPv6PortReleased(proxyPort)
+  await assertIPv6PortReleased(mcpPort)
 })
 
 test('native packaged Darwin launchd coalition factory survives root death and a fresh adapter drains detached children', {

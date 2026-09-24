@@ -68,6 +68,12 @@ test('Grok Windows runtime projection emits private paths and an inline MCP comm
   assert.throws(() => grok.configText({ ...base, runtimeProjection: { platform: 'win32', nodeExecutable: 'node.exe', skillsPath: 'C:\\skills', mcpPort: 19778 } }), /runtime projection paths/)
   assert.throws(() => grok.configText({ ...base, runtimeProjection: { platform: 'win32', nodeExecutable: 'C:\\node.exe', skillsPath: 'C:\\skills', mcpPort: 80 } }), /runtime MCP port/)
   assert.throws(() => grok.configText({ ...base, runtimeProjection: { platform: 'linux', nodeExecutable: '/usr/bin/node', skillsPath: '/skills', mcpPort: 19778 } }), /runtime projection/)
+  const darwin = grok.configText({ ...base, baseUrl: 'http://[::1]:19777/v1', runtimeProjection: { platform: 'darwin', nodeExecutable: '/private/node', skillsPath: '/private/skills', mcpPort: 19778, proxyPort: 19777 } })
+  assert.match(darwin, /base_url="http:\/\/\[::1\]:19777\/v1"/)
+  assert.match(darwin, /paths=\["\/private\/skills"\]/)
+  assert.match(darwin, /"--host","::1"/)
+  assert.throws(() => grok.configText({ ...base, runtimeProjection: { platform: 'darwin', nodeExecutable: '/private/node', skillsPath: '/private/skills', mcpPort: 19778, proxyPort: 19778 } }), /runtime proxy port/)
+  assert.throws(() => grok.configText({ ...base, runtimeProjection: { platform: 'darwin', nodeExecutable: 'node', skillsPath: '/private/skills', mcpPort: 19778, proxyPort: 19777 } }), /runtime projection paths/)
 })
 
 test('Grok sends the closed canonicalJson envelope around the authenticated checker wire projection', () => {

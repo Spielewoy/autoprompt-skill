@@ -485,7 +485,8 @@ function codexDarwinAssets(workflowDirectory) {
   // headers, deployment target, and physical paths before packaging any bytes.
   require('../agents/codex/workflow/darwin-coalition-loader.js').validateDarwinCoalitionRuntime(
     runtime, 'x64', path.join(workflowDirectory, 'darwin-coalition-helper.c'))
-  return ['workflow/darwin-coalition-helper.c', ...expected.map(file => `workflow/darwin-coalition-runtime/${file}`)]
+  return ['workflow/darwin-coalition-helper.c', 'workflow/darwin-launchd-listener-supervisor.c',
+    ...expected.map(file => `workflow/darwin-coalition-runtime/${file}`)]
 }
 
 function codexRuntimeFiles(root = ROOT) {

@@ -176,8 +176,8 @@ async function prepareLaunch(options = {}) {
   const stage = options._dependencies?.stageWindowsHelperDeployment || require('../../../agents/codex/workflow/windows-helper-deployment.js').stageWindowsHelperDeployment
   let staged
   try {
-    staged = stage(roots.control)
-    const sandboxOptions = { processOwner, binding, controlRoot: roots.control, helperDeploymentRoot: staged.root, brokerNodeExecutable: session.brokerNodeExecutable,
+    staged = stage(roots.control, { shortPrivateRoot: true })
+    const sandboxOptions = { processOwner, binding, controlRoot: roots.control, helperDeploymentRoot: staged.root, helperDeploymentBinding: staged.cleanupBinding, brokerNodeExecutable: session.brokerNodeExecutable,
     brokerNodeSha256: session.brokerNodeSha256, brokerCwd: roots.broker, brokerEnvironment, nodeExecutable: session.nodeExecutable,
     nodeExecutableSha256: session.nodeExecutableSha256, nodeArgs: [], workerArgs: spec.argv, runtime, policy: { readOnly: false, targetPath: roots.cwd,
       scratchPath: roots.scratch, readableRoots: [roots.cwd, roots.scratch, roots.home], writableRoots: [roots.cwd, roots.scratch, roots.home] }, workerEnvironment,

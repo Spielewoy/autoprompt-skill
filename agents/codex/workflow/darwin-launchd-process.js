@@ -8,12 +8,13 @@ const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
-const { atomicWriteJson, stableStringify } = require('./event-log.js')
+const { atomicWriteJson, checksumRecord, stableStringify } = require('./event-log.js')
 const { auditPrivatePermissions, inspectPathNoFollow, pathIsInside } = require('./safe-run-root.js')
 const HASH = /^[a-f0-9]{64}$/
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i
 const DECIMAL = /^(0|[1-9][0-9]*)$/
 const kind = 'darwin-launchd-coalition'
+const LISTENER_NAMES = Object.freeze({ proxy: 'autoprompt.model', mcp: 'autoprompt.mcp' })
 const digest = value => crypto.createHash('sha256').update(value).digest('hex')
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 function requestDigest(request) { const body = { ...request }; delete body.checksum; return digest(stableStringify(body)) }
@@ -40,6 +41,62 @@ function writeExclusive(file, value) {
   const fd = fs.openSync(file, 'wx', 0o600)
   try { fs.writeFileSync(fd, JSON.stringify(value) + '\n'); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
 }
+function readGenerationRecords(generationDirectory, requestSha256, expectedUid, options = {}) {
+  let directoryItem, canonical, names
+  try { directoryItem = fs.lstatSync(generationDirectory); canonical = fs.realpathSync.native(generationDirectory); names = fs.readdirSync(generationDirectory).sort() } catch (error) {
+    if (options.allowMissing && error?.code === 'ENOENT') return []
+    fail('PROCESS_IDENTITY_INVALID', 'Darwin listener generation inventory is unavailable')
+  }
+  if (!directoryItem.isDirectory() || directoryItem.isSymbolicLink() || canonical !== generationDirectory || directoryItem.uid !== expectedUid || directoryItem.mode & 0o077 || names.length > 16) {
+    fail('PROCESS_IDENTITY_INVALID', 'Darwin listener generation directory is unsafe')
+  }
+  const seen = new Set(), result = []
+  for (const name of names) {
+    if (!/^generation-[1-9][0-9]*--?[0-9]+[.]json$/.test(name)) fail('PROCESS_IDENTITY_INVALID', 'Darwin listener generation inventory contains an unknown record')
+    const file = path.join(generationDirectory, name), named = fs.lstatSync(file)
+    if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.uid !== expectedUid || (named.mode & 0o777) !== 0o600 || named.size < 1 || named.size > 1024) {
+      fail('PROCESS_IDENTITY_INVALID', 'Darwin listener generation record identity is unsafe')
+    }
+    const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+    let value
+    try {
+      const opened = fs.fstatSync(descriptor)
+      if (!opened.isFile() || opened.dev !== named.dev || opened.ino !== named.ino || opened.nlink !== 1 || opened.uid !== expectedUid ||
+          (opened.mode & 0o777) !== 0o600 || opened.size !== named.size) fail('PROCESS_IDENTITY_CHANGED', 'Darwin listener generation record changed while opening')
+      const bytes = Buffer.alloc(opened.size)
+      if (fs.readSync(descriptor, bytes, 0, bytes.length, 0) !== bytes.length || fs.readSync(descriptor, Buffer.alloc(1), 0, 1, bytes.length) !== 0) {
+        fail('PROCESS_IDENTITY_CHANGED', 'Darwin listener generation record changed while reading')
+      }
+      const after = fs.fstatSync(descriptor)
+      if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) {
+        fail('PROCESS_IDENTITY_CHANGED', 'Darwin listener generation record changed while reading')
+      }
+      try { value = JSON.parse(bytes.toString('utf8')) } catch { fail('PROCESS_IDENTITY_INVALID', 'Darwin listener generation record JSON is invalid') }
+    } finally { fs.closeSync(descriptor) }
+    let namedAfter
+    try { namedAfter = fs.lstatSync(file) } catch { fail('PROCESS_IDENTITY_CHANGED', 'Darwin listener generation record disappeared while reading') }
+    if (!namedAfter.isFile() || namedAfter.isSymbolicLink() || namedAfter.dev !== named.dev || namedAfter.ino !== named.ino ||
+        namedAfter.nlink !== 1 || namedAfter.uid !== named.uid || namedAfter.mode !== named.mode || namedAfter.size !== named.size) {
+      fail('PROCESS_IDENTITY_CHANGED', 'Darwin listener generation record name changed while reading')
+    }
+    if (!exactObject(value, ['schemaVersion', 'requestSha256', 'pid', 'uid', 'pidVersion', 'resourceCoalitionId']) || value.schemaVersion !== 1 ||
+        value.requestSha256 !== requestSha256 || !Number.isSafeInteger(value.pid) || value.pid < 1 || value.uid !== expectedUid ||
+        !Number.isSafeInteger(value.pidVersion) || !DECIMAL.test(value.resourceCoalitionId || '') || value.resourceCoalitionId === '0' ||
+        name !== `generation-${value.pid}-${value.pidVersion}.json`) fail('PROCESS_IDENTITY_INVALID', 'Darwin listener generation record is invalid')
+    const processIdentity = `${value.pid}:${value.pidVersion}`
+    if (seen.has(processIdentity)) fail('PROCESS_IDENTITY_INVALID', 'Darwin listener generation identity is duplicated')
+    seen.add(processIdentity); result.push(Object.freeze(value))
+  }
+  let afterDirectory, afterCanonical, afterNames
+  try { afterDirectory = fs.lstatSync(generationDirectory); afterCanonical = fs.realpathSync.native(generationDirectory); afterNames = fs.readdirSync(generationDirectory).sort() } catch {
+    fail('PROCESS_IDENTITY_CHANGED', 'Darwin listener generation directory changed while reading')
+  }
+  if (!afterDirectory.isDirectory() || afterDirectory.isSymbolicLink() || afterDirectory.dev !== directoryItem.dev || afterDirectory.ino !== directoryItem.ino ||
+      afterDirectory.uid !== directoryItem.uid || afterDirectory.mode !== directoryItem.mode || afterCanonical !== canonical || stableStringify(afterNames) !== stableStringify(names)) {
+    fail('PROCESS_IDENTITY_CHANGED', 'Darwin listener generation directory changed while reading')
+  }
+  return result
+}
 function readBoundExecutable(binding) {
   if (!binding || typeof binding !== 'object' || Array.isArray(binding) || Object.keys(binding).sort().join(',') !== 'path,sha256' ||
       !path.isAbsolute(binding.path || '') || !HASH.test(binding.sha256 || '')) fail('PROVIDER_UNSUPPORTED', 'Darwin helper requires an exact executable binding')
@@ -55,9 +112,9 @@ function readBoundExecutable(binding) {
     return bytes
   } finally { fs.closeSync(descriptor) }
 }
-function materializeHelper(binding, controlRoot) {
+function materializeExecutable(binding, controlRoot, prefix) {
   const bytes = readBoundExecutable(binding)
-  const target = path.join(controlRoot, `coalition-helper-${binding.sha256}`)
+  const target = path.join(controlRoot, `${prefix}-${binding.sha256}`)
   if (!fs.existsSync(target)) {
     const descriptor = fs.openSync(target, 'wx', 0o500)
     try { fs.writeFileSync(descriptor, bytes); fs.fsyncSync(descriptor) } finally { fs.closeSync(descriptor) }
@@ -65,9 +122,10 @@ function materializeHelper(binding, controlRoot) {
   const privateBinding = { path: target, sha256: binding.sha256 }
   readBoundExecutable(privateBinding)
   const privateStats = fs.lstatSync(target)
-  if (!privateStats.isFile() || privateStats.isSymbolicLink() || privateStats.nlink !== 1 || (privateStats.mode & 0o277) !== 0) fail('PROCESS_IDENTITY_CHANGED', 'Private Darwin helper permissions are unsafe')
+  if (!privateStats.isFile() || privateStats.isSymbolicLink() || privateStats.nlink !== 1 || (privateStats.mode & 0o277) !== 0) fail('PROCESS_IDENTITY_CHANGED', 'Private Darwin executable permissions are unsafe')
   return Object.freeze(privateBinding)
 }
+function materializeHelper(binding, controlRoot) { return materializeExecutable(binding, controlRoot, 'coalition-helper') }
 function boundExecutable(binding) {
   readBoundExecutable(binding)
   return binding.path
@@ -112,8 +170,34 @@ function xml(value) {
   if (typeof value !== 'string' || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(value)) fail('LAUNCH_SPEC_INVALID', 'Darwin launch argument is not XML-safe text')
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;')
 }
+function exactObject(value, fields) {
+  return value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).sort().join('\0') === fields.slice().sort().join('\0')
+}
+function darwinListeners(value, optional = false) {
+  if (value === undefined && optional) return null
+  if (!exactObject(value, ['proxy', 'mcp'])) fail('LAUNCH_SPEC_INVALID', 'Darwin listeners must be an exact proxy/MCP pair')
+  const result = {}
+  for (const [name, fd] of [['proxy', 3], ['mcp', 4]]) {
+    const listener = value[name]
+    if (!exactObject(listener, ['fd', 'host', 'port']) || listener.fd !== fd || listener.host !== '::1' ||
+        !Number.isSafeInteger(listener.port) || listener.port < 1024 || listener.port > 65535) {
+      fail('LAUNCH_SPEC_INVALID', `Darwin ${name} listener binding is invalid`)
+    }
+    result[name] = Object.freeze({ fd, host: '::1', port: listener.port })
+  }
+  if (result.proxy.port === result.mcp.port) fail('LAUNCH_SPEC_INVALID', 'Darwin listener ports must be distinct')
+  return Object.freeze(result)
+}
 function launchPlist(label, requestPath, nodePath = process.execPath) {
   return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${[nodePath, __filename, '--job', requestPath].map(value => `<string>${xml(value)}</string>`).join('')}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string></dict></plist>`
+}
+function listenerLaunchPlist(request, requestPath, supervisorPath, nodePath) {
+  const argumentsXml = [supervisorPath, String(request.listeners.proxy.port), String(request.listeners.mcp.port), nodePath,
+    __filename, requestPath, request.listenerMarker, request.checksum, request.generationDirectory]
+    .map(value => `<string>${xml(value)}</string>`).join('')
+  const socket = (name, listener) => `<key>${xml(name)}</key><dict><key>SockNodeName</key><string>::1</string><key>SockServiceName</key><string>${listener.port}</string><key>SockFamily</key><string>IPv6</string><key>SockType</key><string>stream</string><key>SockProtocol</key><string>TCP</string></dict>`
+  return `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>Label</key><string>${xml(request.label)}</string><key>ProgramArguments</key><array>${argumentsXml}</array><key>RunAtLoad</key><true/><key>KeepAlive</key><false/><key>LaunchOnlyOnce</key><false/><key>AbandonProcessGroup</key><false/><key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string><key>Sockets</key><dict>${socket(LISTENER_NAMES.proxy, request.listeners.proxy)}${socket(LISTENER_NAMES.mcp, request.listeners.mcp)}</dict></dict></plist>`
 }
 function sameMissingServiceResponse(remaining, label, reference, missingLabel) {
   const normalize = (result, name) => {
@@ -182,12 +266,13 @@ function createDarwinCoalitionAdapter(options = {}) {
   const helper = materializeHelper(options.helper, controlRoot)
   const nodeExecutable = Object.freeze({ ...(options.nodeExecutable || { path: fs.realpathSync.native(process.execPath), sha256: digest(fs.readFileSync(fs.realpathSync.native(process.execPath))) }) })
   readBoundExecutable(nodeExecutable)
+  const listenerSupervisor = options.listenerSupervisor === undefined ? null : materializeExecutable(options.listenerSupervisor, controlRoot, 'listener-supervisor')
   const bootUuid = helperCall(helper, ['boot']).bootUuid
   const uid = process.getuid()
   const controlRootHash = digest(controlRoot)
   const identity = reservationId => `darwin-reservation:${controlRootHash}:${digest(reservationId)}`
   const directory = reservationId => path.join(controlRoot, digest(reservationId))
-  const files = dir => ({ dir, request: path.join(dir, 'request.json'), ready: path.join(dir, 'ready.json'), gate: path.join(dir, 'go.json'), stopped: path.join(dir, 'stopped.json'), plist: path.join(dir, 'job.plist') })
+  const files = dir => ({ dir, request: path.join(dir, 'request.json'), ready: path.join(dir, 'ready.json'), gate: path.join(dir, 'go.json'), stopped: path.join(dir, 'stopped.json'), exit: path.join(dir, 'exit.json'), plist: path.join(dir, 'job.plist'), generations: path.join(dir, 'generations'), listenerMarker: path.join(dir, 'listener-started') })
   const call = argv => {
     const value = helperCall(helper, argv)
     if (value.bootUuid !== bootUuid) fail('PROCESS_IDENTITY_CHANGED', 'Darwin boot session changed')
@@ -197,6 +282,16 @@ function createDarwinCoalitionAdapter(options = {}) {
     if (path.dirname(dir) !== controlRoot || !HASH.test(path.basename(dir))) fail('PROCESS_IDENTITY_INVALID', 'Darwin reservation is outside its controller root')
     const request = readPrivate(files(dir).request)
     if (request.schemaVersion !== 1 || request.binding?.adapterKind !== kind || request.binding.bootUuid !== bootUuid || request.binding.controlRootHash !== controlRootHash || request.binding.reservationIdentity !== identity(request.binding.reservationId) || dir !== directory(request.binding.reservationId) || stableStringify(request.helper) !== stableStringify(helper) || stableStringify(request.nodeExecutable) !== stableStringify(nodeExecutable) || request.checksum !== requestDigest(request)) fail('PROCESS_IDENTITY_INVALID', 'Darwin immutable launch request does not match its reservation')
+    const hasListeners = Object.hasOwn(request, 'listeners') || Object.hasOwn(request, 'listenerSupervisor') || Object.hasOwn(request, 'generationDirectory') || Object.hasOwn(request, 'listenerMarker')
+    if (hasListeners) {
+      let listeners
+      try { listeners = darwinListeners(request.listeners) } catch { fail('PROCESS_IDENTITY_INVALID', 'Darwin immutable listener binding is invalid') }
+      const f = files(dir)
+      if (!listenerSupervisor || stableStringify(request.listenerSupervisor) !== stableStringify(listenerSupervisor) ||
+          stableStringify(request.listeners) !== stableStringify(listeners) || request.generationDirectory !== f.generations || request.listenerMarker !== f.listenerMarker) {
+        fail('PROCESS_IDENTITY_INVALID', 'Darwin immutable listener request changed')
+      }
+    }
     return request
   }
   function readReady(dir, request = readRequest(dir)) {
@@ -205,12 +300,43 @@ function createDarwinCoalitionAdapter(options = {}) {
     if (ready.schemaVersion !== 1 || ready.ok !== true || ready.command !== 'inspect' || ready.requestChecksum !== request.checksum || ready.bootUuid !== bootUuid || ready.uid !== uid || !Number.isSafeInteger(ready.pid) || ready.pid < 1 || !Number.isSafeInteger(ready.pidVersion) || !DECIMAL.test(ready.resourceCoalitionId || '') || ready.resourceCoalitionId === '0') fail('PROCESS_IDENTITY_INVALID', 'Darwin job published a foreign kernel identity')
     return ready
   }
+  function listenerRequest(request) { return Object.hasOwn(request, 'listeners') }
+  function readExit(dir, request) {
+    const exitPath = files(dir).exit
+    if (!fs.existsSync(exitPath)) return null
+    const value = readPrivate(exitPath)
+    const exited = Number.isInteger(value.code) && value.code >= 0 && value.code <= 255 && value.signal === null
+    const signalled = value.code === null && typeof value.signal === 'string' && /^SIG[A-Z0-9]{1,28}$/.test(value.signal)
+    if (!exactObject(value, ['code', 'signal', 'requestChecksum', 'checksum']) || value.requestChecksum !== request.checksum ||
+        value.checksum !== checksumRecord(value) || (!exited && !signalled)) fail('PROCESS_IDENTITY_INVALID', 'Darwin job exit record is invalid')
+    return value
+  }
+  function stoppedRequest(dir, request) {
+    if (!fs.existsSync(files(dir).stopped)) return false
+    const value = readPrivate(files(dir).stopped)
+    if (!exactObject(value, ['requestChecksum', 'bootUuid']) || value.requestChecksum !== request.checksum || value.bootUuid !== bootUuid) {
+      fail('PROCESS_IDENTITY_INVALID', 'Darwin stopped-service record is invalid')
+    }
+    return true
+  }
+  function readGenerations(dir, request, options = {}) {
+    if (!listenerRequest(request)) return []
+    return readGenerationRecords(files(dir).generations, request.checksum, uid, options)
+  }
+  function validateReadyGeneration(dir, request, ready) {
+    if (!listenerRequest(request)) return
+    const generations = readGenerations(dir, request)
+    if (!generations.some(value => value.resourceCoalitionId === ready.resourceCoalitionId)) {
+      fail('PROCESS_IDENTITY_INVALID', 'Darwin ready process is outside the recorded listener generations')
+    }
+  }
   const group = (dir, ready) => `darwin-coalition:${path.basename(dir)}:${ready.resourceCoalitionId}`
   function fromGroup(value) {
     const match = /^darwin-coalition:([a-f0-9]{64}):([1-9][0-9]*)$/.exec(value || '')
     if (!match) fail('PROCESS_IDENTITY_INVALID', 'Darwin coalition identity is invalid')
     const dir = path.join(controlRoot, match[1]), request = readRequest(dir), ready = readReady(dir, request)
     if (!ready || ready.resourceCoalitionId !== match[2]) fail('PROCESS_IDENTITY_CHANGED', 'Darwin coalition identity changed')
+    validateReadyGeneration(dir, request, ready)
     return { dir, request, ready }
   }
   function launchctl(argv) { return cp.spawnSync('/bin/launchctl', argv, { shell: false, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, env: { PATH: '/usr/bin:/bin', LANG: 'C' } }) }
@@ -226,18 +352,45 @@ function createDarwinCoalitionAdapter(options = {}) {
     })
     if (!fs.existsSync(files(dir).stopped)) writeExclusive(files(dir).stopped, { requestChecksum: request.checksum, bootUuid })
   }
-  function activeTasks(ready) {
-    const usage = call(['usage', ready.resourceCoalitionId])
+  function activeCoalition(resourceCoalitionId) {
+    const usage = call(['usage', resourceCoalitionId])
     if (usage.exists === false) return 0n
     if (usage.exists !== true || !DECIMAL.test(usage.tasksStarted || '') || !DECIMAL.test(usage.tasksExited || '')) fail('PROCESS_OBSERVATION_FAILED', 'Darwin kernel task counters are unavailable')
     const active = BigInt(usage.tasksStarted) - BigInt(usage.tasksExited)
     if (active < 0n) fail('PROCESS_OBSERVATION_FAILED', 'Darwin kernel task counters are inconsistent')
     return active
   }
-  function members(ready) {
-    const census = call(['census', ready.resourceCoalitionId])
+  function activeTasks(ready) { return activeCoalition(ready.resourceCoalitionId) }
+  function coalitionMembers(resourceCoalitionId) {
+    const census = call(['census', resourceCoalitionId])
     if (census.complete !== true || !Array.isArray(census.errors) || census.errors.length || !Array.isArray(census.members) || census.members.some(member => !Number.isSafeInteger(member.pid) || member.pid < 1 || !Number.isSafeInteger(member.pidVersion))) fail('PROCESS_OBSERVATION_FAILED', 'Darwin coalition enumeration is incomplete')
     return census.members.map(member => member.pid)
+  }
+  function members(ready) { return coalitionMembers(ready.resourceCoalitionId) }
+  function generationCoalitions(dir, request, options) {
+    return [...new Set(readGenerations(dir, request, options).map(value => value.resourceCoalitionId))]
+  }
+  async function waitGenerationZero(coalitions, timeoutMs = 5000) {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const live = coalitions.filter(value => activeCoalition(value) !== 0n)
+      if (!live.length) return
+      if (Date.now() >= deadline) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin listener generation cohorts did not drain')
+      await delay(25)
+    }
+  }
+  async function stopAndDrainGenerations(dir, request, signal = null, requireZero = false) {
+    stopJob(dir, request)
+    const coalitions = generationCoalitions(dir, request)
+    if (signal) {
+      for (const resourceCoalitionId of coalitions) {
+        if (activeCoalition(resourceCoalitionId) === 0n) continue
+        const result = call(['signal', resourceCoalitionId, signal])
+        if (result.complete !== true || !Array.isArray(result.errors) || result.errors.length) fail('PROCESS_DRAIN_TIMEOUT', 'Darwin audited listener coalition signal was incomplete')
+      }
+    }
+    if (requireZero) await waitGenerationZero(coalitions)
+    return coalitions
   }
   const adapter = {
     kind, startupTimeoutMs: 30000,
@@ -254,15 +407,26 @@ function createDarwinCoalitionAdapter(options = {}) {
     async spawnOwned(spec) {
       adapter.validateReservationBinding(spec)
       if (spec.shell || !path.isAbsolute(spec.executable || '') || !Array.isArray(spec.argv) || spec.argv.some(value => typeof value !== 'string' || value.includes('\0')) || !path.isAbsolute(spec.cwd || '') || !spec.env || typeof spec.env !== 'object' || Array.isArray(spec.env) || Object.entries(spec.env).some(([name, value]) => !name || name.includes('\0') || typeof value !== 'string' || value.includes('\0')) || spec.env.AUTOPROMPT_OWNERSHIP_RESERVATION !== spec.reservationId || [spec.stdin, spec.stdout, spec.stderr].some(value => value !== undefined && value !== 'ignore')) fail('LAUNCH_SPEC_INVALID', 'Darwin owned proxy requires exact shell-free paths, environment and ignored direct stdio')
+      const listeners = darwinListeners(spec.darwinListeners, true)
+      const listenerEnvironmentNames = ['AUTOPROMPT_GROK_PROXY_LISTENER_FD', 'AUTOPROMPT_GROK_MCP_LISTENER_FD', 'AUTOPROMPT_GROK_PROXY_PORT', 'AUTOPROMPT_GROK_MCP_PORT']
+      if (!listeners && listenerEnvironmentNames.some(name => Object.hasOwn(spec.env, name))) fail('LAUNCH_SPEC_INVALID', 'Darwin listener environment requires an exact listener descriptor')
+      if (listeners && (!listenerSupervisor || spec.env.AUTOPROMPT_GROK_PROXY_LISTENER_FD !== '3' || spec.env.AUTOPROMPT_GROK_MCP_LISTENER_FD !== '4' ||
+          spec.env.AUTOPROMPT_GROK_PROXY_PORT !== String(listeners.proxy.port) || spec.env.AUTOPROMPT_GROK_MCP_PORT !== String(listeners.mcp.port))) {
+        fail('LAUNCH_SPEC_INVALID', 'Darwin listener launch lacks its exact worker environment or supervisor binding')
+      }
       const dir = directory(spec.reservationId), f = files(dir)
       fs.mkdirSync(dir, { mode: 0o700 })
+      if (listeners) fs.mkdirSync(f.generations, { mode: 0o700 })
       // Choose an existing user domain before writing the immutable request.
       const domain = [`gui/${uid}`, `user/${uid}`].find(value => launchctl(['print', value]).status === 0)
       if (!domain) fail('PROVIDER_UNSUPPORTED', 'Darwin user launchd domain is unavailable')
-      const request = { schemaVersion: 1, binding: spec.reservationBinding, helper, nodeExecutable, domain, label: `com.autoprompt.owned.${controlRootHash.slice(0, 16)}.${digest(spec.reservationId)}`, executable: spec.executable, argv: spec.argv, cwd: spec.cwd, env: spec.env }
+      const request = { schemaVersion: 1, binding: spec.reservationBinding, helper, nodeExecutable, domain, label: `com.autoprompt.owned.${controlRootHash.slice(0, 16)}.${digest(spec.reservationId)}`, executable: spec.executable, argv: spec.argv, cwd: spec.cwd, env: spec.env,
+        ...(listeners ? { listeners, listenerSupervisor, generationDirectory: f.generations, listenerMarker: f.listenerMarker } : {}) }
       request.checksum = digest(stableStringify(request))
       writeExclusive(f.request, request)
-      fs.writeFileSync(f.plist, launchPlist(request.label, f.request, boundExecutable(nodeExecutable)), { flag: 'wx', mode: 0o600 })
+      fs.writeFileSync(f.plist, listeners
+        ? listenerLaunchPlist(request, f.request, boundExecutable(listenerSupervisor), boundExecutable(nodeExecutable))
+        : launchPlist(request.label, f.request, boundExecutable(nodeExecutable)), { flag: 'wx', mode: 0o600 })
       const bootstrap = launchctl(['bootstrap', domain, f.plist])
       if (bootstrap.status !== 0 || bootstrap.error || bootstrap.signal) fail('PROCESS_RESERVATION_FAILURE', 'Darwin launchd bootstrap failed; durable reservation requires recovery')
       while (Date.now() < Date.parse(spec.startupDeadlineAt)) {
@@ -270,6 +434,7 @@ function createDarwinCoalitionAdapter(options = {}) {
         if (ready) {
           const current = call(['inspect', String(ready.pid)])
           if (current.pidVersion !== ready.pidVersion || current.resourceCoalitionId !== ready.resourceCoalitionId || current.uid !== uid) fail('PROCESS_IDENTITY_CHANGED', 'Darwin job root changed before launch admission')
+          validateReadyGeneration(dir, request, ready)
           writeExclusive(f.gate, { requestChecksum: request.checksum })
           return { rootPid: ready.pid, groupIdentity: group(dir, ready) }
         }
@@ -280,8 +445,9 @@ function createDarwinCoalitionAdapter(options = {}) {
     async recoverReservation(reservationId) {
       const dir = directory(reservationId)
       if (!fs.existsSync(files(dir).request)) return null
-      const ready = readReady(dir)
+      const request = readRequest(dir), ready = readReady(dir, request)
       if (!ready) fail('OWNERSHIP_RECOVERY_PENDING', 'Darwin launchd reservation has no committed kernel identity')
+      validateReadyGeneration(dir, request, ready)
       return { rootPid: ready.pid, groupIdentity: group(dir, ready) }
     },
     async probeReservation(record) {
@@ -294,8 +460,20 @@ function createDarwinCoalitionAdapter(options = {}) {
       if (!fs.existsSync(files(dir).request)) return { state: 'PENDING', evidence: { reason: 'launch-request-not-yet-published' } }
       const request = readRequest(dir)
       const ready = readReady(dir, request)
-      if (ready) return { state: 'LIVE', ownership: { rootPid: ready.pid, groupIdentity: group(dir, ready) } }
+      if (ready) {
+        validateReadyGeneration(dir, request, ready)
+        return { state: 'LIVE', ownership: { rootPid: ready.pid, groupIdentity: group(dir, ready) } }
+      }
       if (Date.now() < Date.parse(record.startupDeadlineAt)) return { state: 'PENDING' }
+      if (listenerRequest(request)) {
+        await stopAndDrainGenerations(dir, request, 'KILL', true)
+        const late = readReady(dir, request)
+        if (late) {
+          validateReadyGeneration(dir, request, late)
+          return { state: 'LIVE', ownership: { rootPid: late.pid, groupIdentity: group(dir, late) } }
+        }
+        return { state: 'DEAD', evidence: { reason: 'listener-launchd-absent-with-final-generation-drain' } }
+      }
       stopJob(dir, request)
       const late = readReady(dir, request)
       if (late) return { state: 'LIVE', ownership: { rootPid: late.pid, groupIdentity: group(dir, late) } }
@@ -303,6 +481,19 @@ function createDarwinCoalitionAdapter(options = {}) {
     },
     async listOwned(value) {
       const { dir, request, ready } = fromGroup(value)
+      if (listenerRequest(request)) {
+        const exit = readExit(dir, request)
+        if (exit) stopJob(dir, request)
+        const deadline = Date.now() + 2000
+        do {
+          const coalitions = generationCoalitions(dir, request)
+          const pids = [...new Set(coalitions.flatMap(resourceCoalitionId => activeCoalition(resourceCoalitionId) === 0n ? [] : coalitionMembers(resourceCoalitionId)))]
+          if (pids.length) return pids
+          if ((exit || stoppedRequest(dir, request)) && coalitions.every(resourceCoalitionId => activeCoalition(resourceCoalitionId) === 0n)) return []
+          await delay(25)
+        } while (Date.now() < deadline)
+        fail('PROCESS_OBSERVATION_FAILED', 'Darwin listener service has no complete enumerable generation state')
+      }
       // A task can disappear from BSD's PID table before Mach releases its
       // coalition reference (also during exec). Retry that transition, keeping
       // the atomic kernel count as the only authority for an empty result.
@@ -328,6 +519,10 @@ function createDarwinCoalitionAdapter(options = {}) {
     async signalOwned(value, signal) {
       if (!['TERM', 'KILL'].includes(signal)) fail('PROCESS_IDENTITY_INVALID', 'Darwin ownership signal is invalid')
       const { dir, request, ready } = fromGroup(value)
+      if (listenerRequest(request)) {
+        await stopAndDrainGenerations(dir, request, signal)
+        return
+      }
       stopJob(dir, request)
       if (activeTasks(ready) === 0n) return
       const result = call(['signal', ready.resourceCoalitionId, signal])
@@ -353,15 +548,27 @@ async function runJob(requestPath) {
   const request = readPrivate(requestPath), directory = path.dirname(requestPath)
   if (request.checksum !== requestDigest(request) || request.binding?.adapterKind !== kind || Date.now() >= Date.parse(request.binding.startupDeadlineAt)) fail('PROCESS_IDENTITY_INVALID', 'Darwin job request is invalid or expired')
   readBoundExecutable(request.nodeExecutable)
+  let listeners = null
+  if (Object.hasOwn(request, 'listeners')) {
+    listeners = darwinListeners(request.listeners)
+    const expectedGenerationDirectory = path.join(directory, 'generations'), expectedMarker = path.join(directory, 'listener-started')
+    if (request.generationDirectory !== expectedGenerationDirectory || request.listenerMarker !== expectedMarker) fail('PROCESS_IDENTITY_INVALID', 'Darwin listener control paths are invalid')
+    readBoundExecutable(request.listenerSupervisor)
+  }
   const own = helperCall(request.helper, ['inspect', String(process.pid)])
   if (own.bootUuid !== request.binding.bootUuid || own.uid !== process.getuid()) fail('PROCESS_IDENTITY_CHANGED', 'Darwin job boot identity changed')
+  if (listeners) {
+    const generations = readGenerationRecords(request.generationDirectory, request.checksum, own.uid)
+    if (!generations.some(value => value.resourceCoalitionId === own.resourceCoalitionId)) fail('PROCESS_IDENTITY_CHANGED', 'Darwin listener child is outside its published generation cohort')
+  }
   writeExclusive(path.join(directory, 'ready.json'), { ...own, requestChecksum: request.checksum })
   while (!fs.existsSync(path.join(directory, 'go.json'))) {
     if (Date.now() >= Date.parse(request.binding.startupDeadlineAt)) return
     await delay(20)
   }
   if (readPrivate(path.join(directory, 'go.json')).requestChecksum !== request.checksum) fail('PROCESS_IDENTITY_INVALID', 'Darwin launch authorization is foreign')
-  const child = cp.spawn(request.executable, request.argv, { cwd: request.cwd, env: request.env, shell: false, stdio: 'ignore' })
+  const child = cp.spawn(request.executable, request.argv, { cwd: request.cwd, env: request.env, shell: false,
+    stdio: listeners ? ['ignore', 'ignore', 'ignore', 3, 4] : 'ignore' })
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({ code, signal })) })
   atomicWriteJson(path.join(directory, 'exit.json'), { ...result, requestChecksum: request.checksum })
 }
@@ -369,4 +576,4 @@ if (require.main === module) {
   if (process.argv.length !== 4 || process.argv[2] !== '--job' || process.platform !== 'darwin') process.exitCode = 64
   else runJob(process.argv[3]).catch(() => { process.exitCode = 1 })
 }
-module.exports = { createDarwinCoalitionAdapter, helperCall, launchPlist, sameMissingServiceResponse, observeAbsentService, waitForAbsentService }
+module.exports = { createDarwinCoalitionAdapter, helperCall, launchPlist, validateDarwinListeners: darwinListeners, sameMissingServiceResponse, observeAbsentService, waitForAbsentService }

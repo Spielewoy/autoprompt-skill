@@ -65,3 +65,18 @@ test('Grok inline MCP client executes the reviewed closed bundle and round-trips
   assert.equal(signal, null)
   assert.equal(Buffer.concat(output).toString(), '{"roundtrip":true}\n')
 })
+
+test('Grok inline MCP client adopts an IPv6 loopback endpoint when explicitly projected', { timeout: 10000 }, async t => {
+  const net = require('node:net')
+  const server = net.createServer(socket => { socket.on('data', bytes => socket.write(bytes)) })
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '::1', resolve) })
+  t.after(() => new Promise(resolve => server.close(resolve)))
+  const port = server.address().port
+  const bundle = buildGrokInlineMcpClient({ nodeExecutable: path.resolve(process.execPath), port, host: '::1' })
+  assert.deepEqual(bundle.argv.slice(-2), ['--host', '::1'])
+  const child = cp.spawn(bundle.executable, bundle.argv, { stdio: ['pipe', 'pipe', 'pipe'] })
+  const output = [], errors = []; child.stdout.on('data', bytes => output.push(bytes)); child.stderr.on('data', bytes => errors.push(bytes))
+  child.stdin.end('{"ipv6":true}\n')
+  const [code, signal] = await new Promise(resolve => child.once('close', (value, reason) => resolve([value, reason])))
+  assert.equal(code, 0, Buffer.concat(errors).toString()); assert.equal(signal, null); assert.equal(Buffer.concat(output).toString(), '{"ipv6":true}\n')
+})

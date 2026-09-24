@@ -245,11 +245,14 @@ async function scenario(provider, options = {}) {
 function good(result) { assert.equal(result.ok, true); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.contextId, /^[a-zA-Z0-9_-]+$/); assert.match(result.toolBoundaryEvidence.policySha256, /^[a-f0-9]{64}$/) }
 function command(f, value) { f.service.tool.args.command = value }
 
-async function runScenario(provider) {
-  const hostile = await scenario(provider, { tool: { name: 'Task', args: { prompt: 'unauthorized nested dispatch' } }, serviceOptions: { forceFirstTool: true } })
+async function runScenario(provider, isolationOnly = false) {
+  // A selected isolation diagnostic must not silently run every continuation,
+  // concurrency, and recovery scenario behind its one reported test name.
+  // The complete capability run still shares and requires the full witness set.
+  const hostile = isolationOnly ? null : await scenario(provider, { tool: { name: 'Task', args: { prompt: 'unauthorized nested dispatch' } }, serviceOptions: { forceFirstTool: true } })
   let f, listener
   try {
-    await assert.rejects(hostile.run({}), { code: 'ROLE_POLICY_DENIED' })
+    if (hostile) await assert.rejects(hostile.run({}), { code: 'ROLE_POLICY_DENIED' })
     f = await scenario(provider)
     // A challenge is included in the controller-produced receipt bytes, not
     // merely in test metadata. This binds each observed tool exchange to the
@@ -263,6 +266,10 @@ async function runScenario(provider) {
     const first = await f.run({ assignment: { model: 'fixture/model', effort: 'low' } }); good(first)
     assert.equal(fs.readFileSync(readback, 'utf8'), expectedReceipt, 'controller receipt body did not bind the exact candidate bytes and challenge')
     assert.equal(fs.readFileSync(f.candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(scratchFile, 'utf8'), 'scratch-ok'); assert.equal(contacted, false); assert.equal(first.toolBoundaryEvidence.receiptHashes.length, 1)
+    if (isolationOnly) return Object.freeze({ isolation: {
+      candidateHash: native.sha256(fs.readFileSync(f.candidate)), receiptBody: expectedReceipt,
+      receiptHash: first.toolBoundaryEvidence.receiptHashes[0], scratch: fs.readFileSync(scratchFile, 'utf8'), networkContacted: contacted,
+    } })
     const names = f.service.requests.filter(item => Array.isArray(item.body.tools)).flatMap(item => item.body.tools.map(tool => tool.function?.name || tool.name))
     assert.ok(names.includes(controlled.toolName(provider, 'bash'))); assert.ok(names.every(name => controlled.decodeToolName(provider, name)), JSON.stringify(names)); assert.equal(names.some(name => /agent|task|skill/i.test(name)), false)
     const privateAbsent = !f.service.requests.some(item => /AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD|PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE/.test(JSON.stringify(item.body)))
@@ -331,13 +338,13 @@ async function runScenario(provider) {
   } finally {
     if (listener) await new Promise(resolve => listener.close(resolve))
     if (f) await f.close()
-    await hostile.close()
+    await hostile?.close()
   }
 }
 
 const scenarioRuns = new Map()
 function witnessesFor(provider) {
-  if (!scenarioRuns.has(provider)) scenarioRuns.set(provider, runScenario(provider))
+  if (!scenarioRuns.has(provider)) scenarioRuns.set(provider, runScenario(provider, process.env.AUTOPROMPT_CI_CAPABILITY === 'isolation'))
   return scenarioRuns.get(provider)
 }
 const capabilityChecks = Object.freeze({

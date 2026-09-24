@@ -240,10 +240,12 @@ async function scenario(t, config = {}) {
   const launch = async (overrides = {}) => {
     const record = { ...f.record, ...overrides }
     record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { ...nativeEnvironment(), PATH: path.dirname(CLI) + path.delimiter + (process.env.PATH || ''), LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' })
-    record.signal = overrides.signal || AbortSignal.timeout(120000)
+    record.signal = overrides.signal || AbortSignal.timeout(config.runTimeoutMs || 120000)
+    const began = Date.now()
     let result
     try { result = await adapter.launch(record) }
     catch (error) { try { fixtureFailureDiagnostic({ ...f, service }, error) } catch {} throw error }
+    finally { t.diagnostic(JSON.stringify({ hermesNativeTiming: { elapsedMs: Date.now() - began, modelRequests: service.requests.length } })) }
     assert.ok(service.requests.some(request => JSON.stringify(request.messages).includes('CLOSED_CANARY_CHALLENGE:' + f.challenge)), 'actual Hermes controller output omitted canary challenge')
     return result
   }
@@ -251,7 +253,7 @@ async function scenario(t, config = {}) {
     if (fixtureClosing) return Promise.reject(new Error('Hermes fixture is closing'))
     const controller = new AbortController()
     launchControllers.add(controller)
-    const operation = launch({ ...overrides, signal: AbortSignal.any([controller.signal, overrides.signal || AbortSignal.timeout(120000)]) })
+    const operation = launch({ ...overrides, signal: AbortSignal.any([controller.signal, overrides.signal || AbortSignal.timeout(config.runTimeoutMs || 120000)]) })
     activeLaunches.add(operation)
     operation.finally(() => { activeLaunches.delete(operation); launchControllers.delete(controller) }).catch(() => {})
     return operation
@@ -274,12 +276,15 @@ function sibling(f, label) {
   return { ...id, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...id, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) }
 }
 
-test('hermes closed native capability: isolation denies candidate/private/network while allowing scratch', options, async t => {
+test('hermes closed native capability: isolation denies candidate/private/network while allowing scratch', { ...options, timeout: 420000 }, async t => {
   let contacted = false; const listener = net.createServer(socket => { contacted = true; socket.destroy() })
   await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
   try {
     const port = listener.address().port
-    const f = await scenario(t, { command: values => {
+    // Include cold native startup and sandbox admission in the bounded probe.
+    // CI134 completed worker admission and reached the real command before
+    // the old two-minute fixture signal cancelled it.
+    const f = await scenario(t, { runTimeoutMs: 300000, command: values => {
       const network = "const n=require('node:net');const s=n.connect(" + port + ",'127.0.0.1');s.on('connect',()=>process.exit(19));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),700)"
       return readCommand(values.candidate) + '; ' + nodeCommand("require('node:fs').writeFileSync(" + JSON.stringify(path.join(values.scratch, 'isolation.txt')) + ",'scratch-ok'); try { require('node:fs').writeFileSync(" + JSON.stringify(values.candidate) + ",'forbidden'); process.exit(18) } catch {} ; try { require('node:fs').readFileSync(" + JSON.stringify(values.secret) + "); process.exit(20) } catch {} ; " + network)
     } })

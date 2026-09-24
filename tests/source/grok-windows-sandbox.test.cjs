@@ -11,12 +11,17 @@ const sandbox = require('../../scripts/harness-v2-bridge/grok/windows-sandbox.cj
 
 const hash = value => crypto.createHash('sha256').update(value).digest('hex')
 function fixture(t, changes = {}, fixtureOptions = {}) {
-  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'grok-win-sandbox-')))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'grok-win-sandbox-')))
+  const root = path.join(base, 'control'), helperDeploymentRoot = path.join(base, 'native-helpers-ABC123')
+  fs.mkdirSync(root, { mode: 0o700 }); fs.mkdirSync(helperDeploymentRoot, { mode: 0o700 })
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const helperStat = fs.statSync(helperDeploymentRoot, { bigint: true })
+  const helperDeploymentBinding = Object.freeze({ root: helperDeploymentRoot, identity: Object.freeze({ dev: String(helperStat.dev), ino: String(helperStat.ino) }) })
   const executable = path.join(root, 'grok.exe'), node = path.join(root, 'node.exe'), brokerNode = path.join(root, 'broker-node.exe')
   fs.writeFileSync(executable, 'grok'); fs.writeFileSync(node, 'node'); fs.writeFileSync(brokerNode, 'broker-node')
   const binding = { reservationId: 'reservation-1', sessionId: 'session-1', targetKey: 'grok' }
   const prestart = new WeakSet(), releases = [], recoveryCalls = []
+  let prepareCalls = 0
   const makeOwner = () => {
     const receipts = new WeakSet()
     return { failure: null, issueCalls: 0,
@@ -37,6 +42,7 @@ function fixture(t, changes = {}, fixtureOptions = {}) {
   }
   let verifier
   const resources = { async prepareWindowsAppContainerResources(options) {
+    prepareCalls++
     verifier = options.verifyDrainEvidence
     fs.writeFileSync(path.join(root, 'resources.json'), JSON.stringify({ schemaVersion: 1, leaseId: '1'.repeat(32), plan: { exact: true }, sha256: 'f'.repeat(64) }))
     return Object.freeze({ profileName: 'Autoprompt_' + '1'.repeat(32), profileSid: 'S-1-15-2-1-2-3-4-5-6-7',
@@ -52,13 +58,31 @@ function fixture(t, changes = {}, fixtureOptions = {}) {
     recoveryCalls.push(options)
     return Object.freeze({ restored: 1, newEntries: 0, deletedEntries: 0 })
   } }
+  const helperDeployment = {
+    assertTrustedWindowsHelperDeployment(controlRoot, deploymentRoot) {
+      assert.equal(controlRoot, root); assert.equal(deploymentRoot, helperDeploymentRoot)
+      const stat = fs.lstatSync(deploymentRoot, { bigint: true })
+      assert.equal(stat.isDirectory(), true); assert.equal(stat.isSymbolicLink(), false)
+      return { root: fs.realpathSync.native(deploymentRoot), identity: { dev: String(stat.dev), ino: String(stat.ino) } }
+    },
+    cleanupWindowsHelperDeployment(controlRoot, expected) {
+      assert.equal(controlRoot, root); assert.equal(expected.root, helperDeploymentRoot)
+      if (!fs.existsSync(expected.root)) return { removed: false, absent: true }
+      const stat = fs.lstatSync(expected.root, { bigint: true })
+      if (String(stat.dev) !== expected.identity.dev || String(stat.ino) !== expected.identity.ino) {
+        throw Object.assign(new Error('helper identity changed'), { code: 'WINDOWS_RUNTIME_MISMATCH' })
+      }
+      fs.rmSync(expected.root, { recursive: true })
+      return { removed: true, absent: false }
+    },
+  }
   const executableStat = fs.statSync(executable, { bigint: true })
   const runtime = Object.freeze({ kind: 'grok-official-windows-runtime', closureSha256: 'b'.repeat(64), executable: Object.freeze({ path: executable,
     size: 4, sha256: hash('grok'), identity: Object.freeze({ dev: String(executableStat.dev), ino: String(executableStat.ino) }) }) })
   const worker = Object.freeze({ payloadSha256: 'c'.repeat(64), moduleSha256: Object.freeze({ 'sandbox-worker.cjs': 'd'.repeat(64) }), executable: node,
     argv: Object.freeze(['-e', 'inline-worker', '--', 'autoprompt-grok-inline-worker.cjs', '--model', 'grok']) })
   const options = {
-    processOwner: owner, binding, controlRoot: root, helperDeploymentRoot: root,
+    processOwner: owner, binding, controlRoot: root, helperDeploymentRoot, helperDeploymentBinding,
     brokerNodeExecutable: fixtureOptions.realBroker === true ? process.execPath : brokerNode,
     brokerNodeSha256: fixtureOptions.realBroker === true ? hash(fs.readFileSync(process.execPath)) : hash('broker-node'),
     brokerCwd: root, brokerEnvironment: { SystemRoot: 'C:\\Windows', PATH: 'C:\\Windows\\System32' },
@@ -67,11 +91,20 @@ function fixture(t, changes = {}, fixtureOptions = {}) {
       readableRoots: ['C:\\workspace', 'C:\\scratch'], writableRoots: ['C:\\workspace', 'C:\\scratch'] },
     workerEnvironment: { SystemRoot: 'C:\\Windows', HOME: 'C:\\session-home', GROK_HOME: 'C:\\session-home', AUTOPROMPT_GROK_MODEL: 'grok', AUTOPROMPT_GROK_RELAY_TOKEN: 'token', AUTOPROMPT_GROK_PROXY_TOKEN: 'proxy', AUTOPROMPT_GROK_PROXY_PORT: '2', AUTOPROMPT_GROK_MCP_PORT: '1', AUTOPROMPT_GROK_ALLOWED_MCP_TOOLS: '{"x":"bash"}' },
     pipe: { socketPath: `\\\\.\\pipe\\autoprompt-grok-${'e'.repeat(64)}` }, cancellationPath: path.join(root, 'cancel'), timeoutMs: 1000, outputLimit: 65536,
-    _dependencies: { materializeRuntime: () => runtime, buildWorker: () => worker, createLauncher: () => launcher, resources },
+    _dependencies: { materializeRuntime: () => runtime, buildWorker: () => worker, createLauncher: () => launcher, resources, helperDeployment },
     ...changes,
   }
-  return { root, options, owner, makeOwner, binding, releases, recoveryCalls, launcher, launcherBinding }
+  return { root, helperDeploymentRoot, helperDeploymentBinding, options, owner, makeOwner, binding, releases, recoveryCalls, launcher, launcherBinding,
+    get prepareCalls() { return prepareCalls } }
 }
+
+test('helper deployment identity mismatch is rejected before resource allocation', async t => {
+  const f = fixture(t)
+  await assert.rejects(sandbox.prepareWindowsGrokSandbox({ ...f.options,
+    helperDeploymentBinding: { ...f.helperDeploymentBinding, identity: { ...f.helperDeploymentBinding.identity, ino: String(BigInt(f.helperDeploymentBinding.identity.ino) + 1n) } } }),
+  { code: 'GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED' })
+  assert.equal(f.prepareCalls, 0)
+})
 
 test('pre-reservation cleanup uses only the launcher not-started capability and removes its exact broker request', async t => {
   const f = fixture(t), resource = await sandbox.prepareWindowsGrokSandbox(f.options)
@@ -189,12 +222,13 @@ test('fresh controller recovers an entered sandbox only with its exact persisted
   resource.markReservationEntered()
   resource = null
   const freshOwner = f.makeOwner()
-  const result = await sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath, helperDeploymentRoot: f.root,
+  const result = await sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath, helperDeploymentRoot: f.helperDeploymentRoot,
     processOwner: freshOwner, binding: ownerBinding, _dependencies: f.options._dependencies })
   assert.deepEqual(result, { restored: 1, newEntries: 0, deletedEntries: 0 })
   assert.equal(freshOwner.issueCalls, 1)
   assert.equal(f.recoveryCalls.length, 1)
   assert.equal(fs.existsSync(brokerRequestPath), false)
+  assert.equal(fs.existsSync(f.helperDeploymentRoot), false)
 })
 
 test('unknown ownership or rebound durable journal retains recovery resources without implicit drain', async t => {
@@ -202,7 +236,7 @@ test('unknown ownership or rebound durable journal retains recovery resources wi
   pendingResource.markReservationEntered()
   const pendingPath = pendingResource.launch.argv[4], pendingOwner = pending.makeOwner()
   pendingOwner.failure = Object.assign(new Error('pending'), { code: 'OWNERSHIP_RECOVERY_PENDING' })
-  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: pending.root, brokerRequestPath: pendingPath, helperDeploymentRoot: pending.root,
+  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: pending.root, brokerRequestPath: pendingPath, helperDeploymentRoot: pending.helperDeploymentRoot,
     processOwner: pendingOwner, binding: { ...pending.binding, launchBindingHash: pendingResource.launchBindingHash }, _dependencies: pending.options._dependencies }), { code: 'OWNERSHIP_RECOVERY_PENDING' })
   assert.equal(pending.recoveryCalls.length, 0); assert.equal(fs.existsSync(pendingPath), true)
 
@@ -211,7 +245,7 @@ test('unknown ownership or rebound durable journal retains recovery resources wi
   const reboundPath = reboundResource.launch.argv[4], journal = path.join(rebound.root, 'resources.json'), bytes = fs.readFileSync(journal)
   fs.renameSync(journal, `${journal}.original`); fs.writeFileSync(journal, bytes)
   const reboundOwner = rebound.makeOwner()
-  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: rebound.root, brokerRequestPath: reboundPath, helperDeploymentRoot: rebound.root,
+  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: rebound.root, brokerRequestPath: reboundPath, helperDeploymentRoot: rebound.helperDeploymentRoot,
     processOwner: reboundOwner, binding: { ...rebound.binding, launchBindingHash: reboundResource.launchBindingHash }, _dependencies: rebound.options._dependencies }), { code: 'GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED' })
   assert.equal(reboundOwner.issueCalls, 0); assert.equal(rebound.recoveryCalls.length, 0); assert.equal(fs.existsSync(reboundPath), true)
 })
@@ -220,16 +254,14 @@ test('fresh recovery rejects a foreign drain receipt before resource restoration
   const f = fixture(t), resource = await sandbox.prepareWindowsGrokSandbox(f.options)
   resource.markReservationEntered()
   const foreignOwner = { async issueBoundDrainReceipt() { return Object.freeze({ foreign: true }) }, verifyBoundDrainReceipt() { return false } }
-  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: resource.launch.argv[4], helperDeploymentRoot: f.root,
+  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: resource.launch.argv[4], helperDeploymentRoot: f.helperDeploymentRoot,
     processOwner: foreignOwner, binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies }), { code: 'GROK_WINDOWS_SANDBOX_RECOVERY_INVALID' })
   assert.equal(f.recoveryCalls.length, 0)
 })
 
 test('discovered recovery obtains its launch hash from the owned registry and retains unbound requests', async t => {
   const f = fixture(t)
-  const helperDeploymentRoot = path.join(f.root, 'native-helpers-ABC123')
-  fs.mkdirSync(helperDeploymentRoot, { mode: 0o700 })
-  const resource = await sandbox.prepareWindowsGrokSandbox({ ...f.options, helperDeploymentRoot })
+  const resource = await sandbox.prepareWindowsGrokSandbox(f.options)
   resource.markReservationEntered()
   const request = resource.launch.argv[4], owner = f.makeOwner()
   let records = []
@@ -244,4 +276,19 @@ test('discovered recovery obtains its launch hash from the owned registry and re
   assert.equal(f.recoveryCalls.length, 1)
   assert.equal(owner.issueCalls, 1)
   assert.equal(fs.existsSync(request), false)
+})
+
+test('fresh recovery retains a replaced helper deployment and its broker request', async t => {
+  const f = fixture(t), resource = await sandbox.prepareWindowsGrokSandbox(f.options)
+  resource.markReservationEntered()
+  const request = resource.launch.argv[4], moved = `${f.helperDeploymentRoot}.original`
+  fs.renameSync(f.helperDeploymentRoot, moved)
+  fs.mkdirSync(f.helperDeploymentRoot, { mode: 0o700 })
+  const owner = f.makeOwner()
+  await assert.rejects(sandbox.recoverWindowsGrokSandbox({ controlRoot: f.root, brokerRequestPath: request,
+    helperDeploymentRoot: f.helperDeploymentRoot, processOwner: owner,
+    binding: { ...f.binding, launchBindingHash: resource.launchBindingHash }, _dependencies: f.options._dependencies }),
+  { code: 'GROK_WINDOWS_SANDBOX_IDENTITY_CHANGED' })
+  assert.equal(fs.existsSync(request), true)
+  assert.equal(fs.existsSync(f.helperDeploymentRoot), true)
 })

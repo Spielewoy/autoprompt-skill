@@ -9933,6 +9933,26 @@ function validOwnedRelayAddress(value) {
     : path.isAbsolute(value)
 }
 
+function canonicalDarwinListeners(value) {
+  if (process.platform !== 'darwin') {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listener descriptors are not supported on this platform')
+  }
+  let listeners
+  try { listeners = require('./darwin-launchd-process.js').validateDarwinListeners(value) }
+  catch {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listener descriptor is invalid')
+  }
+  return Object.freeze({
+    proxy: Object.freeze({ fd: listeners.proxy.fd, host: listeners.proxy.host, port: listeners.proxy.port }),
+    mcp: Object.freeze({ fd: listeners.mcp.fd, host: listeners.mcp.host, port: listeners.mcp.port }),
+  })
+}
+
+function sameDarwinListeners(left, right) {
+  return left.proxy.fd === right.proxy.fd && left.proxy.host === right.proxy.host && left.proxy.port === right.proxy.port &&
+    left.mcp.fd === right.mcp.fd && left.mcp.host === right.mcp.host && left.mcp.port === right.mcp.port
+}
+
 class OwnedCodexProxyRunner {
   constructor(options = {}) {
     if (!options.processOwner || typeof options.processOwner.launch !== 'function' ||
@@ -10012,6 +10032,27 @@ class OwnedCodexProxyRunner {
       }
     }
     const childSpec = launchResource?.launch || spec
+    const listenerCandidates = [
+      ...(Object.hasOwn(spec, 'darwinListeners') ? [spec.darwinListeners] : []),
+      ...(launchResource && Object.hasOwn(launchResource, 'darwinListeners') ? [launchResource.darwinListeners] : []),
+      ...(Object.hasOwn(childSpec, 'darwinListeners') ? [childSpec.darwinListeners] : []),
+    ]
+    let darwinListeners
+    if (listenerCandidates.length) {
+      if (!launchResource || !launchResource.relayStdin || this.processOwner?.adapter?.kind !== 'darwin-launchd-coalition') {
+        try { await launchResource?.cleanup?.() } catch {}
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listeners require a prepared relay and Darwin coalition ownership')
+      }
+      try {
+        darwinListeners = canonicalDarwinListeners(listenerCandidates[0])
+        if (listenerCandidates.slice(1).some(value => !sameDarwinListeners(darwinListeners, canonicalDarwinListeners(value)))) {
+          throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listener descriptors disagree across the launch resource')
+        }
+      } catch (error) {
+        try { await launchResource.cleanup?.() } catch {}
+        throw error
+      }
+    }
     const windowsTempDirectory = childSpec.windowsTempDirectory
     if (windowsTempDirectory !== undefined) {
       if (process.platform !== 'win32') {
@@ -10032,6 +10073,7 @@ class OwnedCodexProxyRunner {
       executable: childSpec.executable,
       argv: childSpec.argv,
       ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+      ...(darwinListeners ? { darwinListeners } : {}),
     }))
     const sequence = ++this.controlSequence
     try { fs.writeFileSync(requestPath, `${JSON.stringify({
@@ -10042,6 +10084,7 @@ class OwnedCodexProxyRunner {
       executable: childSpec.executable,
       argv: childSpec.argv,
       ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+      ...(darwinListeners ? { darwinListeners } : {}),
       argvHash,
       cwd: childSpec.cwd,
       stdin: childSpec.stdin || '',
@@ -10071,6 +10114,7 @@ class OwnedCodexProxyRunner {
         stdin: 'ignore',
         stdout: 'ignore',
         stderr: 'ignore',
+        ...(darwinListeners ? { darwinListeners } : {}),
         sessionId: spec.sessionId,
         reservationId: spec.reservationId,
         targetKey: this.targetKey,
@@ -10372,7 +10416,7 @@ async function runOwnedCodexProxy(requestPath) {
       !/^[a-f0-9]{64}$/.test(request.argvHash || '')) {
     throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy request is invalid')
   }
-  let windowsTempDirectory
+  let windowsTempDirectory, darwinListeners
   try {
     if (request.windowsTempDirectory !== undefined) {
       if (process.platform !== 'win32') {
@@ -10380,12 +10424,17 @@ async function runOwnedCodexProxy(requestPath) {
       }
       windowsTempDirectory = validateWindowsTempDescriptorShape(request.windowsTempDirectory)
     }
-    const expectedArgvHash = windowsTempDirectory && hashText(JSON.stringify({
+    if (Object.hasOwn(request, 'darwinListeners')) {
+      darwinListeners = canonicalDarwinListeners(request.darwinListeners)
+      if (!request.relayStdin) throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listener proxy requires its prepared relay')
+    }
+    const expectedArgvHash = hashText(JSON.stringify({
       executable: request.executable,
       argv: request.argv,
-      windowsTempDirectory,
+      ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+      ...(darwinListeners ? { darwinListeners } : {}),
     }))
-    if (windowsTempDirectory && expectedArgvHash !== request.argvHash) {
+    if (expectedArgvHash !== request.argvHash) {
       throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy executable request binding is invalid')
     }
   } catch (error) {
@@ -10499,7 +10548,7 @@ async function runOwnedCodexProxy(requestPath) {
       env: childEnvironment,
       shell: false,
       windowsHide: true,
-      stdio: [relay || 'pipe', 'pipe', 'pipe'],
+      stdio: darwinListeners ? [relay || 'pipe', 'pipe', 'pipe', darwinListeners.proxy.fd, darwinListeners.mcp.fd] : [relay || 'pipe', 'pipe', 'pipe'],
     })
   } catch (error) { failBeforeChild(error) }
   child?.once?.('spawn', () => recordPhase('spawned'))

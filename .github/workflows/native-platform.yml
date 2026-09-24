@@ -1214,6 +1214,16 @@ jobs:
         run: |
           set -o pipefail
           node --test --test-reporter=tap tests/source/darwin-launchd-listener-handoff-native.test.cjs 2>&1 | tee darwin-launchd-listener-handoff.log
+      - name: Verify production listener supervisor and owned generation recovery
+        timeout-minutes: 7
+        shell: bash
+        env:
+          AUTOPROMPT_DARWIN_LISTENER_PRODUCTION: '1'
+          AUTOPROMPT_DARWIN_LISTENER_HANDOFF_EVIDENCE: ${{ runner.temp }}/darwin-listener-production/evidence.json
+        run: |
+          set -o pipefail
+          mkdir -m 700 "$RUNNER_TEMP/darwin-listener-production"
+          node --test --test-reporter=tap tests/source/darwin-launchd-listener-handoff-native.test.cjs tests/source/darwin-launchd-process-native.test.cjs 2>&1 | tee darwin-listener-production.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -1222,6 +1232,8 @@ jobs:
             darwin-launchd-listener-handoff.log
             ${{ runner.temp }}/darwin-launchd-listener-handoff-evidence.json
             ${{ runner.temp }}/darwin-launchd-listener-handoff
+            darwin-listener-production.log
+            ${{ runner.temp }}/darwin-listener-production
           if-no-files-found: error
 
   macos-helper-build:

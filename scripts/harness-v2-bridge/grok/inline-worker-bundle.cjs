@@ -82,12 +82,13 @@ function buildGrokInlineWorker(options = {}) {
 function buildGrokInlineMcpClient(options = {}) {
   const nodeExecutable = options.nodeExecutable
   const port = options.port === undefined ? 19778 : options.port
+  const host = options.host === undefined ? '127.0.0.1' : options.host
   const absoluteExecutable = options.platform === 'win32' ? path.win32.isAbsolute(nodeExecutable || '') : path.isAbsolute(nodeExecutable || '')
   if (typeof nodeExecutable !== 'string' || !absoluteExecutable ||
-      !Number.isSafeInteger(port) || port < 1024 || port > 65535) fail('GROK_INLINE_BUNDLE_INVALID', 'Inline MCP command is invalid')
+      !Number.isSafeInteger(port) || port < 1024 || port > 65535 || !['127.0.0.1', '::1'].includes(host)) fail('GROK_INLINE_BUNDLE_INVALID', 'Inline MCP command is invalid')
   const modules = Object.fromEntries(GROK_MCP_MODULES.map(id => [id, fs.readFileSync(path.join(__dirname, id), 'utf8')]))
   const bundle = buildClosedCommonJsBundle({ modules, entry: 'mcp-loopback.cjs', allowedBuiltins: GROK_MCP_BUILTINS })
-  const argv = ['-e', bundle.bootstrap, '--', 'autoprompt-grok-inline-mcp.cjs', '--port', String(port)]
+  const argv = ['-e', bundle.bootstrap, '--', 'autoprompt-grok-inline-mcp.cjs', '--port', String(port), ...(host === '::1' ? ['--host', host] : [])]
   const commandLineUtf16Units = windowsCommandLineUnits(nodeExecutable, argv)
   if (commandLineUtf16Units > WINDOWS_SAFE_COMMAND_LINE_UNITS) fail('GROK_INLINE_BUNDLE_TOO_LARGE', 'Inline MCP command exceeds the bounded Windows command line')
   return Object.freeze({ ...bundle, executable: nodeExecutable, argv: Object.freeze(argv), commandLineUtf16Units })

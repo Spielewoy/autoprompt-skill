@@ -12,6 +12,7 @@ const MANIFEST = 'manifest.json'
 const SOURCE_PATH = path.join(__dirname, 'darwin-coalition-helper.c')
 const ARCHITECTURES = Object.freeze({ x64: Object.freeze({ file: 'coalition-helper-x64', cpuType: 0x01000007 }), arm64: Object.freeze({ file: 'coalition-helper-arm64', cpuType: 0x0100000c }) })
 const MINIMUM_MACOS = Object.freeze([13, 5, 0])
+const COALITION_DESCRIPTOR = Object.freeze({ kind: 'autoprompt-darwin-coalition-runtime', label: 'Darwin coalition', architectures: ARCHITECTURES })
 
 function fail(code, message) { const error = new Error(message); error.code = code; throw error }
 function sha256(value) { return crypto.createHash('sha256').update(value).digest('hex') }
@@ -76,42 +77,46 @@ function parseMachO(bytes) {
   if (cursor !== 32 + commandsSize || minimumRecords !== 1 || !minimum) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin helper Mach-O has no unique macOS build minimum')
   return Object.freeze({ cpuType, minimumMacOS: Object.freeze(minimum), littleEndian: little })
 }
-function parseManifest(bytes) {
-  if (bytes.length > 65536) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition manifest exceeds its bound')
+function parseManifestInternal(bytes, descriptor) {
+  if (bytes.length > 65536) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} manifest exceeds its bound`)
   let value
   try { value = JSON.parse(bytes) } catch { fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition manifest is not JSON') }
-  if (!equalKeys(value, ['schemaVersion', 'kind', 'helperCSourceSha256', 'minimumMacOS', 'architectures', 'provenance']) || value.schemaVersion !== 1 || value.kind !== 'autoprompt-darwin-coalition-runtime' || !HASH.test(value.helperCSourceSha256 || '') || value.minimumMacOS !== '13.5') fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition manifest schema is invalid')
-  if (!equalKeys(value.architectures, ['x64', 'arm64']) || !value.provenance || typeof value.provenance !== 'object' || Array.isArray(value.provenance) || !equalKeys(value.provenance, ['sourceRepository', 'sourceCommit', 'buildWorkflow', 'artifacts']) || typeof value.provenance.sourceRepository !== 'string' || !value.provenance.sourceRepository || Buffer.byteLength(value.provenance.sourceRepository) > 2048 || /[\r\n\0]/.test(value.provenance.sourceRepository) || !/^[a-f0-9]{40}$/.test(value.provenance.sourceCommit || '') || typeof value.provenance.buildWorkflow !== 'string' || !value.provenance.buildWorkflow || Buffer.byteLength(value.provenance.buildWorkflow) > 2048 || /[\r\n\0]/.test(value.provenance.buildWorkflow) || !equalKeys(value.provenance.artifacts, ['x64', 'arm64'])) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition manifest provenance is invalid')
-  for (const arch of Object.keys(ARCHITECTURES)) {
+  if (!equalKeys(value, ['schemaVersion', 'kind', 'helperCSourceSha256', 'minimumMacOS', 'architectures', 'provenance']) || value.schemaVersion !== 1 || value.kind !== descriptor.kind || !HASH.test(value.helperCSourceSha256 || '') || value.minimumMacOS !== '13.5') fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} manifest schema is invalid`)
+  if (!equalKeys(value.architectures, ['x64', 'arm64']) || !value.provenance || typeof value.provenance !== 'object' || Array.isArray(value.provenance) || !equalKeys(value.provenance, ['sourceRepository', 'sourceCommit', 'buildWorkflow', 'artifacts']) || typeof value.provenance.sourceRepository !== 'string' || !value.provenance.sourceRepository || Buffer.byteLength(value.provenance.sourceRepository) > 2048 || /[\r\n\0]/.test(value.provenance.sourceRepository) || !/^[a-f0-9]{40}$/.test(value.provenance.sourceCommit || '') || typeof value.provenance.buildWorkflow !== 'string' || !value.provenance.buildWorkflow || Buffer.byteLength(value.provenance.buildWorkflow) > 2048 || /[\r\n\0]/.test(value.provenance.buildWorkflow) || !equalKeys(value.provenance.artifacts, ['x64', 'arm64'])) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} manifest provenance is invalid`)
+  for (const arch of Object.keys(descriptor.architectures)) {
     const artifact = value.provenance.artifacts[arch]
-    if (!equalKeys(artifact, ['artifactId', 'sha256']) || !Number.isSafeInteger(artifact.artifactId) || artifact.artifactId < 1 || !HASH.test(artifact.sha256 || '')) fail('DARWIN_COALITION_UNAVAILABLE', `Darwin coalition manifest ${arch} build provenance is invalid`)
+    if (!equalKeys(artifact, ['artifactId', 'sha256']) || !Number.isSafeInteger(artifact.artifactId) || artifact.artifactId < 1 || !HASH.test(artifact.sha256 || '')) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} manifest ${arch} build provenance is invalid`)
   }
-  for (const [arch, expected] of Object.entries(ARCHITECTURES)) {
+  for (const [arch, expected] of Object.entries(descriptor.architectures)) {
     const entry = value.architectures[arch]
-    if (!equalKeys(entry, ['file', 'sha256', 'size']) || entry.file !== expected.file || !HASH.test(entry.sha256 || '') || !Number.isSafeInteger(entry.size) || entry.size < 32 || entry.size > 32 * 1024 * 1024) fail('DARWIN_COALITION_UNAVAILABLE', `Darwin coalition manifest ${arch} binary binding is invalid`)
+    if (!equalKeys(entry, ['file', 'sha256', 'size']) || entry.file !== expected.file || !HASH.test(entry.sha256 || '') || !Number.isSafeInteger(entry.size) || entry.size < 32 || entry.size > 32 * 1024 * 1024) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} manifest ${arch} binary binding is invalid`)
   }
   return Object.freeze(value)
 }
-function validateDarwinCoalitionRuntime(runtimeRoot, architecture, sourcePath = SOURCE_PATH) {
-  const root = physicalDirectory(runtimeRoot, 'Darwin coalition runtime')
-  const manifestBytes = readPhysical(child(root, MANIFEST, 'manifest'), 'Darwin coalition manifest', 65536)
-  const manifest = parseManifest(manifestBytes)
+function parseManifest(bytes) { return parseManifestInternal(bytes, COALITION_DESCRIPTOR) }
+function validateDarwinRuntimeDescriptor(runtimeRoot, architecture, sourcePath, descriptor) {
+  const root = physicalDirectory(runtimeRoot, `${descriptor.label} runtime`)
+  const manifestBytes = readPhysical(child(root, MANIFEST, 'manifest'), `${descriptor.label} manifest`, 65536)
+  const manifest = parseManifestInternal(manifestBytes, descriptor)
   if (typeof sourcePath !== 'string' || !path.isAbsolute(sourcePath)) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition helper source path is invalid')
-  const source = readPhysical(sourcePath, 'Darwin coalition helper source', 4 * 1024 * 1024)
-  if (sha256(source) !== manifest.helperCSourceSha256) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition helper source binding drifted')
-  const expected = ARCHITECTURES[architecture]
-  if (!expected) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition helper has no supported architecture')
+  const source = readPhysical(sourcePath, `${descriptor.label} source`, 4 * 1024 * 1024)
+  if (sha256(source) !== manifest.helperCSourceSha256) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} source binding drifted`)
+  const expected = descriptor.architectures[architecture]
+  if (!expected) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} has no supported architecture`)
   let selected
-  for (const [arch, expectedArch] of Object.entries(ARCHITECTURES)) {
+  for (const [arch, expectedArch] of Object.entries(descriptor.architectures)) {
     const entry = manifest.architectures[arch], helperPath = child(root, entry.file, 'helper')
-    const helperBytes = readPhysical(helperPath, `Darwin coalition ${arch} helper`)
-    if (helperBytes.length !== entry.size || sha256(helperBytes) !== entry.sha256) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition helper binding drifted')
+    const helperBytes = readPhysical(helperPath, `${descriptor.label} ${arch} helper`)
+    if (helperBytes.length !== entry.size || sha256(helperBytes) !== entry.sha256) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} binding drifted`)
     const mach = parseMachO(helperBytes)
-    if (mach.cpuType !== expectedArch.cpuType) fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition helper Mach-O architecture differs from its payload path')
-    if (compareVersion(mach.minimumMacOS, MINIMUM_MACOS) !== 0) fail('DARWIN_COALITION_UNAVAILABLE', `Darwin coalition helper build minimum must be macOS ${versionText(MINIMUM_MACOS)}`)
+    if (mach.cpuType !== expectedArch.cpuType) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} Mach-O architecture differs from its payload path`)
+    if (compareVersion(mach.minimumMacOS, MINIMUM_MACOS) !== 0) fail('DARWIN_COALITION_UNAVAILABLE', `${descriptor.label} build minimum must be macOS ${versionText(MINIMUM_MACOS)}`)
     if (arch === architecture) selected = Object.freeze({ path: helperPath, sha256: entry.sha256 })
   }
   return selected
+}
+function validateDarwinCoalitionRuntime(runtimeRoot, architecture, sourcePath = SOURCE_PATH) {
+  return validateDarwinRuntimeDescriptor(runtimeRoot, architecture, sourcePath, COALITION_DESCRIPTOR)
 }
 function loadDarwinCoalitionHelper() {
   if (process.platform !== 'darwin') fail('DARWIN_COALITION_UNAVAILABLE', 'Darwin coalition helper requires native macOS')
@@ -124,4 +129,4 @@ function staticAvailability() {
   } catch (error) { return Object.freeze({ available: false, code: error.code || 'DARWIN_COALITION_UNAVAILABLE', reason: error.message }) }
 }
 
-module.exports = { RUNTIME_ROOT, ARCHITECTURES, MINIMUM_MACOS, parseMachO, parseManifest, validateDarwinCoalitionRuntime, loadDarwinCoalitionHelper, staticAvailability }
+module.exports = { RUNTIME_ROOT, ARCHITECTURES, MINIMUM_MACOS, parseMachO, parseManifest, validateDarwinRuntimeDescriptor, validateDarwinCoalitionRuntime, loadDarwinCoalitionHelper, staticAvailability }

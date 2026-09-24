@@ -114,6 +114,21 @@ function prepareProcessLaunchEnvironment(adapter, reservationId, environment = {
     : Object.freeze({ ...environment, ...controls })
 }
 
+function validateDarwinLaunchListeners(value) {
+  let listeners
+  try { listeners = require('./darwin-launchd-process.js').validateDarwinListeners(value) }
+  catch (error) {
+    if (error && error.code === 'LAUNCH_SPEC_INVALID') throw error
+    fail('LAUNCH_SPEC_INVALID', 'Darwin listener descriptor is invalid')
+  }
+  // Do not retain a caller-owned nested object across any asynchronous owner
+  // boundary, even when the adapter returned an immutable canonical view.
+  return Object.freeze({
+    proxy: Object.freeze({ fd: listeners.proxy.fd, host: listeners.proxy.host, port: listeners.proxy.port }),
+    mcp: Object.freeze({ fd: listeners.mcp.fd, host: listeners.mcp.host, port: listeners.mcp.port }),
+  })
+}
+
 const WINDOWS_CANONICAL_ENVIRONMENT_KEYS = Object.freeze(new Map([
   'appdata', 'codex_home', 'comspec', 'home', 'localappdata', 'os', 'path', 'pathext',
   'systemdrive', 'systemroot', 'temp', 'tmp', 'userprofile', 'windir', 'xdg_config_home',
@@ -467,6 +482,13 @@ class ProcessOwner {
     if (spec.requireShortCwd !== undefined && typeof spec.requireShortCwd !== 'boolean') {
       fail('LAUNCH_SPEC_INVALID', 'short cwd requirement must be boolean')
     }
+    let darwinListeners
+    if (Object.hasOwn(spec, 'darwinListeners')) {
+      if (this.adapter.kind !== 'darwin-launchd-coalition') {
+        fail('LAUNCH_SPEC_INVALID', 'Darwin listener descriptors require the Darwin coalition adapter')
+      }
+      darwinListeners = validateDarwinLaunchListeners(spec.darwinListeners)
+    }
     if (spec.env !== undefined && (!spec.env || typeof spec.env !== 'object' || Array.isArray(spec.env) ||
         Object.entries(spec.env).some(([name, value]) => !name || name.includes('\0') ||
           typeof value !== 'string' || value.includes('\0')))) {
@@ -568,6 +590,7 @@ class ProcessOwner {
         stdin: spec.stdin,
         stdout: spec.stdout,
         stderr: spec.stderr,
+        ...(darwinListeners ? { darwinListeners } : {}),
         ...(spec.requireShortCwd === true ? { requireShortCwd: true } : {}),
       })
     } catch (error) {

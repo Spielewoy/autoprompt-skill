@@ -140,7 +140,8 @@ test('Windows helper staging copies only bound native files into verified privat
   const calls = [], original = path.resolve(__dirname, '../../agents/codex/workflow')
   const modes = fs.statSync(original).mode
   const deployment = windowsModule('windows-helper-deployment.js', {
-    './safe-run-root.js': { ensureWindowsPrivateAcl(directory) { calls.push(['private', directory]) } },
+    './safe-run-root.js': { ensureWindowsPrivateAcl(directory) { calls.push(['private', directory]) }, auditPrivatePermissions() {},
+      inspectPathNoFollow(directory) { const stat = fs.lstatSync(directory); return { exists: true, realpath: fs.realpathSync.native(directory), identity: { dev: String(stat.dev), ino: String(stat.ino) } } } },
     './windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent(file) { calls.push(['verify', path.dirname(file)]) } } } },
   }).stageWindowsHelperDeployment(root)
   assert.equal(calls[0][0], 'verify')
@@ -153,8 +154,36 @@ test('Windows helper staging copies only bound native files into verified privat
   assert.deepEqual(names, ['windows-appcontainer-native.cs', 'windows-appcontainer-resources-native.cs', 'windows-appcontainer-resources.ps1', 'windows-appcontainer.ps1'])
   for (const name of names) assert.deepEqual(fs.readFileSync(path.join(deployment.root, name)), fs.readFileSync(path.join(original, name)))
   assert.equal(fs.statSync(original).mode, modes, 'the shared installed/source runtime is never relabeled')
+  assert.deepEqual(Object.keys(deployment.cleanupBinding).sort(), ['identity', 'root'])
+  deployment.cleanup()
   deployment.cleanup()
   assert.deepEqual(fs.readdirSync(root), [])
+})
+
+test('Windows helper staging uses the authenticated short compiler root for a deep controller deployment', t => {
+  const base = fs.realpathSync.native(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'windows-stage-short-')))
+  const control = path.join(base, ...Array.from({ length: 10 }, (_, index) => `deep-${index}-${'x'.repeat(24)}`))
+  const localAppData = path.join(base, 'local')
+  fs.mkdirSync(control, { recursive: true }); fs.mkdirSync(localAppData)
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const calls = []
+  const helper = windowsModule('windows-helper-deployment.js', {
+    './safe-run-root.js': { ensureWindowsPrivateAcl(directory) { calls.push(['private', directory]) }, auditPrivatePermissions(directory) { calls.push(['audit', directory]) },
+      createWindowsCompilerDirectory(prefix) { return fs.mkdtempSync(path.join(localAppData, prefix)) },
+      windowsControllerEnvironment() { return { LOCALAPPDATA: localAppData } },
+      inspectPathNoFollow(directory) { const stat = fs.lstatSync(directory); return { exists: true, realpath: fs.realpathSync.native(directory), identity: { dev: String(stat.dev), ino: String(stat.ino) } } } },
+    './windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent(file) { calls.push(['verify', path.dirname(file)]) } } } },
+  })
+  const deployment = helper.stageWindowsHelperDeployment(control, { shortPrivateRoot: true })
+  assert.equal(path.dirname(deployment.root), localAppData)
+  assert.notEqual(path.dirname(deployment.root), control)
+  assert.match(path.basename(deployment.root), /^native-helpers-[A-Za-z0-9]{6}$/)
+  assert.ok(calls.some(([kind, directory]) => kind === 'audit' && directory === deployment.root), 'external helper root receives a protected-DACL audit')
+  const moved = deployment.root + '-moved'
+  fs.renameSync(deployment.root, moved); fs.mkdirSync(deployment.root)
+  assert.throws(() => deployment.cleanup(), { code: 'WINDOWS_RUNTIME_MISMATCH' })
+  assert.equal(fs.existsSync(deployment.root), true, 'cleanup never deletes a replacement at the staged name')
+  assert.throws(() => helper.assertTrustedWindowsHelperDeployment(control, path.join(base, 'untrusted', 'native-helpers-ABC123')), { code: 'WINDOWS_RUNTIME_MISMATCH' })
 })
 
 test('Windows helper staging refuses unverified parents and linked helper inputs without residue', t => {
@@ -172,7 +201,7 @@ test('Windows helper staging refuses unverified parents and linked helper inputs
   fs.writeFileSync(real, 'bounded helper fixture')
   fs.linkSync(real, path.join(source, 'windows-appcontainer.ps1'))
   const unsafe = windowsModule('windows-helper-deployment.js', {
-    './safe-run-root.js': { ensureWindowsPrivateAcl() {} },
+    './safe-run-root.js': { ensureWindowsPrivateAcl() {}, inspectPathNoFollow(directory) { const stat = fs.lstatSync(directory); return { exists: true, realpath: fs.realpathSync.native(directory), identity: { dev: String(stat.dev), ino: String(stat.ino) } } } },
     './windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent() {} } } },
   }, source)
   assert.throws(() => unsafe.stageWindowsHelperDeployment(control), { code: 'WINDOWS_RUNTIME_MISMATCH' })
@@ -186,7 +215,7 @@ test('Windows helper staging preserves its primary refusal and accounts for an u
   let owned, removed
   const helpers = windowsModule('windows-helper-deployment.js', {
     'node:fs': { ...fs, rmSync(directory, options) { removed = directory; assert.equal(options.maxRetries, 10); assert.equal(options.retryDelay, 100); throw Object.assign(Error('controlled removal refusal'), { code: 'EACCES' }) } },
-    './safe-run-root.js': { ensureWindowsPrivateAcl(directory) { owned = directory; throw primary } },
+    './safe-run-root.js': { ensureWindowsPrivateAcl(directory) { owned = directory; throw primary }, inspectPathNoFollow(directory) { const stat = fs.lstatSync(directory); return { exists: true, realpath: fs.realpathSync.native(directory), identity: { dev: String(stat.dev), ino: String(stat.ino) } } } },
     './windows-filesystem.js': { createWindowsFilesystemCapture() { return { assertRecordParent() {} } } },
   })
   assert.throws(() => helpers.stageWindowsHelperDeployment(root), error => error === primary && error.code === 'PRIVACY_UNSUPPORTED' && error.cleanupConfirmed === false && error.retainedHelperRoot === owned && error.cleanupCode === 'EACCES')

@@ -59,12 +59,12 @@ function createMcpLoopbackServer(options = {}) {
   }
 }
 function parsePort(argv) {
-  if (argv.length !== 2 || argv[0] !== '--port' || !/^\d+$/u.test(argv[1])) fail('GROK_MCP_RELAY_CONFIG_INVALID', 'Use --port <loopback-port>')
-  return Number(argv[1])
+  if ((argv.length !== 2 && argv.length !== 4) || argv[0] !== '--port' || !/^\d+$/u.test(argv[1]) || argv.length === 4 && (argv[2] !== '--host' || argv[3] !== '::1')) fail('GROK_MCP_RELAY_CONFIG_INVALID', 'Use --port <loopback-port> [--host ::1]')
+  return { port: Number(argv[1]), host: argv.length === 4 ? '::1' : '127.0.0.1' }
 }
 if (require.main === module) {
-  const port = parsePort(process.argv.slice(2))
-  const socket = net.createConnection(port, '127.0.0.1')
+  const endpoint = parsePort(process.argv.slice(2))
+  const socket = net.createConnection(endpoint.port, endpoint.host)
   socket.pipe(process.stdout); process.stdin.pipe(socket)
   socket.once('error', error => { process.stderr.write(`${error.message}\n`); process.exitCode = 1 })
 }

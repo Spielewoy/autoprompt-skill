@@ -94,7 +94,10 @@ test('prepareLaunch passes reservation-private roots and closed Windows environm
   const result = await launch.prepareLaunch({ session, config: { ...session.config, model: 'grok', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { autoprompt_owned__read: 'read' }, issuedCalls: [], systemRoot: 'C:\\Windows', systemPath: 'C:\\Windows\\System32' }, sessionRoot: session.sessionRoot, launchRoot: session.launchRoot,
     grokExecutable: f.grokExecutable, processOwner: {}, binding: { reservationId: 'r', sessionId: 's', targetKey: 'grok' },
     pipe: { socketPath: '\\\\.\\pipe\\autoprompt-grok-' + 'a'.repeat(64) }, spec: { argv: ['--verbatim'], taskRoot: path.join(f.root, 'task'), candidateRoot: path.join(f.root, 'candidate') },
-    _dependencies: { stageWindowsHelperDeployment: controlRoot => ({ root: path.join(controlRoot, 'staged-helper'), cleanup() {} }), prepareSandbox: async options => { observed = options; return resource } } })
+    _dependencies: { stageWindowsHelperDeployment: (controlRoot, stageOptions) => {
+      assert.deepEqual(stageOptions, { shortPrivateRoot: true })
+      return { root: path.join(controlRoot, 'staged-helper'), cleanupBinding: { root: path.join(controlRoot, 'staged-helper'), identity: { dev: '1', ino: '2' } }, cleanup() {} }
+    }, prepareSandbox: async options => { observed = options; return resource } } })
   assert.equal(typeof result.cleanup, 'function')
   assert.deepEqual(observed.policy.writableRoots, [session.privateRoots.cwd, session.privateRoots.scratch, session.privateRoots.home])
   assert.equal(observed.controlRoot, session.privateRoots.control)
@@ -132,10 +135,11 @@ test('prepareLaunch reaches the real broker materializer with a sealed worker co
       async release(evidence) { assert.equal(options.verifyDrainEvidence(evidence, { profileSid: this.profileSid, leaseId: this.recovery.leaseId }), true); released++ },
     }) } }
   const owner = { async issueBoundDrainReceipt(expected) { return { expected } }, verifyBoundDrainReceipt(receipt, expected) { return JSON.stringify(receipt.expected) === JSON.stringify(expected) } }
+  const controlStat = fs.statSync(session.privateRoots.control, { bigint: true })
   const config = { ...session.config, model: 'grok', relayToken: 'a'.repeat(64), proxyToken: 'b'.repeat(64), allowedMcpTools: { autoprompt_owned__read: 'read' }, issuedCalls: [], systemRoot: 'C:\\Windows', systemPath: 'C:\\Windows\\System32' }
   const prepared = await launch.prepareLaunch({ session, config, sessionRoot: session.sessionRoot, launchRoot: session.launchRoot, processOwner: owner,
     binding: { reservationId: 'r', sessionId: 's', targetKey: 'grok' }, pipe: { socketPath: '\\\\.\\pipe\\autoprompt-grok-' + 'a'.repeat(64) }, spec: { argv: ['--verbatim'] },
-    _dependencies: { stageWindowsHelperDeployment: root => ({ root, cleanup() { stagedCleanup++ } }), materializeRuntime: () => runtime,
+    _dependencies: { stageWindowsHelperDeployment: root => ({ root, cleanupBinding: { root, identity: { dev: String(controlStat.dev), ino: String(controlStat.ino) } }, cleanup() { stagedCleanup++ } }), materializeRuntime: () => runtime,
       buildWorker: () => ({ payloadSha256: 'c'.repeat(64), moduleSha256: { 'sandbox-worker.cjs': 'd'.repeat(64) }, executable: session.nodeExecutable, argv: ['-e', 'worker'] }),
       createLauncher: () => launcher, resources } })
   const request = JSON.parse(fs.readFileSync(prepared.launch.argv[4], 'utf8'))
