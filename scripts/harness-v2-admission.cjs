@@ -88,7 +88,8 @@ function runtimeIdentityBody(provider, installed, executable) {
   }
   // Windows npm shims are never executed through cmd.exe. Their raw shim hash
   // remains the executable identity, while this separately binds the exact
-  // Node interpreter and package script used for every shell:false launch.
+  // Node interpreter/package script or native package executable used for every
+  // shell:false launch.
   const launchInvocationSha256 = executable.invocation ? (() => {
     executableInvocation(executable)
     return executable.invocation.sha256

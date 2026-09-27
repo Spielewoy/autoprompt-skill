@@ -13,6 +13,10 @@ const npm10NodeShim = target => [
   'IF EXIST "%dp0%\\node.exe" (', '  SET "_prog=%dp0%\\node.exe"', ') ELSE (', '  SET "_prog=node"', '  SET PATHEXT=%PATHEXT:;.JS;=;%', ')', '',
   `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${target}" %*`, '',
 ].join('\r\n')
+const npm10NativeShim = target => [
+  '@ECHO off', 'GOTO start', ':find_dp0', 'SET dp0=%~dp0', 'EXIT /b', ':start', 'SETLOCAL', 'CALL :find_dp0',
+  `"%dp0%\\${target}"   %*`, '',
+].join('\r\n')
 
 function fixture(t, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-npm-shim-'))
@@ -27,6 +31,22 @@ function fixture(t, options = {}) {
   const shim = path.join(bin, 'grok.cmd')
   fs.writeFileSync(shim, options.source || npm10NodeShim('..\\fixture-cli\\bin\\fixture.js'), { mode: 0o700 })
   return { root, packageRoot, bin, shim, script }
+}
+
+async function nativeFixture(t, options = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-native-npm-shim-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const packageRoot = path.join(root, 'node_modules', 'fixture-cli')
+  const bin = path.join(root, 'node_modules', '.bin')
+  const executable = path.join(packageRoot, 'bin', 'fixture.exe')
+  fs.mkdirSync(path.dirname(executable), { recursive: true, mode: 0o700 })
+  fs.mkdirSync(bin, { recursive: true, mode: 0o700 })
+  fs.writeFileSync(executable, 'MZ fixture native executable\n', { mode: 0o700 })
+  fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 'fixture-cli', version: '1.0.0', bin: { grok: options.bin || 'bin/fixture.exe' } }), { mode: 0o600 })
+  const shim = path.join(bin, 'grok.cmd')
+  await cmdShim(executable, shim.slice(0, -'.cmd'.length))
+  if (options.source) fs.writeFileSync(shim, options.source, { mode: 0o700 })
+  return { root, packageRoot, bin, shim, executable }
 }
 
 async function currentNpmFixture(t) {
@@ -55,13 +75,55 @@ test('Windows npm10 cmd-shim resolves to exact Node plus declared package bin wi
   assert.equal(probe.path, f.shim)
   assert.equal(probe.invocation.sha256, binding.invocation.sha256)
   assert.equal(native.executableRuntimePath(probe), f.script)
-  assert.ok(probe.portableRuntimeIdentity.files.some(([label]) => label === 'interpreter/node'),
+  assert.ok(probe.portableRuntimeIdentity.files.some(([label]) => /^interpreter\/node(?:\.exe)?$/iu.test(label)),
     'the portable closure binds the verified Node interpreter, not /usr/bin/env')
   assert.ok(!probe.portableRuntimeIdentity.files.some(([label]) => label === 'interpreter/env'),
     'the env selector is never part of a shell-free shim launch')
   assert.equal(calls.length, 2)
   assert.ok(calls.every(call => call.executable === process.execPath && call.argv[0] === f.script && call.options.shell === false),
     'the probe must never dispatch the .cmd through a command shell')
+})
+
+test('Windows npm cmd-shim resolves a declared native package bin without cmd.exe', async t => {
+  const f = await nativeFixture(t)
+  const binding = native.locateExecutable({ provider: 'grok', executable: f.shim, platform: 'win32' })
+  assert.equal(binding.path, f.shim)
+  assert.equal(binding.sha256, native.executableSha256(f.shim), 'the raw shim remains the executable identity')
+  assert.equal(binding.invocation.kind, 'native-executable')
+  assert.equal(binding.invocation.executable.path, f.executable)
+  assert.equal(binding.invocation.executable.sha256, native.executableSha256(f.executable))
+  const launch = native.executableInvocation(binding, ['--version'])
+  assert.equal(launch.executable, f.executable)
+  assert.deepEqual(launch.argv, ['--version'])
+
+  const calls = []
+  const probe = native.probeExecutable({ provider: 'grok', executable: f.shim, platform: 'win32', env: { PATH: process.env.PATH }, spawnSync: (executable, argv, options) => {
+    calls.push({ executable, argv, options })
+    return { status: 0, stdout: argv.includes('--version') ? 'grok 1.0.13\n' : '-p --output-format --resume --model --tools --verbatim --system-prompt-override --no-subagents\n', stderr: '' }
+  } })
+  assert.equal(probe.path, f.shim)
+  assert.equal(probe.invocation.sha256, binding.invocation.sha256)
+  assert.equal(native.executableRuntimePath(probe), f.executable)
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every(call => call.executable === f.executable && !call.argv.includes(f.shim) && call.options.shell === false),
+    'the probe must invoke the native package bin directly and never dispatch the .cmd through a command shell')
+
+  const tampered = { ...binding, invocation: { ...binding.invocation, executable: { ...binding.invocation.executable, path: 7 } } }
+  assert.throws(() => native.executableInvocation(tampered, ['--help']), { code: 'PROVIDER_IDENTITY_MISMATCH' })
+  fs.appendFileSync(f.executable, 'changed\n')
+  assert.throws(() => native.executableInvocation(binding, ['--help']), { code: 'PROVIDER_IDENTITY_MISMATCH' })
+})
+
+test('Windows npm native cmd-shim resolution rejects flags, escaping paths, and manifest mismatches', async t => {
+  const flags = await nativeFixture(t, { source: npm10NativeShim('..\\fixture-cli\\bin\\fixture.exe').replace('   %*', ' --flag %*') })
+  assert.throws(() => native.locateExecutable({ provider: 'grok', executable: flags.shim, platform: 'win32' }), { code: 'PROVIDER_UNSUPPORTED' })
+
+  const mismatched = await nativeFixture(t, { bin: 'bin/other.exe' })
+  assert.throws(() => native.locateExecutable({ provider: 'grok', executable: mismatched.shim, platform: 'win32' }), { code: 'PROVIDER_IDENTITY_MISMATCH' })
+
+  const escaping = await nativeFixture(t, { bin: '../escape.exe', source: npm10NativeShim('..\\escape.exe') })
+  fs.writeFileSync(path.join(escaping.root, 'node_modules', 'escape.exe'), 'MZ escape\n', { mode: 0o700 })
+  assert.throws(() => native.locateExecutable({ provider: 'grok', executable: escaping.shim, platform: 'win32' }), { code: 'PROVIDER_UNSUPPORTED' })
 })
 
 test('Windows npm shim resolution rejects ambiguous, escaping, and manifest-mismatched scripts', t => {

@@ -99,11 +99,13 @@ function windowsNpmShimInvocation(shim) {
   // that whole fixed Node form, including its no-argument final invocation;
   // do not treat `%_prog%` as a general command-language variable.
   const currentNpmNodeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n\r?\nIF EXIST "%dp0%\\node\.exe" \(\r?\n  SET "_prog=%dp0%\\node\.exe"\r?\n\) ELSE \(\r?\n  SET "_prog=node"\r?\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r?\n\)\r?\n\r?\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\([^"%&|<>\r\n]+?\.(?:cjs|mjs|js))" %\*\r?\n$/iu
-  const command = currentNpmNodeShim.exec(source)
-  if (!command) fail('PROVIDER_UNSUPPORTED', 'npm command shim is not the reviewed plain-Node cmd-shim form')
-  const script = path.resolve(directory, command[1].replaceAll('\\', path.sep))
-  const packageRoot = windowsPackageRoot(script)
-  unlinkedDescendant(packageRoot, script)
+  const currentNpmNativeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n"%dp0%\\([^"%&|<>\r\n]+?\.exe)" +%\*\r?\n$/iu
+  const nodeCommand = currentNpmNodeShim.exec(source)
+  const nativeCommand = currentNpmNativeShim.exec(source)
+  if (!nodeCommand && !nativeCommand) fail('PROVIDER_UNSUPPORTED', 'npm command shim is not the reviewed plain-Node or native-executable cmd-shim form')
+  const entrypoint = path.resolve(directory, (nodeCommand || nativeCommand)[1].replaceAll('\\', path.sep))
+  const packageRoot = windowsPackageRoot(entrypoint)
+  unlinkedDescendant(packageRoot, entrypoint)
   let manifest
   try { manifest = JSON.parse(readBound(path.join(packageRoot, 'package.json')).toString('utf8')) } catch { fail('PROVIDER_UNSUPPORTED', 'npm command shim package metadata is unreadable') }
   const shimName = path.basename(shim, '.cmd').toLowerCase()
@@ -113,7 +115,13 @@ function windowsNpmShimInvocation(shim) {
     fail('PROVIDER_UNSUPPORTED', 'npm command shim does not name an exact declared package bin')
   }
   const declared = path.resolve(packageRoot, bins[shimName].replaceAll('/', path.sep))
-  if (declared !== script) fail('PROVIDER_IDENTITY_MISMATCH', 'npm command shim script differs from its package bin declaration')
+  if (declared !== entrypoint) fail('PROVIDER_IDENTITY_MISMATCH', `npm command shim ${nativeCommand ? 'executable' : 'script'} differs from its package bin declaration`)
+  if (nativeCommand) {
+    const executableSha256Value = executableSha256(entrypoint), shimSha256 = executableSha256(shim)
+    const body = { schemaVersion: 1, kind: 'native-executable', shim: { path: shim, sha256: shimSha256 }, executable: { path: entrypoint, sha256: executableSha256Value } }
+    return Object.freeze({ ...body, sha256: sha256(JSON.stringify(body)) })
+  }
+  const script = entrypoint
   const firstLine = readBound(script).subarray(0, 512).toString('utf8').split(/\r?\n/u, 1)[0]
   if (!/^#!(?:\/usr\/bin\/env\s+node(?:\.exe)?|\/[A-Za-z0-9._/-]*\/node(?:\.exe)?)\s*$/iu.test(firstLine)) {
     fail('PROVIDER_UNSUPPORTED', 'npm command shim entrypoint does not have a plain Node shebang')
@@ -124,7 +132,9 @@ function windowsNpmShimInvocation(shim) {
   return Object.freeze({ ...body, sha256: sha256(JSON.stringify(body)) })
 }
 function executableRuntimePath(binding) {
-  return binding?.invocation?.kind === 'node-script' ? binding.invocation.script.path : binding?.path
+  if (binding?.invocation?.kind === 'node-script') return binding.invocation.script.path
+  if (binding?.invocation?.kind === 'native-executable') return binding.invocation.executable.path
+  return binding?.path
 }
 function executableInvocation(binding, argv = []) {
   if (!binding || typeof binding.path !== 'string' || !/^[a-f0-9]{64}$/.test(binding.sha256 || '') || !Array.isArray(argv) || argv.some(value => typeof value !== 'string' || value.includes('\0'))) {
@@ -133,6 +143,19 @@ function executableInvocation(binding, argv = []) {
   if (executableSha256(binding.path) !== binding.sha256) fail('PROVIDER_IDENTITY_MISMATCH', 'Native executable changed before launch')
   if (!binding.invocation) return Object.freeze({ executable: binding.path, argv: [...argv] })
   const invocation = binding.invocation
+  if (invocation.kind === 'native-executable') {
+    if (invocation.schemaVersion !== 1 || !invocation.shim || !invocation.executable ||
+        typeof invocation.shim.path !== 'string' || typeof invocation.executable.path !== 'string' ||
+        !path.isAbsolute(invocation.shim.path) || !path.isAbsolute(invocation.executable.path) ||
+        invocation.shim.path !== binding.path || invocation.shim.sha256 !== binding.sha256 ||
+        !/^[a-f0-9]{64}$/.test(invocation.executable.sha256 || '') || !/^[a-f0-9]{64}$/.test(invocation.sha256 || '') ||
+        executableSha256(invocation.executable.path) !== invocation.executable.sha256) {
+      fail('PROVIDER_IDENTITY_MISMATCH', 'npm command shim launch binding changed')
+    }
+    const body = { schemaVersion: 1, kind: 'native-executable', shim: invocation.shim, executable: invocation.executable }
+    if (sha256(JSON.stringify(body)) !== invocation.sha256) fail('PROVIDER_IDENTITY_MISMATCH', 'npm command shim launch binding digest changed')
+    return Object.freeze({ executable: invocation.executable.path, argv: [...argv] })
+  }
   if (invocation.kind !== 'node-script' || invocation.schemaVersion !== 1 ||
       !invocation.shim || !invocation.node || !invocation.script ||
       typeof invocation.shim.path !== 'string' || typeof invocation.node.path !== 'string' || typeof invocation.script.path !== 'string' ||
