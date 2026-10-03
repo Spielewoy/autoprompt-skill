@@ -5,12 +5,54 @@
 // owned wrapper. It deliberately does not translate a model API into a second
 // agent loop.
 const fs = require('node:fs')
+const crypto = require('node:crypto')
 const path = require('node:path')
+const YAML = require('yaml')
 const { privateDirectory, readBound, writePrivate } = require('../agents/reasonix/workflow/native.js')
 const boundary = require('./harness-v2-tool-boundary.cjs')
 
 const TOOLSET = 'autoprompt_owned'
+const DIAGNOSTIC_FILE_LIMIT = 1024 * 1024
 const EFFORTS = Object.freeze(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
+const fileType = stat => stat.isFile() ? 'file' : stat.isSymbolicLink() ? 'symlink' : stat.isDirectory() ? 'directory' : 'other'
+const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value
+function stableFileDiagnostic(file, expected, stat) {
+  const expectedBytes = Buffer.from(expected, 'utf8')
+  const details = {
+    type: fileType(stat),
+    nlink: stat.nlink,
+    expectedBytes: expectedBytes.length,
+    actualBytes: Number.isSafeInteger(stat.size) ? stat.size : null,
+    expectedSha256: sha256(expectedBytes),
+    actualSha256: null,
+    changedTopLevelKeys: [],
+    addedTopLevelKeyCount: null,
+    parseStatus: 'not-attempted',
+    readStatus: 'not-readable'
+  }
+  if (!stat.isFile() || stat.nlink !== 1) return { details, matches: false }
+  if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > DIAGNOSTIC_FILE_LIMIT) return { details: { ...details, readStatus: 'size-out-of-range' }, matches: false }
+  let actual
+  try {
+    actual = readBound(file)
+    details.actualSha256 = sha256(actual)
+    details.readStatus = 'stable'
+    const expectedDocument = YAML.parseDocument(expectedBytes.toString('utf8'), { maxAliasCount: 0, uniqueKeys: true })
+    const actualDocument = YAML.parseDocument(actual.toString('utf8'), { maxAliasCount: 0, uniqueKeys: true })
+    if (expectedDocument.errors.length || actualDocument.errors.length) throw new Error('invalid document')
+    const expectedValue = expectedDocument.toJS({ maxAliasCount: 0 })
+    const actualValue = actualDocument.toJS({ maxAliasCount: 0 })
+    if (expectedValue && actualValue && typeof expectedValue === 'object' && typeof actualValue === 'object' && !Array.isArray(expectedValue) && !Array.isArray(actualValue)) {
+      const expectedKeys = Object.keys(expectedValue)
+      details.changedTopLevelKeys = expectedKeys.filter(key => !Object.hasOwn(actualValue, key) || JSON.stringify(canonical(expectedValue[key])) !== JSON.stringify(canonical(actualValue[key]))).sort()
+      details.addedTopLevelKeyCount = Object.keys(actualValue).filter(key => !Object.hasOwn(expectedValue, key)).length
+      if (Number.isSafeInteger(actualValue._config_version) && actualValue._config_version >= 0 && actualValue._config_version <= 1000000) details.actualConfigVersion = actualValue._config_version
+      details.parseStatus = 'valid-object'
+    } else details.parseStatus = 'valid-nonobject'
+  } catch { if (details.readStatus === 'stable') details.parseStatus = 'invalid'; else details.readStatus = 'read-failed' }
+  return { details, matches: !!actual && actual.equals(expectedBytes) }
+}
 const safe = (value, name) => {
   if (typeof value !== 'string' || !value || value.includes('\0') || /[\r\n]/.test(value)) throw new Error(`Invalid Hermes ${name}`)
   return value
@@ -94,7 +136,12 @@ function prepare(options) {
   const stablePrivate = (file, content) => {
     if (fs.existsSync(file)) {
       const stat = fs.lstatSync(file)
-      if (!stat.isFile() || stat.nlink !== 1 || fs.readFileSync(file, 'utf8') !== content) throw new Error(`Hermes persistent file changed: ${path.basename(file)}`)
+      const inspected = stableFileDiagnostic(file, content, stat)
+      if (!inspected.matches) {
+        const error = new Error(`Hermes persistent file changed: ${path.basename(file)}`)
+        error.details = inspected.details
+        throw error
+      }
       return
     }
     writePrivate(file, content)
@@ -109,12 +156,24 @@ function prepare(options) {
   // documented named custom-provider projection applies `extra_body` to every
   // OpenAI-compatible request, which is the narrow native route for a sealed
   // controller cap. No other request override is projected.
-  const config = { plugins: { enabled: [TOOLSET] }, model: { default: safe(model, 'model'), provider: providerName, base_url: url(options.baseUrl, 'base URL'), api_key: safe(apiKey, 'API key') }, providers: { [providerName]: { base_url: url(options.baseUrl, 'base URL'), api_key: safe(apiKey, 'API key'), model: safe(model, 'model'), ...(maxTokens === undefined ? {} : { extra_body: { max_tokens: maxTokens } }) } }, toolsets: [], tools: { tool_search: { enabled: false } }, auxiliary: { title_generation: { enabled: false } }, compression: { enabled: false }, telemetry: { shared_metrics: { enabled: false, send: false } }, agent: { max_turns: Number.isSafeInteger(options.maxTurns) ? options.maxTurns : 32, disabled_toolsets: [] } }
+  const relayBaseUrl = url(options.baseUrl, 'base URL')
+  const relayApiKey = safe(apiKey, 'API key')
+  // A continuation keeps one HERMES_HOME/state.db while each physical launch
+  // receives a fresh controller quota relay. Hermes expands these fixed config
+  // references from the owned child's environment, so the persistent config
+  // remains byte-identical and no live sibling observes a shared-file rewrite.
+  const relayBaseUrlReference = '${env:AUTOPROMPT_HERMES_RELAY_BASE_URL}'
+  const relayApiKeyReference = '${env:AUTOPROMPT_HERMES_RELAY_API_KEY}'
+  // Hermes 0.21.1 uses schema 41. An unversioned config is eligible for
+  // startup migration, which rewrites the session-bound persistent file.
+  // Long tools trigger a one-time Hermes progress tip after 30 seconds. Mark
+  // it seen in this owned noninteractive home so the tip cannot rewrite config.
+  const config = { _config_version: 41, plugins: { enabled: [TOOLSET] }, model: { default: safe(model, 'model'), provider: providerName, base_url: relayBaseUrlReference, api_key: relayApiKeyReference }, providers: { [providerName]: { base_url: relayBaseUrlReference, api_key: relayApiKeyReference, model: safe(model, 'model'), ...(maxTokens === undefined ? {} : { extra_body: { max_tokens: maxTokens } }) } }, toolsets: [], tools: { tool_search: { enabled: false } }, auxiliary: { title_generation: { enabled: false } }, compression: { enabled: false }, telemetry: { shared_metrics: { enabled: false, send: false } }, agent: { max_turns: Number.isSafeInteger(options.maxTurns) ? options.maxTurns : 32, disabled_toolsets: [] }, onboarding: { seen: { tool_progress_prompt: true } } }
   stablePrivate(path.join(persistentHome, 'config.yaml'), JSON.stringify(config))
   const spec = { hermesExecutable, pythonExecutable, home: persistentHome, sessionRoot, promptFile, model, effort, continuationId: continuationId || null, receiptPath: current.receiptPath, toolProjectionPath,
     argv: ['chat', '--query-file', promptFile, '--oneshot', '--model', model, '--provider', providerName, '--toolsets', TOOLSET, '--ignore-rules', ...(effort ? ['--reasoning', effort] : []), ...(continuationId ? ['--resume', continuationId] : [])] }
   const specFile = path.join(home, 'autoprompt-hermes-launch.json')
   writePrivate(specFile, JSON.stringify(spec))
-  return { specFile, env: { HERMES_HOME: persistentHome, HERMES_BUNDLED_PLUGINS: bundled, HERMES_ENABLE_PROJECT_PLUGINS: '0', HERMES_IGNORE_RULES: '1', AUTOPROMPT_TOOL_POLICY: current.policyPath, AUTOPROMPT_TOOL_POLICY_SHA256: current.policySha256, AUTOPROMPT_HERMES_TOOL_PROJECTIONS: toolProjectionPath, AUTOPROMPT_NODE: process.execPath, AUTOPROMPT_TOOL_SERVER: require.resolve('./harness-v2-tool-server.cjs') }, argv: [require.resolve('./harness-v2-bridge/hermes/owned-wrapper.cjs'), '--spec', specFile] }
+  return { specFile, env: { HERMES_HOME: persistentHome, HERMES_BUNDLED_PLUGINS: bundled, HERMES_ENABLE_PROJECT_PLUGINS: '0', HERMES_IGNORE_RULES: '1', AUTOPROMPT_HERMES_RELAY_BASE_URL: relayBaseUrl, AUTOPROMPT_HERMES_RELAY_API_KEY: relayApiKey, AUTOPROMPT_TOOL_POLICY: current.policyPath, AUTOPROMPT_TOOL_POLICY_SHA256: current.policySha256, AUTOPROMPT_HERMES_TOOL_PROJECTIONS: toolProjectionPath, AUTOPROMPT_NODE: process.execPath, AUTOPROMPT_TOOL_SERVER: require.resolve('./harness-v2-tool-server.cjs') }, argv: [require.resolve('./harness-v2-bridge/hermes/owned-wrapper.cjs'), '--spec', specFile] }
 }
 module.exports = { TOOLSET, EFFORTS, sanitizeConnection, selectApiKey, requiredReasoning, prepare }

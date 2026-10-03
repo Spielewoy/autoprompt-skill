@@ -5,6 +5,7 @@
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { pathToFileURL, fileURLToPath } = require('node:url')
 const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const { readBound, sha256, privateDirectory, writePrivate } = require('../agents/reasonix/workflow/native.js')
@@ -98,43 +99,41 @@ function windowsNpmShimInvocation(shim) {
   // npm 10's cmd-shim has a deliberate `%_prog%` fallback skeleton. Match
   // that whole fixed Node form, including its no-argument final invocation;
   // do not treat `%_prog%` as a general command-language variable.
-  const currentNpmNodeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n\r?\nIF EXIST "%dp0%\\node\.exe" \(\r?\n  SET "_prog=%dp0%\\node\.exe"\r?\n\) ELSE \(\r?\n  SET "_prog=node"\r?\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r?\n\)\r?\n\r?\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\([^"%&|<>\r\n]+?\.(?:cjs|mjs|js))" %\*\r?\n$/iu
-  const currentNpmNativeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n"%dp0%\\([^"%&|<>\r\n]+?\.exe)" +%\*\r?\n$/iu
+  const currentNpmNodeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n\r?\nIF EXIST "%dp0%\\node\.exe" \(\r?\n  SET "_prog=%dp0%\\node\.exe"\r?\n\) ELSE \(\r?\n  SET "_prog=node"\r?\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r?\n\)\r?\n\r?\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\([^"%&|<>\r\n]+?)" %\*\r?\n$/iu
+  const currentNpmNativeExeShim = /^@ECHO off\r?\nGOTO start\r?\n:find_dp0\r?\nSET dp0=%~dp0\r?\nEXIT \/b\r?\n:start\r?\nSETLOCAL\r?\nCALL :find_dp0\r?\n"%dp0%\\([^"%&|<>\r\n]+?\.exe)"[ \t]+%\*\r?\n$/iu
   const nodeCommand = currentNpmNodeShim.exec(source)
-  const nativeCommand = currentNpmNativeShim.exec(source)
-  if (!nodeCommand && !nativeCommand) fail('PROVIDER_UNSUPPORTED', 'npm command shim is not the reviewed plain-Node or native-executable cmd-shim form')
-  const entrypoint = path.resolve(directory, (nodeCommand || nativeCommand)[1].replaceAll('\\', path.sep))
+  const nativeCommand = currentNpmNativeExeShim.exec(source)
+  const command = nodeCommand || nativeCommand
+  if (!command) fail('PROVIDER_UNSUPPORTED', 'npm command shim is not a reviewed npm Node or native-executable cmd-shim form')
+  const entrypoint = path.resolve(directory, command[1].replaceAll('\\', path.sep))
+  const kind = nativeCommand ? 'native-exe' : 'node-script'
   const packageRoot = windowsPackageRoot(entrypoint)
   unlinkedDescendant(packageRoot, entrypoint)
   let manifest
   try { manifest = JSON.parse(readBound(path.join(packageRoot, 'package.json')).toString('utf8')) } catch { fail('PROVIDER_UNSUPPORTED', 'npm command shim package metadata is unreadable') }
-  const shimName = path.basename(shim, '.cmd').toLowerCase()
+  const shimName = path.basename(shim).replace(/\.cmd$/iu, '').toLowerCase()
   const packageName = typeof manifest.name === 'string' ? manifest.name.split('/').at(-1).toLowerCase() : ''
   const bins = typeof manifest.bin === 'string' ? { [packageName]: manifest.bin } : manifest.bin
   if (!bins || typeof bins !== 'object' || Array.isArray(bins) || typeof bins[shimName] !== 'string') {
     fail('PROVIDER_UNSUPPORTED', 'npm command shim does not name an exact declared package bin')
   }
   const declared = path.resolve(packageRoot, bins[shimName].replaceAll('/', path.sep))
-  if (declared !== entrypoint) fail('PROVIDER_IDENTITY_MISMATCH', `npm command shim ${nativeCommand ? 'executable' : 'script'} differs from its package bin declaration`)
-  if (nativeCommand) {
-    const executableSha256Value = executableSha256(entrypoint), shimSha256 = executableSha256(shim)
-    const body = { schemaVersion: 1, kind: 'native-executable', shim: { path: shim, sha256: shimSha256 }, executable: { path: entrypoint, sha256: executableSha256Value } }
-    return Object.freeze({ ...body, sha256: sha256(JSON.stringify(body)) })
+  if (declared !== entrypoint) fail('PROVIDER_IDENTITY_MISMATCH', 'npm command shim entrypoint differs from its package bin declaration')
+  if (kind === 'node-script') {
+    const firstLine = readBound(entrypoint).subarray(0, 512).toString('utf8').split(/\r?\n/u, 1)[0]
+    if (!/^#!(?:\/usr\/bin\/env\s+node(?:\.exe)?|\/[A-Za-z0-9._/-]*\/node(?:\.exe)?)\s*$/iu.test(firstLine)) {
+      fail('PROVIDER_UNSUPPORTED', 'npm command shim entrypoint does not have a plain Node shebang')
+    }
   }
-  const script = entrypoint
-  const firstLine = readBound(script).subarray(0, 512).toString('utf8').split(/\r?\n/u, 1)[0]
-  if (!/^#!(?:\/usr\/bin\/env\s+node(?:\.exe)?|\/[A-Za-z0-9._/-]*\/node(?:\.exe)?)\s*$/iu.test(firstLine)) {
-    fail('PROVIDER_UNSUPPORTED', 'npm command shim entrypoint does not have a plain Node shebang')
-  }
-  const nodePath = path.resolve(process.execPath)
-  const nodeSha256 = executableSha256(nodePath), scriptSha256 = executableSha256(script), shimSha256 = executableSha256(shim)
-  const body = { schemaVersion: 1, kind: 'node-script', shim: { path: shim, sha256: shimSha256 }, node: { path: nodePath, sha256: nodeSha256 }, script: { path: script, sha256: scriptSha256 } }
+  const shimSha256 = executableSha256(shim), entrypointSha256 = executableSha256(entrypoint)
+  const body = kind === 'node-script'
+    ? { schemaVersion: 1, kind, shim: { path: shim, sha256: shimSha256 }, node: { path: path.resolve(process.execPath), sha256: executableSha256(path.resolve(process.execPath)) }, script: { path: entrypoint, sha256: entrypointSha256 } }
+    : { schemaVersion: 1, kind, shim: { path: shim, sha256: shimSha256 }, executable: { path: entrypoint, sha256: entrypointSha256 } }
   return Object.freeze({ ...body, sha256: sha256(JSON.stringify(body)) })
 }
 function executableRuntimePath(binding) {
-  if (binding?.invocation?.kind === 'node-script') return binding.invocation.script.path
-  if (binding?.invocation?.kind === 'native-executable') return binding.invocation.executable.path
-  return binding?.path
+  return binding?.invocation?.kind === 'node-script' ? binding.invocation.script.path
+    : binding?.invocation?.kind === 'native-exe' ? binding.invocation.executable.path : binding?.path
 }
 function executableInvocation(binding, argv = []) {
   if (!binding || typeof binding.path !== 'string' || !/^[a-f0-9]{64}$/.test(binding.sha256 || '') || !Array.isArray(argv) || argv.some(value => typeof value !== 'string' || value.includes('\0'))) {
@@ -143,31 +142,26 @@ function executableInvocation(binding, argv = []) {
   if (executableSha256(binding.path) !== binding.sha256) fail('PROVIDER_IDENTITY_MISMATCH', 'Native executable changed before launch')
   if (!binding.invocation) return Object.freeze({ executable: binding.path, argv: [...argv] })
   const invocation = binding.invocation
-  if (invocation.kind === 'native-executable') {
-    if (invocation.schemaVersion !== 1 || !invocation.shim || !invocation.executable ||
-        typeof invocation.shim.path !== 'string' || typeof invocation.executable.path !== 'string' ||
-        !path.isAbsolute(invocation.shim.path) || !path.isAbsolute(invocation.executable.path) ||
-        invocation.shim.path !== binding.path || invocation.shim.sha256 !== binding.sha256 ||
-        !/^[a-f0-9]{64}$/.test(invocation.executable.sha256 || '') || !/^[a-f0-9]{64}$/.test(invocation.sha256 || '') ||
-        executableSha256(invocation.executable.path) !== invocation.executable.sha256) {
-      fail('PROVIDER_IDENTITY_MISMATCH', 'npm command shim launch binding changed')
-    }
-    const body = { schemaVersion: 1, kind: 'native-executable', shim: invocation.shim, executable: invocation.executable }
-    if (sha256(JSON.stringify(body)) !== invocation.sha256) fail('PROVIDER_IDENTITY_MISMATCH', 'npm command shim launch binding digest changed')
-    return Object.freeze({ executable: invocation.executable.path, argv: [...argv] })
-  }
-  if (invocation.kind !== 'node-script' || invocation.schemaVersion !== 1 ||
-      !invocation.shim || !invocation.node || !invocation.script ||
-      typeof invocation.shim.path !== 'string' || typeof invocation.node.path !== 'string' || typeof invocation.script.path !== 'string' ||
-      !path.isAbsolute(invocation.shim.path) || !path.isAbsolute(invocation.node.path) || !path.isAbsolute(invocation.script.path) ||
+  const nodeScript = invocation.kind === 'node-script'
+  const entrypoint = nodeScript ? invocation.script : invocation.executable
+  if (!['node-script', 'native-exe'].includes(invocation.kind) || invocation.schemaVersion !== 1 ||
+      !invocation.shim || !entrypoint ||
+      typeof invocation.shim.path !== 'string' || typeof entrypoint.path !== 'string' ||
+      !path.isAbsolute(invocation.shim.path) || !path.isAbsolute(entrypoint.path) ||
       invocation.shim.path !== binding.path || invocation.shim.sha256 !== binding.sha256 ||
-      !/^[a-f0-9]{64}$/.test(invocation.node.sha256 || '') || !/^[a-f0-9]{64}$/.test(invocation.script.sha256 || '') || !/^[a-f0-9]{64}$/.test(invocation.sha256 || '') ||
-      executableSha256(invocation.node.path) !== invocation.node.sha256 || executableSha256(invocation.script.path) !== invocation.script.sha256) {
+      !/^[a-f0-9]{64}$/.test(entrypoint.sha256 || '') || !/^[a-f0-9]{64}$/.test(invocation.sha256 || '') ||
+      executableSha256(entrypoint.path) !== entrypoint.sha256 ||
+      (nodeScript && (!invocation.node || typeof invocation.node.path !== 'string' || !path.isAbsolute(invocation.node.path) ||
+        !/^[a-f0-9]{64}$/.test(invocation.node.sha256 || '') || executableSha256(invocation.node.path) !== invocation.node.sha256))) {
     fail('PROVIDER_IDENTITY_MISMATCH', 'npm command shim launch binding changed')
   }
-  const body = { schemaVersion: 1, kind: 'node-script', shim: invocation.shim, node: invocation.node, script: invocation.script }
+  const body = nodeScript
+    ? { schemaVersion: 1, kind: invocation.kind, shim: invocation.shim, node: invocation.node, script: invocation.script }
+    : { schemaVersion: 1, kind: invocation.kind, shim: invocation.shim, executable: invocation.executable }
   if (sha256(JSON.stringify(body)) !== invocation.sha256) fail('PROVIDER_IDENTITY_MISMATCH', 'npm command shim launch binding digest changed')
-  return Object.freeze({ executable: invocation.node.path, argv: [invocation.script.path, ...argv] })
+  return Object.freeze(nodeScript
+    ? { executable: invocation.node.path, argv: [invocation.script.path, ...argv] }
+    : { executable: invocation.executable.path, argv: [...argv] })
 }
 function locateExecutable({ provider, env = process.env, executable, platform = process.platform } = {}) {
   const d = descriptor(provider)
@@ -180,8 +174,11 @@ function locateExecutable({ provider, env = process.env, executable, platform = 
     try {
       let resolved = fs.realpathSync.native(name)
       if (provider === 'vscode' && path.basename(path.dirname(resolved)) === 'bin') {
-        const electron = path.join(path.dirname(path.dirname(resolved)), platform === 'win32' ? 'Code.exe' : 'code')
-        if (fs.existsSync(electron)) resolved = fs.realpathSync.native(electron)
+        const bundle = platform === 'darwin' ? vscodeBundleRoot(resolved) : null
+        const vscodeExecutable = bundle
+          ? path.join(bundle, platform === 'win32' ? 'Code.exe' : 'Contents/MacOS/Code')
+          : path.join(path.dirname(path.dirname(resolved)), platform === 'win32' ? 'Code.exe' : 'code')
+        if (fs.existsSync(vscodeExecutable)) resolved = fs.realpathSync.native(vscodeExecutable)
       }
       if (/^(codex|codex\.exe|codex\.js)$/i.test(path.basename(resolved))) fail('PROVIDER_IDENTITY_MISMATCH', 'Codex is not a native executable for this provider')
       fs.accessSync(resolved, fs.constants.X_OK)
@@ -194,6 +191,68 @@ function locateExecutable({ provider, env = process.env, executable, platform = 
     } catch (error) { if (error instanceof HarnessError) throw error }
   }
   fail('PROVIDER_UNSUPPORTED', `${d.command} is not installed or executable`, { provider, command: d.command })
+}
+function vscodeReleaseCliCandidates(root) {
+  try {
+    root = fs.realpathSync.native(root)
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && /^[a-f0-9]{10,64}$/i.test(entry.name))
+      .map(entry => path.join(root, entry.name, 'resources', 'app', 'out', 'cli.js'))
+      .filter(candidate => {
+        try {
+          const stat = fs.lstatSync(candidate)
+          return stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync.native(candidate) === candidate
+        } catch { return false }
+      })
+  } catch { return [] }
+}
+function vscodeBundleRoot(executable) {
+  for (let dir = path.resolve(executable), i = 0; i < 8; dir = path.dirname(dir), i++) {
+    // On a case-insensitive macOS volume, Contents/resources also resolves
+    // Contents/Resources. Do not mistake that directory for a Linux bundle:
+    // its canonical CLI path and framework boundary belong to the .app root.
+    if (path.basename(dir) === 'Contents' && path.basename(path.dirname(dir)).endsWith('.app')) continue
+    const app = path.join(dir, 'resources', 'app')
+    if (fs.existsSync(path.join(app, 'product.json')) && fs.existsSync(path.join(app, 'package.json'))) return fs.realpathSync.native(dir)
+    if (path.basename(dir).endsWith('.app') && fs.existsSync(path.join(dir, 'Contents', 'Resources', 'app', 'product.json')) && fs.existsSync(path.join(dir, 'Contents', 'Resources', 'app', 'package.json'))) return fs.realpathSync.native(dir)
+    // The official Windows 1.136.1 archive keeps Code.exe at extraction root
+    // and ships the application under its release-hash child. Treat that root
+    // as one bundle only when precisely one physical child has the CLI layout.
+    if (i === 1 && vscodeReleaseCliCandidates(dir).length === 1) return fs.realpathSync.native(dir)
+    if (path.dirname(dir) === dir) break
+  }
+  return null
+}
+function bundlePathInside(root, file) {
+  const relative = path.relative(root, file)
+  return !relative || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+}
+function vscodeCliPath(executable) {
+  const resolvedExecutable = fs.realpathSync.native(executable)
+  const bundle = vscodeBundleRoot(resolvedExecutable)
+  if (bundle) {
+    const relative = path.basename(bundle).endsWith('.app')
+      ? path.join('Contents', 'Resources', 'app', 'out', 'cli.js')
+      : path.join('resources', 'app', 'out', 'cli.js')
+    const candidate = path.join(bundle, relative)
+    try {
+      const stat = fs.lstatSync(candidate)
+      if (stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync.native(candidate) === candidate) return candidate
+    } catch {}
+    const candidates = vscodeReleaseCliCandidates(bundle)
+    return candidates.length === 1 ? candidates[0] : null
+  }
+  // The official 1.136.1 Windows archive places Code.exe at its extraction
+  // root while resources live beneath the release commit directory. Bind one
+  // physical immediate child only; arbitrary recursive CLI discovery is unsafe.
+  const root = fs.realpathSync.native(path.dirname(resolvedExecutable))
+  const direct = path.join(root, 'resources', 'app', 'out', 'cli.js')
+  try {
+    const stat = fs.lstatSync(direct)
+    if (stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync.native(direct) === direct) return direct
+  } catch {}
+  const candidates = vscodeReleaseCliCandidates(root)
+  return candidates.length === 1 ? candidates[0] : null
 }
 function runtimeDependencyIdentity(executable, environment = process.env, invocation = null) {
   const roots = new Set(), files = new Map()
@@ -210,6 +269,10 @@ function runtimeDependencyIdentity(executable, environment = process.env, invoca
     totalBytes += fs.statSync(real).size
     if (files.size >= 100000 || totalBytes > 8 * 1024 * 1024 * 1024) fail('PROVIDER_IDENTITY_MISMATCH', 'Runtime dependency inventory exceeds its bounded size')
     files.set(file, [real, executableSha256(real)])
+  }
+  const recordBundleLink = (link, real, root) => {
+    const kind = fs.statSync(real).isDirectory() ? 'directory-link' : 'file-link'
+    files.set(`@link:${link}`, [real, sha256(`${kind}\0${path.relative(root, link)}\0${path.relative(root, real)}`)])
   }
   const visit = root => {
     root = fs.realpathSync.native(root)
@@ -245,22 +308,33 @@ function runtimeDependencyIdentity(executable, environment = process.env, invoca
       else if (Object.hasOwn(manifest.dependencies || {}, name) && !Object.hasOwn(manifest.optionalDependencies || {}, name)) fail('PROVIDER_IDENTITY_MISMATCH', `Runtime dependency is missing: ${name}`)
     }
   }
-  const vscodeBundle = path.dirname(executable)
-  if (fs.existsSync(path.join(vscodeBundle, 'resources/app/product.json')) && fs.existsSync(path.join(vscodeBundle, 'resources/app/package.json'))) {
+  const vscodeBundle = vscodeBundleRoot(executable)
+  if (vscodeBundle) {
     // Electron can stay byte-identical while the VS Code application changes.
     // Bind the complete shipped bundle, including ASARs, native modules and
     // built-in extensions. Never treat the Electron executable hash as enough.
     roots.add(vscodeBundle)
+    const visitedBundleDirs = new Set(), activeBundleDirs = new Set()
     const walkBundle = dir => {
+      const canonical = fs.realpathSync.native(dir)
+      if (!bundlePathInside(vscodeBundle, canonical)) fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle directory escapes its application root')
+      if (activeBundleDirs.has(canonical)) fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle contains a directory-link cycle')
+      if (visitedBundleDirs.has(canonical)) return
+      activeBundleDirs.add(canonical)
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const file = path.join(dir, entry.name)
         if (entry.isDirectory()) walkBundle(file)
         else if (entry.isFile()) record(file)
         else if (entry.isSymbolicLink()) {
-          if (!fs.statSync(file).isFile()) fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle contains an unbound directory link')
-          record(file)
+          const real = fs.realpathSync.native(file)
+          if (!bundlePathInside(vscodeBundle, real)) fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle link escapes its application root')
+          if (fs.statSync(real).isDirectory()) { recordBundleLink(file, real, vscodeBundle); walkBundle(real) }
+          else if (fs.statSync(real).isFile()) { recordBundleLink(file, real, vscodeBundle); record(file) }
+          else fail('PROVIDER_IDENTITY_MISMATCH', 'VS Code bundle contains an unsupported link')
         }
       }
+      activeBundleDirs.delete(canonical)
+      visitedBundleDirs.add(canonical)
     }
     walkBundle(vscodeBundle)
   } else if (first) visit(first)
@@ -326,6 +400,13 @@ function portableRuntimeDependencyIdentity(provider, executable, environment = p
     if (prior && prior !== hash) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable runtime inventory has ambiguous duplicate logical paths')
     if (prior) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable runtime inventory repeats a logical path')
     logicalFiles.set(label, hash)
+  }
+  const recordBundleLink = (label, link, real, root) => {
+    const target = path.relative(root, real).split(path.sep).join('/')
+    const source = path.relative(root, link).split(path.sep).join('/')
+    const marker = `vscode-link/${label}/${source}`
+    if (logicalFiles.has(marker)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle repeats a link identity')
+    logicalFiles.set(marker, sha256(`${fs.statSync(real).isDirectory() ? 'directory-link' : 'file-link'}\0${source}\0${target}`))
   }
   // Interpreters are declared by an absolute launcher shebang and may be a
   // distribution-managed symlink. Bind the final executable bytes, while
@@ -416,17 +497,32 @@ function portableRuntimeDependencyIdentity(provider, executable, environment = p
   if (resolvedExecutable !== path.resolve(executable)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable runtime executable must not be a symbolic link')
   regular(resolvedExecutable)
   let rootBase = null
-  const vscodeBundle = path.dirname(resolvedExecutable)
-  if (provider === 'vscode' && fs.existsSync(path.join(vscodeBundle, 'resources/app/product.json')) && fs.existsSync(path.join(vscodeBundle, 'resources/app/package.json'))) {
+  const vscodeBundle = provider === 'vscode' ? vscodeBundleRoot(resolvedExecutable) : null
+  if (vscodeBundle) {
     rootBase = directory(vscodeBundle); packageCount = 1
+    const visitedBundleDirs = new Set(), activeBundleDirs = new Set()
     const walkBundle = dir => {
+      const canonical = fs.realpathSync.native(dir)
+      if (!bundlePathInside(rootBase, canonical)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle directory escapes its application root')
+      if (activeBundleDirs.has(canonical)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains a directory-link cycle')
+      if (visitedBundleDirs.has(canonical)) return
+      activeBundleDirs.add(canonical)
       for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
         const file = path.join(dir, entry.name), stat = fs.lstatSync(file)
-        if (stat.isSymbolicLink()) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains a symbolic link')
+        if (stat.isSymbolicLink()) {
+          const real = fs.realpathSync.native(file)
+          if (!bundlePathInside(rootBase, real)) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle link escapes its application root')
+          recordBundleLink(`vscode/${safeRelative(rootBase, file)}`, file, real, rootBase)
+          if (fs.statSync(real).isDirectory()) walkBundle(real)
+          else if (fs.statSync(real).isFile()) record(`vscode/${safeRelative(rootBase, file)}`, real)
+          else fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains an unsupported link')
+        }
         if (stat.isDirectory()) walkBundle(file)
         else if (stat.isFile()) record(`vscode/${safeRelative(rootBase, file)}`, file)
-        else fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains an unsupported filesystem entry')
+        else if (!stat.isSymbolicLink()) fail('PROVIDER_IDENTITY_MISMATCH', 'Portable VS Code bundle contains an unsupported filesystem entry')
       }
+      activeBundleDirs.delete(canonical)
+      visitedBundleDirs.add(canonical)
     }
     walkBundle(rootBase)
   } else {
@@ -500,9 +596,32 @@ function hermesClosureRuntime(executable) {
   }
   return Object.freeze({ root, manifestFile, manifest: Object.freeze(manifest), ...result })
 }
+function hermesPosixLauncherBinding(executable, bytes = readBound(executable)) {
+  if (process.platform === 'win32' || !bytes.subarray(0, 64).toString('utf8').startsWith('#!/usr/bin/env bash\n')) return null
+  return require('./harness-v2-bridge/hermes/posix-launcher.cjs').bindHermesPosixLauncher(executable)
+}
+function hermesPythonInterpreter(executable) {
+  const closure = hermesClosureRuntime(executable)
+  if (closure) return closure.python
+  const bytes = readBound(executable)
+  const posix = hermesPosixLauncherBinding(executable, bytes)
+  if (posix) return posix.interpreter.path
+  if (process.platform === 'win32' && bytes.subarray(0, 2).toString('ascii') === 'MZ') {
+    const binding = require('./harness-v2-bridge/hermes/windows-launcher.cjs').parseHermesUvLauncher(bytes)
+    if (binding.architecture !== process.arch) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes trampoline architecture differs from its native host')
+    const interpreter = fs.realpathSync.native(binding.pythonPath)
+    const stat = fs.lstatSync(interpreter)
+    if (!stat.isFile() || stat.isSymbolicLink() || path.basename(interpreter).toLowerCase() !== 'python.exe') fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes trampoline Python is not a physical interpreter')
+    return interpreter
+  }
+  const interpreter = /^#!([^\r\n\s]+)/.exec(bytes.subarray(0, 512).toString('utf8'))?.[1]
+  if (!interpreter || !path.isAbsolute(interpreter)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes launcher has no bound absolute Python interpreter')
+  return interpreter
+}
 function hermesPythonDependencyInventory(executable, environment = process.env) {
   const closure = hermesClosureRuntime(executable)
-  const interpreter = closure?.python || /^#!([^\r\n\s]+)/.exec(readBound(executable).subarray(0, 512).toString('utf8'))?.[1]
+  const posix = closure ? null : hermesPosixLauncherBinding(executable)
+  const interpreter = hermesPythonInterpreter(executable)
   if (!interpreter || !path.isAbsolute(interpreter)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes launcher has no bound absolute Python interpreter')
   // Hermes is commonly installed editable during development. Distribution
   // RECORD files then contain only the finder and metadata, while the actual
@@ -515,6 +634,7 @@ function hermesPythonDependencyInventory(executable, environment = process.env) 
 import importlib.metadata as metadata
 import json
 import os
+import sys
 from pathlib import Path
 import sysconfig
 
@@ -623,11 +743,12 @@ for direct_url in purelib_path.glob("*.dist-info/direct_url.json"):
         editable = isinstance(direct.get("dir_info"), dict) and direct["dir_info"].get("editable") is True
         if not editable or not isinstance(value, str) or not value.startswith("file://"):
             continue
-        from urllib.parse import unquote, urlsplit
+        from urllib.parse import urlsplit
+        from urllib.request import url2pathname
         parsed = urlsplit(value)
         if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
             missing.append(str(direct_url)); continue
-        root = Path(unquote(parsed.path)).resolve()
+        root = Path(url2pathname(parsed.path)).resolve()
         if not root.is_dir():
             missing.append(str(direct_url)); continue
         editable_direct_roots.append((str(root), direct_url.parent.name))
@@ -687,7 +808,10 @@ def add_tree(root, allow_stdlib_links=False):
             links.append({"logicalPath": "python/stdlib-link/" + candidate.relative_to(stdlib_root).as_posix(), "path": str(candidate), "target": str(target.resolve())})
             files.add(str(target.resolve()))
         elif candidate.is_file():
-            files.add(str(candidate.resolve()))
+            # root is already canonical, rglob does not descend directory links,
+            # and the link case above is handled separately. Avoid resolving
+            # every ancestor again for each of thousands of regular files.
+            files.add(str(candidate))
 
 for root in list(source_roots):
     add_tree(root)
@@ -695,6 +819,18 @@ for root in package_roots:
     add_tree(root)
 for root in stdlib_roots:
     add_tree(root, Path(root).resolve() == stdlib_root)
+
+# A Windows venv python.exe redirects into its base installation. Bind the
+# loader configuration, interpreter DLLs and native stdlib extensions as well
+# as Lib; these files do not appear in wheel RECORD inventories.
+if os.name == "nt":
+    for runtime_root in {Path(sys.base_prefix), Path(sys.prefix), Path(sys.executable).parent}:
+        for pattern in ("*.dll", "python*.exe", "python*.zip", "pyvenv.cfg"):
+            for candidate in runtime_root.glob(pattern):
+                add_tree(candidate)
+    dlls = Path(sys.base_prefix) / "DLLs"
+    if dlls.exists():
+        add_tree(dlls)
 
 # Keep a declared logical-root map alongside the raw path list. The Node
 # caller hashes every listed byte for its legacy local identity; this map is
@@ -718,6 +854,9 @@ add_root("python/stdlib", sysconfig.get_paths().get("stdlib"))
 add_root("python/platstdlib", sysconfig.get_paths().get("platstdlib"))
 add_root("python/site-packages", sysconfig.get_paths().get("purelib"))
 add_root("python/plat-site-packages", sysconfig.get_paths().get("platlib"))
+if os.name == "nt":
+    add_root("python/base-runtime", sys.base_prefix)
+    add_root("python/venv-runtime", sys.prefix)
 # Direct editable source roots are logical roots too, but their trees are not
 # added a second time: finder/path roots above remain the exact file closure.
 for root, name in editable_direct_roots:
@@ -750,27 +889,36 @@ print(json.dumps({"files": sorted(files), "packageCount": len(package_names), "m
   const probeCache = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-hermes-python-cache-'))
   let run
   try {
-    run = cp.spawnSync(interpreter, ['-c', script], { cwd: probeCache, env: { PATH: environment.PATH || '', PYTHONNOUSERSITE: '1', PYTHONPYCACHEPREFIX: probeCache }, encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 * 1024 })
+    const system = process.platform === 'win32' ? Object.fromEntries(Object.entries(environment).filter(([name]) => ['systemroot', 'windir'].includes(name.toLowerCase()))) : {}
+    run = cp.spawnSync(interpreter, ['-c', script], { cwd: probeCache, env: { ...system, PATH: environment.PATH || '', PYTHONNOUSERSITE: '1', PYTHONPYCACHEPREFIX: probeCache }, encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 * 1024 })
   } finally {
     fs.rmSync(probeCache, { recursive: true, force: true })
   }
-  if (run.error || run.status !== 0) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory could not be read')
+  if (run.error || run.status !== 0) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory could not be read', {
+    status: run.status, signal: run.signal, code: run.error?.code, stderr: String(run.stderr || '').slice(-2048),
+  })
   let inventory; try { inventory = JSON.parse(run.stdout) } catch { fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory is invalid') }
   if (closure) {
     if (!Array.isArray(inventory.roots) || inventory.roots.some(item => item?.logicalPath === 'python/interpreter' || item?.logicalPath === 'hermes/manifest')) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes closure Python root is invalid')
     inventory.roots.push({ logicalPath: 'python/interpreter', path: closure.runtimePython })
     inventory.roots.push({ logicalPath: 'hermes/manifest', path: closure.manifestFile })
   }
+  if (posix) {
+    if (!Array.isArray(inventory.roots) || inventory.roots.some(item => ['hermes/entrypoint', 'hermes/venv-config'].includes(item?.logicalPath))) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes POSIX launcher roots are invalid')
+    inventory.roots.push({ logicalPath: 'hermes/entrypoint', path: fs.realpathSync.native(posix.entrypointPath) })
+    inventory.roots.push({ logicalPath: 'hermes/venv-config', path: fs.realpathSync.native(posix.authenticatingConfigPaths[0]) })
+  }
   const listed = inventory?.files
   if (!Array.isArray(listed) || !listed.length || (Array.isArray(inventory.missing) && inventory.missing.length)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory is incomplete')
   const files = new Map()
-  for (const file of [executable, interpreter, ...(closure ? [closure.runtimePython, closure.manifestFile] : []), ...listed]) {
+  for (const file of [executable, interpreter, ...(closure ? [closure.runtimePython, closure.manifestFile] : []), ...(posix?.authenticatingFiles.map(item => item.path) || []), ...listed]) {
     if (!path.isAbsolute(file) || !fs.existsSync(file)) continue
     const stat = fs.lstatSync(file)
     const boundInterpreter = stat.isSymbolicLink() && path.resolve(file) === path.resolve(interpreter) && fs.statSync(file).isFile()
     if ((!stat.isFile() && !boundInterpreter) || (stat.isSymbolicLink() && !boundInterpreter)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory contains a linked or invalid file')
     const real = fs.realpathSync.native(file); files.set(real, executableSha256(real))
   }
+  if (posix && (files.get(posix.interpreter.physicalPath) !== posix.interpreter.sha256 || posix.authenticatingFiles.some(item => files.get(fs.realpathSync.native(item.path)) !== item.sha256))) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes POSIX launcher binding changed while collecting identity')
   if (files.size < 3) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency inventory is incomplete')
   if (!Number.isSafeInteger(inventory.packageCount) || inventory.packageCount < 1) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency package inventory is invalid')
   const links = []
@@ -822,7 +970,7 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
       if (url.protocol !== 'file:' || (url.hostname && url.hostname !== 'localhost') || url.search || url.hash || url.username || url.password) {
         fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes direct URL metadata is not a local installation reference')
       }
-      try { source = decodeURIComponent(url.pathname) } catch { fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes direct URL metadata is not decodable') }
+      try { source = fileURLToPath(url) } catch { fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes direct URL metadata is not decodable') }
     }
     if (!path.isAbsolute(source)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes generated metadata has a non-absolute installation reference')
     let real
@@ -847,8 +995,9 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
   }
   const replaceQuoted = (text, reference, replacement, expected) => {
     if (typeof reference !== 'string' || !reference || /[\r\n\0]/.test(reference)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes generated metadata reference is invalid')
-    const escaped = reference.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const matcher = new RegExp(`(['"])${escaped}\\1`, 'g')
+    const literalForms = [...new Set([reference, reference.replace(/\\/g, '\\\\')])]
+    const escaped = literalForms.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+    const matcher = new RegExp(`(['"])(?:${escaped})\\1`, 'g')
     const matches = [...text.matchAll(matcher)]
     if (matches.length !== expected) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes generated metadata does not match its parsed literal closure')
     return text.replace(matcher, (_whole, quote) => `${quote}${replacement}${quote}`)
@@ -937,12 +1086,23 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
     })
     if (touched) { canonical.set(file, Buffer.from(next, 'utf8')); changed.add(file) }
   }
+  const launcherDigests = new Map()
+  const posixLauncher = hermesPosixLauncherBinding(executable)
+  if (posixLauncher) {
+    const projected = require('./harness-v2-bridge/hermes/posix-launcher.cjs').canonicalHermesPosixIdentity(posixLauncher)
+    for (const item of projected.canonicalFiles) {
+      if (rawFiles.get(item.path) !== item.rawSha256) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes POSIX launcher changed before portable projection')
+      readExact(item.path, item.rawSha256)
+      launcherDigests.set(item.path, item.sha256)
+    }
+  }
+  const portableHash = (file, rawHash) => launcherDigests.get(file) || (canonical.has(file) ? sha256(canonical.get(file)) : rawHash)
   const logical = new Map(), add = (label, hash) => {
     if (!validLabel(label) || !/^[a-f0-9]{64}$/.test(hash)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes portable dependency record is invalid')
     if (logical.has(label)) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes portable dependency record is ambiguous')
     logical.set(label, hash)
   }
-  add(`hermes/launcher/${path.basename(launcher)}`, sha256(canonical.get(launcher) || readExact(launcher, rawFiles.get(launcher))))
+  add(`hermes/launcher/${path.basename(launcher)}`, portableHash(launcher, sha256(readExact(launcher, rawFiles.get(launcher)))))
   add(`python/interpreter/${path.basename(interpreter)}`, executableSha256(interpreter))
   for (const link of linkBindings) {
     if (!validLabel(link.logicalPath) || !rawFiles.has(link.target) || link.targetSha256 !== rawFiles.get(link.target) || !/^[a-f0-9]{64}$/.test(link.targetSha256 || '')) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python symlink binding is invalid')
@@ -962,18 +1122,20 @@ function hermesPortableRuntimeDependencyIdentity(executable, environment = proce
     }
     const relative = path.relative(root.path, file).split(path.sep).join('/')
     if (relative.startsWith('../') || relative.includes('/../')) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes Python dependency escaped its logical root')
-    add(`${root.logicalPath}${relative ? `/${relative}` : ''}`, canonical.has(file) ? sha256(canonical.get(file)) : hash)
+    add(`${root.logicalPath}${relative ? `/${relative}` : ''}`, portableHash(file, hash))
   }
   const files = [...logical].sort(([a], [b]) => a.localeCompare(b))
   if (files.length !== captured.files.length + linkBindings.length) fail('PROVIDER_IDENTITY_MISMATCH', 'Hermes portable dependency inventory is incomplete')
   const body = { schemaVersion: 1, provider: 'hermes', platform: process.platform, architecture: process.arch, files }
   return Object.freeze({ ...body, sha256: sha256(JSON.stringify(body)), fileCount: files.length, packageCount: captured.inventory.packageCount })
 }
-function isolatedEnvironment(root, environment = {}, credentials = {}) {
+function isolatedEnvironment(root, environment = {}, credentials = {}, options = {}) {
+  const windows = (options.platform || process.platform) === 'win32'
+  if (windows) environment = require('../agents/codex/workflow/process-owner.js').normalizeWindowsChildEnvironment(environment)
   const result = {}
   // Explicit allowlist: NODE_OPTIONS, plugin paths, shell startup files, and all
   // inherited provider configuration overrides must not reach the child.
-  for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'LANG', 'LC_ALL', 'TZ', 'TERM', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', 'GIT_CONFIG_COUNT']) {
+  for (const key of ['PATH', windows ? 'SYSTEMROOT' : 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'LANG', 'LC_ALL', 'TZ', 'TERM', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', 'GIT_CONFIG_COUNT', ...(windows ? ['AUTOPROMPT_WINDOWS_BASH'] : [])]) {
     if (typeof environment[key] === 'string') result[key] = environment[key]
   }
   // Preserve controller-owned Git safety projection, but no user Git config.
@@ -981,9 +1143,9 @@ function isolatedEnvironment(root, environment = {}, credentials = {}) {
     const key = `GIT_CONFIG_${suffix}_${i}`
     if (typeof environment[key] === 'string') result[key] = environment[key]
   }
-  Object.assign(result, credentials, { HOME: root, USERPROFILE: root, XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'), XDG_STATE_HOME: path.join(root, 'state'), XDG_CACHE_HOME: path.join(root, 'cache'), TMPDIR: path.join(root, 'tmp'), TMP: path.join(root, 'tmp'), TEMP: path.join(root, 'tmp'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(root, 'gitconfig') })
+  Object.assign(result, credentials, { HOME: root, USERPROFILE: root, XDG_CONFIG_HOME: path.join(root, 'config'), XDG_DATA_HOME: path.join(root, 'data'), XDG_STATE_HOME: path.join(root, 'state'), XDG_CACHE_HOME: path.join(root, 'cache'), TMPDIR: path.join(root, 'tmp'), TMP: path.join(root, 'tmp'), TEMP: path.join(root, 'tmp'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: windows ? '/dev/null' : path.join(root, 'gitconfig') })
   for (const dir of [root, result.XDG_CONFIG_HOME, result.XDG_DATA_HOME, result.XDG_STATE_HOME, result.XDG_CACHE_HOME, result.TMPDIR]) privateDirectory(dir)
-  if (!fs.existsSync(result.GIT_CONFIG_GLOBAL)) writePrivate(result.GIT_CONFIG_GLOBAL, '')
+  if (!windows && !fs.existsSync(result.GIT_CONFIG_GLOBAL)) writePrivate(result.GIT_CONFIG_GLOBAL, '')
   return result
 }
 function packageEvidence(packageRoot, expectedName, version) {
@@ -1112,17 +1274,18 @@ function probeExecutable(options = {}) {
   const binding = locateExecutable(options)
   const timeout = options.timeoutMs ?? 30000
   if (!Number.isSafeInteger(timeout) || timeout < 1000 || timeout > 120000) fail('PROVIDER_UNSUPPORTED', 'Native probe timeout must be bounded between 1 and 120 seconds')
-  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-native-probe-'))
+  const probeRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-native-probe-')))
   try {
     const env = isolatedEnvironment(probeRoot, options.env || process.env)
     const spawn = options.spawnSync || cp.spawnSync
     const invoke = argv => {
-      const vscodeCli = path.join(path.dirname(binding.path), 'resources/app/out/cli.js')
-      const nativeArgv = options.provider === 'vscode' && fs.existsSync(vscodeCli) ? [vscodeCli, ...argv] : argv
+      const vscodeCli = options.provider === 'vscode' ? vscodeCliPath(binding.path) : null
+      const nativeArgv = vscodeCli ? [vscodeCli, ...argv] : argv
       const nativeEnv = nativeArgv === argv ? env : { ...env, ELECTRON_RUN_AS_NODE: '1' }
       const launch = executableInvocation(binding, nativeArgv)
       const result = spawn(launch.executable, launch.argv, { cwd: probeRoot, env: nativeEnv, shell: false, encoding: 'utf8', timeout, maxBuffer: 1024 * 1024, windowsHide: true })
-      if (result.error || result.status !== 0 || result.signal) fail('PROVIDER_UNSUPPORTED', `${d.command} capability probe failed`, { argv, status: result.status, code: result.error?.code })
+      if (result.error || result.status !== 0 || result.signal) fail('PROVIDER_UNSUPPORTED', `${d.command} capability probe failed`, { argv, status: result.status, code: result.error?.code,
+        signal: result.signal, stderr: String(result.stderr || '').slice(-2048) })
       return `${result.stdout || ''}\n${result.stderr || ''}`
     }
     const versionText = invoke(['--version'])
@@ -1382,7 +1545,7 @@ function createLaunch(options) {
   const model = options.model || connection.model
   const controlled = options.toolBoundary ? require('./harness-v2-controlled-tools.cjs') : null
   if (controlled) controlled.load(options.toolBoundary, provider)
-  let argv, requiredResponseFormat = null
+  let argv, requiredResponseFormat = null, windowsTempDirectory = null
   if (provider === 'vscode') {
     argv = require('./harness-v2-vscode-config.cjs').project({ ...options, connection }, env)
   } else if (provider === 'claude') {
@@ -1402,13 +1565,36 @@ function createLaunch(options) {
     if (continuationId) argv.push('--resume', continuationId)
     env.CLAUDE_CONFIG_DIR = path.join(sessionRoot, 'claude')
     env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
+    if (process.platform === 'win32') {
+      // Claude 2.1.270 can stall before initialization when TEMP is a long
+      // Windows path. Keep durable home/session state canonical and place only
+      // transient files under cwd so the Job-owned cwd alias can shorten them.
+      const cwd = path.resolve(options.cwd)
+      let cwdItem, cwdReal
+      try { cwdItem = fs.lstatSync(cwd); cwdReal = fs.realpathSync.native(cwd) } catch {}
+      if (!cwdItem || !cwdItem.isDirectory() || cwdItem.isSymbolicLink() || cwdReal.toLowerCase() !== cwd.toLowerCase()) {
+        fail('PROFILE_INVALID', 'Windows Claude temporary directory requires an existing canonical cwd')
+      }
+      const relativePath = `temp-${sha256(path.resolve(home)).slice(0, 32)}`
+      const temporary = path.join(cwd, relativePath)
+      const relative = path.relative(cwd, temporary)
+      if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        fail('PROFILE_INVALID', 'Windows Claude temporary directory must be a strict cwd descendant')
+      }
+      privateDirectory(temporary)
+      env.TEMP = temporary
+      env.TMP = temporary
+      env.TMPDIR = temporary
+      const body = { schemaVersion: 1, path: temporary, relativePath }
+      windowsTempDirectory = Object.freeze({ ...body, sha256: sha256(JSON.stringify(body)) })
+    }
     if (options.maxTokens !== undefined) {
       if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens <= 0) fail('PROFILE_INVALID', 'Claude output token limit must be a positive integer')
       env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(options.maxTokens)
     }
   } else if (provider === 'opencode' || provider === 'kilo') {
     const tools = { read: true, glob: true, grep: true, list: true, write: !readOnly, edit: !readOnly, patch: !readOnly, bash: Boolean(options.commandBoundary) }
-    const projection = options.toolFree === true ? null : controlled?.opencodeProjection(options.toolBoundary, provider)
+    const projection = options.toolFree === true ? null : controlled?.opencodeProjection(options.toolBoundary, provider, options.opencodeToolTransport)
     const permission = options.toolFree === true ? { '*': 'deny' }
       : projection?.permission || { '*': 'deny', ...Object.fromEntries(Object.entries(tools).filter(([, enabled]) => enabled).map(([name]) => [name, 'allow'])), external_directory: { '*': 'deny', [`${targetPath}/**`]: 'allow' } }
     // Native title/summary requests are not part of the run event ledger.
@@ -1440,7 +1626,10 @@ function createLaunch(options) {
     const sessionId = continuationId || crypto.randomUUID()
     writePrivate(file, JSON.stringify([
       ...['sdk-app-startup', 'sdk-jsonrpc-server', 'persistent-bash', 'persistent-pwsh', 'str-replace-editor', 'llm-retry', 'session-log-deepseek', 'plugin-package-inventory-deepseek'].map(id => ({ id, disabled: true })),
-      { insert: [{ id: 'autoprompt-owned-sdk', name: require.resolve('./harness-v2-bridge/deepseek/plugin.cjs'), config: {
+      // dsh-app-boot accepts URL module specifiers portably. Passing a raw
+      // Windows drive path reaches Cordis's bare-module resolver before its
+      // host-path conversion and the owned plugin cannot be loaded.
+      { insert: [{ id: 'autoprompt-owned-sdk', name: pathToFileURL(require.resolve('./harness-v2-bridge/deepseek/plugin.cjs')).href, config: {
         packageRoot, oneShot: true, sessionId, input,
         initialize: { cwd: options.cwd, provider: connection.modelProvider || 'deepseek-official', model: model || 'deepseek-chat', outputSchema: options.outputSchema, ...(effort ? { reasoningEffort: effort } : {}), ...(continuationId ? { resumeSessionId: continuationId } : {}) },
       } }] },
@@ -1471,8 +1660,7 @@ function createLaunch(options) {
     const pythonCache = path.join(home, 'python-cache')
     privateDirectory(pythonCache)
     env.PYTHONPYCACHEPREFIX = pythonCache
-    const launcher = readBound(options.executable).subarray(0, 512).toString('utf8')
-    const pythonExecutable = hermesClosureRuntime(options.executable)?.python || /^#!([^\r\n\s]+)/.exec(launcher)?.[1]
+    const pythonExecutable = hermesPythonInterpreter(options.executable)
     if (!pythonExecutable || !path.isAbsolute(pythonExecutable)) fail('PROVIDER_UNSUPPORTED', 'Hermes launcher does not bind an absolute Python interpreter')
     const configuredMaxTokens = connection.maxTokens
     const maxTokens = options.maxTokens === undefined ? configuredMaxTokens : Math.min(options.maxTokens, configuredMaxTokens || options.maxTokens)
@@ -1499,14 +1687,28 @@ function createLaunch(options) {
     // The persistent native state is deliberately narrower than the controller
     // context root. Issued-call history remains outside this writable HOME.
     const sessionHome = path.join(sessionRoot, 'grok-home')
+    // The Linux bwrap launch mounts this exact controller Node for its worker.
+    // Use the same executable for the native CLI's MCP child; accepting a
+    // caller-supplied Linux projection would reintroduce an ambient executable.
+    if (process.platform === 'linux' && options.grokRuntimeProjection !== undefined) fail('PROFILE_INVALID', 'Linux Grok runtime projection is controller-owned')
+    const grokRuntimeProjection = process.platform === 'linux'
+      ? Object.freeze({ platform: 'linux', nodeExecutable: process.execPath, skillsPath: '/autoprompt/session/skills', mcpPort: 19778 })
+      : options.grokRuntimeProjection
+    const grokBaseUrl = grokRuntimeProjection?.platform === 'darwin'
+      ? `http://[::1]:${grokRuntimeProjection.proxyPort}/v1`
+      : `http://127.0.0.1:${grokRuntimeProjection?.proxyPort || 19777}/v1`
     const prepared = grok.prepare({ sessionHome, toolBoundary: options.toolBoundary,
       executable: options.executable, model: model || connection.model,
-      baseUrl: 'http://127.0.0.1:19777/v1', proxyToken, prompt, input,
-      continuationId, effort, outputSchema: options.outputSchema, maxCompletionTokens: options.maxCompletionTokens })
+      baseUrl: grokBaseUrl, proxyToken, prompt, input,
+      continuationId, effort, outputSchema: options.outputSchema, maxCompletionTokens: options.maxCompletionTokens,
+      runtimeProjection: grokRuntimeProjection })
     for (const key of descriptor(provider).credentials) delete env[key]
     delete env.GROK_BASE_URL
     return { argv: prepared.argv, env: {}, stdin: '', cwd: options.cwd, shell: false,
       grok: Object.freeze({ sessionHome, model: model || connection.model,
+        ...(grokRuntimeProjection ? { runtimeProjection: grokRuntimeProjection } : {}),
+        ...(process.platform === 'win32' ? { systemRoot: env.SYSTEMROOT,
+          systemPath: path.win32.join(env.SYSTEMROOT, 'System32') } : {}),
         proxyToken, relayToken, upstreamUrl: grok.upstreamChatCompletionsUrl(connection.environment?.GROK_BASE_URL),
         upstreamAuthorization: `Bearer ${apiKey}`, allowedMcpTools: prepared.allowedMcpTools,
         issuedCalls: options.issuedCalls || [], toolBoundary: options.toolBoundary,
@@ -1533,6 +1735,8 @@ function createLaunch(options) {
     if (connection.modelProvider) argv.push('--provider', connection.modelProvider)
   }
   if (model && !['deepseek', 'vscode'].includes(provider)) argv.push('--model', safeString(model, 'model'))
-  return { argv, env, stdin: input, cwd: options.cwd, shell: false, ...(requiredResponseFormat ? { requiredResponseFormat } : {}) }
+  return { argv, env, stdin: input, cwd: options.cwd, shell: false,
+    ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+    ...(requiredResponseFormat ? { requiredResponseFormat } : {}) }
 }
-module.exports = { runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, createLaunch, readBound, sha256, privateDirectory, writePrivate }
+module.exports = { windowsNpmShimInvocation, vscodeCliPath, runtimeDependencyIdentity, portableRuntimeDependencyIdentity, hermesPythonInterpreter, hermesPythonDependencyInventory, hermesRuntimeDependencyIdentity, hermesPortableRuntimeDependencyIdentity, validateEffort, PROVIDERS, HarnessError, fail, descriptor, locateExecutable, executableSha256, executableRuntimePath, executableInvocation, probeExecutable, deepseekSdkCapabilityEvidence, connectionConfig, sanitizeConnection, credentialEnvironment, isolatedEnvironment, createLaunch, readBound, sha256, privateDirectory, writePrivate }

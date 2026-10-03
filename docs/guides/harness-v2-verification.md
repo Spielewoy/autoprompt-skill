@@ -39,9 +39,9 @@ For custom OpenCode or Kilo models, define the selected variant's matching `reas
 
 ## Runtime requirements
 
-The verified v2 execution path is Linux with Bubblewrap. VS Code also needs a graphical session or headless display. macOS and Windows installation support does not establish native execution support; see [configured Linux runtimes](../lima-runtime.md) for the explicit VM/WSL options.
+The README support table records Linux runs, while the local canary policy authorizes fresh attempts for each of the ten non-Codex providers on Linux, Windows, and macOS when the installed runtime and platform adapter are available. Windows attempts use AppContainer and Job process ownership; macOS attempts use the native sandbox and owned-process controls. VS Code also needs a graphical session or headless display. This policy authorizes attempts and does not certify a platform: every activation must pass all eleven exact-runtime capability checks with no failure or skip. Codex follows its separate canonical validation route. Installer success or doctor output alone is not runtime proof; see [configured Linux runtimes](../lima-runtime.md) when a native path is unavailable.
 
-Matching reviewed releases can activate after their local capability checks pass. `PROVIDER_UNSUPPORTED` means the installed runtime, native executable, or required capability does not match an accepted configuration. Run `autoprompt doctor PROVIDER --strict` and check the tested versions before retrying.
+Matching reviewed releases can activate after their local capability checks pass. The ten non-Codex providers with local policies do not require imported signing keys or a pre-existing reviewed release record: all 11 fresh native checks must pass for the exact installed runtime and executable. `PROVIDER_UNSUPPORTED` means the installed runtime, native executable, or required capability does not match an accepted configuration. Run `autoprompt doctor PROVIDER --strict` and check the tested versions before retrying.
 
 ## Resume
 

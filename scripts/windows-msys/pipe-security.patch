@@ -1,0 +1,2479 @@
+diff --git a/winsup/cygwin/Makefile.am b/winsup/cygwin/Makefile.am
+index 41190bdb7a11e3550d3c84998db6d0399105584e..01ead7029673f6551a4a623ca976b5757d3be188 100644
+--- a/winsup/cygwin/Makefile.am
++++ b/winsup/cygwin/Makefile.am
+@@ -264,6 +264,9 @@ REGEX_FILES = \
+ 
+ SEC_FILES= \
+ 	sec/acl.cc \
++	sec/appcontainer_pipe.cc \
++	sec/appcontainer_null.cc \
++	sec/appcontainer_pipe_name.cc \
+ 	sec/auth.cc \
+ 	sec/base.cc \
+ 	sec/helper.cc \
+@@ -610,7 +613,7 @@ $(NEW_DLL_NAME): $(LDSCRIPT) libdll.a $(VERSION_OFILES) $(LIBSERVER)\
+ 		  $(newlib_build)/libm.a $(newlib_build)/libc.a
+ 	$(AM_V_CXXLD)$(CXX) $(CXXFLAGS) \
+ 	-mno-use-libstdc-wrappers \
+-	-Wl,--gc-sections -nostdlib -Wl,-T$(LDSCRIPT) -static \
++	-Wl,--gc-sections -Wl,--dynamicbase -nostdlib -Wl,-T$(LDSCRIPT) -static \
+ 	$${SOURCE_DATE_EPOCH:+-Wl,--no-insert-timestamp} \
+ 	-Wl,--heap=0 -Wl,--out-implib,msysdll.a -shared -o $@ \
+ 	-e @DLL_ENTRY@ $(DEF_FILE) \
+diff --git a/winsup/cygwin/autoload.cc b/winsup/cygwin/autoload.cc
+index d5d344d..a26146c 100644
+--- a/winsup/cygwin/autoload.cc
++++ b/winsup/cygwin/autoload.cc
+@@ -415,11 +415,31 @@ wsock_init (struct func_info *func)
+ 
+ LoadDLLprime (ws2_32, _wsock_init, 0)
+ 
++LoadDLLfunc (AddAccessAllowedAceEx, advapi32)
++LoadDLLfunc (AddAce, advapi32)
+ LoadDLLfunc (CheckTokenMembership, advapi32)
++LoadDLLfunc (CopySid, advapi32)
+ LoadDLLfunc (CreateProcessAsUserW, advapi32)
++LoadDLLfunc (CreateWellKnownSid, advapi32)
+ LoadDLLfunc (DeregisterEventSource, advapi32)
+ LoadDLLfunc (DecryptFileW, advapi32)
+ LoadDLLfunc (EncryptFileW, advapi32)
++LoadDLLfunc (GetAclInformation, advapi32)
++LoadDLLfunc (GetLengthSid, advapi32)
++LoadDLLfunc (GetSecurityDescriptorControl, advapi32)
++LoadDLLfunc (GetSecurityDescriptorDacl, advapi32)
++LoadDLLfunc (GetSecurityDescriptorGroup, advapi32)
++LoadDLLfunc (GetSecurityDescriptorOwner, advapi32)
++LoadDLLfunc (GetSecurityDescriptorRMControl, advapi32)
++LoadDLLfunc (GetSecurityDescriptorSacl, advapi32)
++LoadDLLfunc (GetSidLengthRequired, advapi32)
++LoadDLLfunc (GetSidSubAuthorityCount, advapi32)
++LoadDLLfunc (GetTokenInformation, advapi32)
++LoadDLLfunc (InitializeAcl, advapi32)
++LoadDLLfunc (InitializeSecurityDescriptor, advapi32)
++LoadDLLfunc (IsValidAcl, advapi32)
++LoadDLLfunc (IsValidSecurityDescriptor, advapi32)
++LoadDLLfunc (IsValidSid, advapi32)
+ LoadDLLfunc (LogonUserW, advapi32)
+ LoadDLLfunc (LookupAccountNameW, advapi32)
+ LoadDLLfunc (LookupAccountSidW, advapi32)
+@@ -431,6 +451,7 @@ LoadDLLfunc (LsaOpenPolicy, advapi32)
+ LoadDLLfunc (LsaQueryInformationPolicy, advapi32)
+ LoadDLLfunc (LsaRetrievePrivateData, advapi32)
+ LoadDLLfunc (LsaStorePrivateData, advapi32)
++LoadDLLfunc (OpenProcessToken, advapi32)
+ LoadDLLfunc (RegOpenUserClassesRoot, advapi32)
+ LoadDLLfunc (RegOpenCurrentUser, advapi32)
+ LoadDLLfunc (RegCloseKey, advapi32)
+@@ -443,6 +464,12 @@ LoadDLLfunc (RegQueryInfoKeyW, advapi32)
+ LoadDLLfunc (RegQueryValueExW, advapi32)
+ LoadDLLfunc (RegisterEventSourceW, advapi32)
+ LoadDLLfunc (ReportEventW, advapi32)
++LoadDLLfunc (SetSecurityDescriptorControl, advapi32)
++LoadDLLfunc (SetSecurityDescriptorDacl, advapi32)
++LoadDLLfunc (SetSecurityDescriptorGroup, advapi32)
++LoadDLLfunc (SetSecurityDescriptorOwner, advapi32)
++LoadDLLfunc (SetSecurityDescriptorRMControl, advapi32)
++LoadDLLfunc (SetSecurityDescriptorSacl, advapi32)
+ LoadDLLfunc (SystemFunction036, advapi32)	/* Aka "RtlGenRandom" */
+ 
+ LoadDLLfunc (AuthzAccessCheck, authz)
+diff --git a/winsup/cygwin/fhandler/base.cc b/winsup/cygwin/fhandler/base.cc
+index beebd71..e64c698 100644
+--- a/winsup/cygwin/fhandler/base.cc
++++ b/winsup/cygwin/fhandler/base.cc
+@@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_null.h"
+ #include <unistd.h>
+ #include <stdlib.h>
+ #include <sys/uio.h>
+@@ -494,17 +495,28 @@ int
+ fhandler_base::open_null (int flags)
+ {
+   int res = 0;
+-  HANDLE fh;
++  HANDLE fh = NULL;
+   OBJECT_ATTRIBUTES attr;
+   IO_STATUS_BLOCK io;
+-  NTSTATUS status;
++  NTSTATUS status = STATUS_UNSUCCESSFUL;
++  DWORD null_error = 0;
+ 
+   InitializeObjectAttributes (&attr, &ro_u_null, OBJ_CASE_INSENSITIVE |
+ 			      ((flags & O_CLOEXEC) ? 0 : OBJ_INHERIT),
+ 			      NULL, NULL);
+-  status = NtCreateFile (&fh, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL, 0,
+-			 FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+-			 FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
++  if (appcontainer_null_open (&fh, GENERIC_READ | SYNCHRONIZE, FILE_OPEN,
++                              FILE_SYNCHRONOUS_IO_NONALERT, flags & O_CLOEXEC,
++                              &null_error))
++    {
++      if (null_error) { __seterrno_from_win_error (null_error); goto done; }
++      status = STATUS_SUCCESS;
++      io.Status = status;
++      io.Information = FILE_OPENED;
++    }
++  else
++    status = NtCreateFile (&fh, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL, 0,
++			   FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
++			   FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+   if (!NT_SUCCESS (status))
+     {
+       __seterrno_from_nt_status (status);
+@@ -525,14 +537,15 @@ int
+ fhandler_base::open (int flags, mode_t mode)
+ {
+   int res = 0;
+-  HANDLE fh;
++  HANDLE fh = NULL;
+   ULONG file_attributes = 0;
+   ULONG shared = (get_major () == DEV_TAPE_MAJOR ? 0 : FILE_SHARE_VALID_FLAGS);
+   ULONG create_disposition;
+   FILE_BASIC_INFORMATION fbi;
+   OBJECT_ATTRIBUTES attr;
+   IO_STATUS_BLOCK io, io_bi;
+-  NTSTATUS status;
++  NTSTATUS status = STATUS_UNSUCCESSFUL;
++  DWORD null_error = 0;
+   PFILE_FULL_EA_INFORMATION p = NULL;
+   ULONG plen = 0;
+ 
+@@ -691,8 +704,18 @@ fhandler_base::open (int flags, mode_t mode)
+ 	}
+     }
+ 
+-  status = NtCreateFile (&fh, access, &attr, &io, NULL, file_attributes, shared,
+-			 create_disposition, options, p, plen);
++  if (get_device () == FH_NULL
++      && appcontainer_null_open (&fh, access, create_disposition, options,
++                                 flags, &null_error))
++    {
++      if (null_error) { __seterrno_from_win_error (null_error); goto done; }
++      status = STATUS_SUCCESS;
++      io.Status = status;
++      io.Information = FILE_OPENED;
++    }
++  else
++    status = NtCreateFile (&fh, access, &attr, &io, NULL, file_attributes, shared,
++			   create_disposition, options, p, plen);
+   /* Pre-W10, we can't reopen a file by handle with delete disposition
+      set, so we have to lie our ass off. */
+   if (get_handle () && status == STATUS_DELETE_PENDING)
+diff --git a/winsup/cygwin/fhandler/fifo.cc b/winsup/cygwin/fhandler/fifo.cc
+index 15117db..abe6732 100644
+--- a/winsup/cygwin/fhandler/fifo.cc
++++ b/winsup/cygwin/fhandler/fifo.cc
+@@ -20,6 +20,9 @@
+ #include "cygtls.h"
+ #include "shared_info.h"
+ #include "ntdll.h"
++#include "appcontainer_pipe_security.h"
++#include "appcontainer_pipe_name.h"
++#include "appcontainer_named_kernel.h"
+ #include "cygwait.h"
+ #include <sys/param.h>
+ 
+@@ -219,12 +222,25 @@ fhandler_fifo::create_pipe_instance ()
+       __seterrno_from_nt_status (status);
+       return NULL;
+     }
++  appcontainer_pipe_name owned_name;
++  appcontainer_pipe_security pipe_security;
++  DWORD prepare_error = owned_name.prepare (get_pipe_name ());
++  if (!prepare_error)
++    prepare_error = pipe_security.prepare (NULL);
++  if (prepare_error)
++    {
++      debug_printf ("AppContainer pipe preparation failed: %u", prepare_error);
++      __seterrno_from_win_error (prepare_error);
++      return NULL;
++    }
++  PSECURITY_DESCRIPTOR descriptor = pipe_security.get ()
++    ? pipe_security.get ()->lpSecurityDescriptor : NULL;
+   access = GENERIC_READ | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES
+     | SYNCHRONIZE;
+   sharing = FILE_SHARE_READ | FILE_SHARE_WRITE;
+   hattr = (openflags & O_CLOEXEC ? 0 : OBJ_INHERIT) | OBJ_CASE_INSENSITIVE;
+-  InitializeObjectAttributes (&attr, get_pipe_name (),
+-			      hattr, npfsh, NULL);
++  InitializeObjectAttributes (&attr, owned_name.get (),
++			      hattr, npfsh, descriptor);
+   timeout.QuadPart = -500000;
+   status = NtCreateNamedPipeFile (&ph, access, &attr, &io, sharing,
+ 				  FILE_OPEN_IF, 0,
+@@ -253,8 +269,15 @@ fhandler_fifo::open_pipe (HANDLE& ph)
+   status = npfs_handle (npfsh);
+   if (!NT_SUCCESS (status))
+     return status;
++  appcontainer_pipe_name owned_name;
++  DWORD prepare_error = owned_name.prepare (get_pipe_name ());
++  if (prepare_error)
++    {
++      debug_printf ("AppContainer pipe name failed: %u", prepare_error);
++      return appcontainer_pipe_name::error_status (prepare_error);
++    }
+   access = GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+-  InitializeObjectAttributes (&attr, get_pipe_name (),
++  InitializeObjectAttributes (&attr, owned_name.get (),
+ 			      openflags & O_CLOEXEC ? 0 : OBJ_INHERIT,
+ 			      npfsh, NULL);
+   sharing = FILE_SHARE_READ | FILE_SHARE_WRITE;
+@@ -277,20 +300,30 @@ fhandler_fifo::wait_open_pipe (HANDLE& ph)
+   status = npfs_handle (npfsh);
+   if (!NT_SUCCESS (status))
+     return status;
++  appcontainer_pipe_name owned_name;
++  DWORD prepare_error = owned_name.prepare (get_pipe_name ());
++  if (prepare_error)
++    {
++      debug_printf ("AppContainer FIFO wait name failed: %u", prepare_error);
++      return appcontainer_pipe_name::error_status (prepare_error);
++    }
++  PUNICODE_STRING wait_name = owned_name.get ();
++  unsigned int attempts = 0;
+   if (!(evt = create_event ()))
+     api_fatal ("Can't create event, %E");
+   pwbuf_size
+-    = offsetof (FILE_PIPE_WAIT_FOR_BUFFER, Name) + get_pipe_name ()->Length;
++    = offsetof (FILE_PIPE_WAIT_FOR_BUFFER, Name) + wait_name->Length;
+   pwbuf = (PFILE_PIPE_WAIT_FOR_BUFFER) alloca (pwbuf_size);
+   pwbuf->Timeout.QuadPart = orig_timeout;
+-  pwbuf->NameLength = get_pipe_name ()->Length;
++  pwbuf->NameLength = wait_name->Length;
+   pwbuf->TimeoutSpecified = TRUE;
+-  memcpy (pwbuf->Name, get_pipe_name ()->Buffer, get_pipe_name ()->Length);
++  memcpy (pwbuf->Name, wait_name->Buffer, wait_name->Length);
+   stamp = get_clock (CLOCK_MONOTONIC)->n100secs ();
+   bool retry;
+   do
+     {
+       retry = false;
++      ++attempts;
+       status = NtFsControlFile (npfsh, evt, NULL, NULL, &io, FSCTL_PIPE_WAIT,
+ 				pwbuf, pwbuf_size, NULL, 0);
+       if (status == STATUS_PENDING)
+@@ -302,6 +335,8 @@ fhandler_fifo::wait_open_pipe (HANDLE& ph)
+ 	}
+       if (NT_SUCCESS (status))
+ 	status = open_pipe (ph);
++      if (owned_name.is_appcontainer () && attempts >= 8)
++        break;
+       if (STATUS_PIPE_NO_INSTANCE_AVAILABLE (status))
+ 	{
+ 	  /* Another writer has grabbed the pipe instance.  Adjust
+@@ -684,9 +719,12 @@ fhandler_fifo::create_shmem (bool only_open)
+ 			      get_shared_parent_dir (), NULL);
+   if (!only_open)
+     {
+-      status = NtCreateSection (&sect, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY
++      status = appcontainer_named_kernel_create (&sect, &attr,
++        [&] (POBJECT_ATTRIBUTES private_attributes) {
++          return NtCreateSection (&sect, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY
+ 				| SECTION_MAP_READ | SECTION_MAP_WRITE,
+-				&attr, &size, PAGE_READWRITE, SEC_COMMIT, NULL);
++				private_attributes, &size, PAGE_READWRITE, SEC_COMMIT, NULL);
++        });
+       if (status == STATUS_OBJECT_NAME_COLLISION)
+ 	already_exists = true;
+     }
+@@ -750,9 +788,12 @@ fhandler_fifo::create_shared_fc_handler ()
+   RtlInitUnicodeString (&uname, shared_fc_name);
+   InitializeObjectAttributes (&attr, &uname, OBJ_INHERIT,
+ 			      get_shared_parent_dir (), NULL);
+-  status = NtCreateSection (&sect, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY
+-			    | SECTION_MAP_READ | SECTION_MAP_WRITE, &attr,
++  status = appcontainer_named_kernel_create (&sect, &attr,
++    [&] (POBJECT_ATTRIBUTES private_attributes) {
++      return NtCreateSection (&sect, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY
++			    | SECTION_MAP_READ | SECTION_MAP_WRITE, private_attributes,
+ 			    &size, PAGE_READWRITE, SEC_RESERVE, NULL);
++    });
+   if (status == STATUS_OBJECT_NAME_COLLISION)
+     status = NtOpenSection (&sect, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY
+ 			    | SECTION_MAP_READ | SECTION_MAP_WRITE, &attr);
+diff --git a/winsup/cygwin/fhandler/mqueue.cc b/winsup/cygwin/fhandler/mqueue.cc
+index f2aeb56..857b747 100644
+--- a/winsup/cygwin/fhandler/mqueue.cc
++++ b/winsup/cygwin/fhandler/mqueue.cc
+@@ -15,6 +15,7 @@ details. */
+ #include <stdio.h>
+ #include <mqueue.h>
+ #include <sys/param.h>
++#include "appcontainer_named_kernel.h"
+ 
+ #define MSGSIZE(i)      roundup((i), sizeof(long))
+ 
+@@ -176,8 +177,11 @@ fhandler_mqueue::_mqinfo (SIZE_T filesize, mode_t mode, int flags,
+   InitializeObjectAttributes (&oa, &uname, OBJ_OPENIF | OBJ_CASE_INSENSITIVE,
+                               get_shared_parent_dir (),
+                               everyone_sd (CYG_MUTANT_ACCESS));
+-  status = NtCreateMutant (&mqinfo ()->mqi_lock, CYG_MUTANT_ACCESS, &oa,
++  status = appcontainer_named_kernel_create (&mqinfo ()->mqi_lock, &oa,
++    [&] (POBJECT_ATTRIBUTES private_attributes) {
++      return NtCreateMutant (&mqinfo ()->mqi_lock, CYG_MUTANT_ACCESS, private_attributes,
+ 			   FALSE);
++    });
+   if (!NT_SUCCESS (status))
+     goto err;
+ 
+@@ -186,14 +190,20 @@ fhandler_mqueue::_mqinfo (SIZE_T filesize, mode_t mode, int flags,
+   InitializeObjectAttributes (&oa, &uname, OBJ_OPENIF | OBJ_CASE_INSENSITIVE,
+                               get_shared_parent_dir (),
+                               everyone_sd (CYG_EVENT_ACCESS));
+-  status = NtCreateEvent (&mqinfo ()->mqi_waitsend, CYG_EVENT_ACCESS, &oa,
++  status = appcontainer_named_kernel_create (&mqinfo ()->mqi_waitsend, &oa,
++    [&] (POBJECT_ATTRIBUTES private_attributes) {
++      return NtCreateEvent (&mqinfo ()->mqi_waitsend, CYG_EVENT_ACCESS, private_attributes,
+ 			  NotificationEvent, FALSE);
++    });
+   if (!NT_SUCCESS (status))
+     goto err;
+   wcsncpy (buf + 7, L"rcv", 3);
+   /* same length, same attributes, no more init required */
+-  status = NtCreateEvent (&mqinfo ()->mqi_waitrecv, CYG_EVENT_ACCESS, &oa,
++  status = appcontainer_named_kernel_create (&mqinfo ()->mqi_waitrecv, &oa,
++    [&] (POBJECT_ATTRIBUTES private_attributes) {
++      return NtCreateEvent (&mqinfo ()->mqi_waitrecv, CYG_EVENT_ACCESS, private_attributes,
+ 			  NotificationEvent, FALSE);
++    });
+   if (!NT_SUCCESS (status))
+     goto err;
+ 
+diff --git a/winsup/cygwin/fhandler/pipe.cc b/winsup/cygwin/fhandler/pipe.cc
+index 11ef78c..7492fcb 100644
+--- a/winsup/cygwin/fhandler/pipe.cc
++++ b/winsup/cygwin/fhandler/pipe.cc
+@@ -11,6 +11,7 @@ details. */
+ #include <sys/socket.h>
+ #include "cygerrno.h"
+ #include "security.h"
++#include "appcontainer_pipe_security.h"
+ #include "path.h"
+ #include "fhandler.h"
+ #include "select.h"
+@@ -21,6 +22,8 @@ details. */
+ #include "tls_pbuf.h"
+ #include "sigproc.h"
+ #include <assert.h>
++#include "ntdll.h"
++#include "appcontainer_pipe_name.h"
+ 
+ /* This is only to be used for writing.  When reading,
+ STATUS_PIPE_EMPTY simply means there's no data to be read. */
+@@ -217,7 +220,10 @@ get_mtx_name (HANDLE h, const char *io, char *name)
+   if (!NT_SUCCESS (status) || !ntfn->Name.Buffer)
+     return NULL;
+   ntfn->Name.Buffer[ntfn->Name.Length / sizeof (WCHAR)] = L'\0';
+-  WCHAR *p = wcschr (ntfn->Name.Buffer, L'-');
++  /* The AppContainer NPFS prefix includes a hyphenated package SID.
++     Only the final pipe basename contains the installation/PID format. */
++  WCHAR *base = wcsrchr (ntfn->Name.Buffer, L'\\');
++  WCHAR *p = wcschr (base ? base + 1 : ntfn->Name.Buffer, L'-');
+   if (p == NULL)
+     return NULL;
+   if (2 != swscanf (p, L"-%u-pipe-nt-0x%x", &pid, &uniq_id))
+@@ -800,8 +806,10 @@ fhandler_pipe::close (int flag)
+ 
+ #ifdef __MSYS__
+ #define PIPE_INTRO "\\\\.\\pipe\\msys-"
++#define PIPE_LOCAL_INTRO "\\\\.\\pipe\\LOCAL\\msys-"
+ #else
+ #define PIPE_INTRO "\\\\.\\pipe\\cygwin-"
++#define PIPE_LOCAL_INTRO "\\\\.\\pipe\\LOCAL\\cygwin-"
+ #endif
+ 
+ /* Create a pipe, and return handles to the read and write ends,
+@@ -822,13 +830,56 @@ fhandler_pipe::create (LPSECURITY_ATTRIBUTES sa_ptr, PHANDLE r, PHANDLE w,
+   if (w)
+     *w = NULL;
+ 
++  /* The adapter owns its descriptor through both synchronous opens.  On an
++     ordinary host get() is the exact caller pointer, including NULL, and
++     is_appcontainer() comes only from the actual process token.  */
++  appcontainer_pipe_security pipe_security;
++  DWORD prepare_error = pipe_security.prepare (sa_ptr);
++  if (prepare_error)
++    {
++      SetLastError (prepare_error);
++      return prepare_error;
++    }
++  const bool appcontainer = pipe_security.is_appcontainer ();
++  sa_ptr = pipe_security.get ();
++  const char *intro = appcontainer ? PIPE_LOCAL_INTRO : PIPE_INTRO;
++
+   /* Ensure that there is enough pipe buffer space for atomic writes.  */
+   if (!psize)
+     psize = DEFAULT_PIPEBUFSIZE;
+ 
+   char pipename[MAX_PATH];
+-  size_t len = __small_sprintf (pipename, PIPE_INTRO "%S-",
+-				      &cygheap->installation_key);
++  if (appcontainer)
++    {
++      /* The installation key is exactly sixteen hexadecimal UTF-16 units.
++         Check before the unbounded formatter; include maximum DWORD PID,
++         pointer-formatted counter, separators and the final NUL in the bound.
++         Host formatting and its original name layout remain unchanged.  */
++      const UNICODE_STRING &key = cygheap->installation_key;
++      bool valid_key = key.Buffer && key.Length == 16 * sizeof (WCHAR)
++                       && key.MaximumLength >= key.Length;
++      for (size_t i = 0; valid_key && i < 16; ++i)
++        valid_key = (key.Buffer[i] >= L'0' && key.Buffer[i] <= L'9')
++                    || (key.Buffer[i] >= L'a' && key.Buffer[i] <= L'f')
++                    || (key.Buffer[i] >= L'A' && key.Buffer[i] <= L'F');
++      if (!valid_key)
++        {
++          SetLastError (ERROR_INVALID_DATA);
++          return ERROR_INVALID_DATA;
++        }
++      size_t name_length = name ? strnlen (name, sizeof pipename) : 0;
++      size_t needed = strlen (intro) + 16 + 1
++                      + ((!name || (open_mode & PIPE_ADD_PID)) ? 11 : 0)
++                      + (name ? name_length : 5 + 2 + 2 * sizeof (void *))
++                      + 1;
++      if (name_length == sizeof pipename || needed > sizeof pipename)
++        {
++          SetLastError (ERROR_FILENAME_EXCED_RANGE);
++          return ERROR_FILENAME_EXCED_RANGE;
++        }
++    }
++  size_t len = __small_sprintf (pipename, "%s%S-", intro,
++                               &cygheap->installation_key);
+   DWORD pipe_mode = PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS;
+   if (!name)
+     pipe_mode |= pipe_byte ? PIPE_TYPE_BYTE : PIPE_TYPE_MESSAGE;
+@@ -850,6 +901,7 @@ fhandler_pipe::create (LPSECURITY_ATTRIBUTES sa_ptr, PHANDLE r, PHANDLE w,
+      Retrying will probably never be necessary, but we want
+      to be as robust as possible.  */
+   DWORD err = 0;
++  unsigned int appcontainer_collisions = 0;
+   while (r && !*r)
+     {
+       static volatile ULONG pipe_unique_id;
+@@ -890,6 +942,16 @@ fhandler_pipe::create (LPSECURITY_ATTRIBUTES sa_ptr, PHANDLE r, PHANDLE w,
+ 	}
+ 
+       err = GetLastError ();
++      /* A restricted-token denial is not evidence of a reusable name.
++         Keep host retries unchanged, but refuse AppContainer denials and
++         bound genuine busy-name retries without opening an existing pipe.  */
++      if (appcontainer)
++        {
++          if (!err)
++            err = ERROR_GEN_FAILURE;
++          if (err != ERROR_PIPE_BUSY || ++appcontainer_collisions >= 8)
++            break;
++        }
+       switch (err)
+ 	{
+ 	case ERROR_PIPE_BUSY:
+@@ -917,6 +979,8 @@ fhandler_pipe::create (LPSECURITY_ATTRIBUTES sa_ptr, PHANDLE r, PHANDLE w,
+   if (err)
+     {
+       *r = NULL;
++      if (appcontainer)
++        SetLastError (err);
+       return err;
+     }
+ 
+@@ -940,8 +1004,14 @@ fhandler_pipe::create (LPSECURITY_ATTRIBUTES sa_ptr, PHANDLE r, PHANDLE w,
+ 	  DWORD err = GetLastError ();
+ 	  debug_printf ("CreateFile failed, r %p, %E", r);
+ 	  if (r)
+-	    CloseHandle (*r);
++            {
++              CloseHandle (*r);
++              if (appcontainer)
++                *r = NULL;
++            }
+ 	  *w = NULL;
++          if (appcontainer)
++            SetLastError (err);
+ 	  return err;
+ 	}
+ 
+@@ -1049,10 +1119,20 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+   OBJECT_ATTRIBUTES attr;
+   IO_STATUS_BLOCK io;
+   LARGE_INTEGER timeout;
++  appcontainer_pipe_security pipe_security;
++  appcontainer_pipe_name owned_name;
++  DWORD prepare_error = pipe_security.prepare (sa_ptr);
++  unsigned int attempts = 0;
+ 
+   /* Default to error. */
+   r = NULL;
+   w = NULL;
++  if (prepare_error)
++    {
++      debug_printf ("AppContainer pipe security failed: %u", prepare_error);
++      return appcontainer_pipe_name::error_status (prepare_error);
++    }
++  LPSECURITY_ATTRIBUTES effective_sa = pipe_security.get ();
+ 
+   status = fhandler_base::npfs_handle (npfsh);
+   if (!NT_SUCCESS (status))
+@@ -1090,10 +1170,17 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+ 		    ? "PIPE_TYPE_MESSAGE" : "PIPE_TYPE_BYTE");
+ 
+       RtlInitUnicodeString (&pipename, pipename_buf);
+-
+-      InitializeObjectAttributes (&attr, &pipename,
+-				  sa_ptr->bInheritHandle ? OBJ_INHERIT : 0,
+-				  npfsh, sa_ptr->lpSecurityDescriptor);
++      prepare_error = owned_name.prepare (&pipename);
++      if (prepare_error)
++        {
++          debug_printf ("AppContainer pipe name failed: %u", prepare_error);
++          return appcontainer_pipe_name::error_status (prepare_error);
++        }
++      ++attempts;
++
++      InitializeObjectAttributes (&attr, owned_name.get (),
++                                  effective_sa->bInheritHandle ? OBJ_INHERIT : 0,
++                                  npfsh, effective_sa->lpSecurityDescriptor);
+ 
+       timeout.QuadPart = -500000;
+       /* Set FILE_SYNCHRONOUS_IO_NONALERT flag so that native
+@@ -1112,6 +1199,18 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+ 	  break;
+ 	}
+ 
++      /* Only known busy collisions may retry under the actual restricted
++         token. Access denial and all other failures must not spin forever. */
++      if (pipe_security.is_appcontainer ())
++        {
++          r = NULL;
++          if (attempts < 8 && (status == STATUS_PIPE_BUSY
++                              || status == STATUS_INSTANCE_NOT_AVAILABLE
++                              || status == STATUS_PIPE_NOT_AVAILABLE))
++            continue;
++          return status;
++        }
++
+       switch (status)
+ 	{
+ 	case STATUS_PIPE_BUSY:
+@@ -1153,6 +1252,8 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+       if (r)
+ 	NtClose (r);
+       w = NULL;
++      if (pipe_security.is_appcontainer ())
++        r = NULL;
+       return status;
+     }
+ 
+diff --git a/winsup/cygwin/fhandler/pty.cc b/winsup/cygwin/fhandler/pty.cc
+index de53dbf..1f73085 100644
+--- a/winsup/cygwin/fhandler/pty.cc
++++ b/winsup/cygwin/fhandler/pty.cc
+@@ -7,12 +7,14 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_anonymous_pipe.h"
+ #include <stdlib.h>
+ #include <sys/param.h>
+ #include <cygwin/acl.h>
+ #include <cygwin/kd.h>
+ #include "cygerrno.h"
+ #include "security.h"
++#include "appcontainer_pipe_security.h"
+ #include "path.h"
+ #include "fhandler.h"
+ #include "dtable.h"
+@@ -41,6 +43,78 @@ extern "C" int sscanf (const char *, const char *, ...);
+       CloseHandle (h); \
+   } while (0)
+ 
++/* Every direct master-control reopen must use the same actual-token name
++   policy as the listener.  No environment-derived namespace is accepted. */
++static DWORD
++pty_control_pipe_name (char (&name)[MAX_PATH], int unit, bool appcontainer)
++{
++  if (appcontainer)
++    {
++      const UNICODE_STRING &key = cygheap->installation_key;
++      bool valid = key.Buffer && key.Length == 16 * sizeof (WCHAR)
++                   && key.MaximumLength >= key.Length && unit >= 0;
++      for (size_t i = 0; valid && i < 16; ++i)
++        valid = (key.Buffer[i] >= L'0' && key.Buffer[i] <= L'9')
++                || (key.Buffer[i] >= L'a' && key.Buffer[i] <= L'f')
++                || (key.Buffer[i] >= L'A' && key.Buffer[i] <= L'F');
++      if (!valid)
++        return ERROR_INVALID_DATA;
++    }
++#ifdef __MSYS__
++  const char *prefix = appcontainer ? "\\\\.\\pipe\\LOCAL\\msys-"
++                                   : "\\\\.\\pipe\\msys-";
++#else
++  const char *prefix = appcontainer ? "\\\\.\\pipe\\LOCAL\\cygwin-"
++                                   : "\\\\.\\pipe\\cygwin-";
++#endif
++  /* AC input is bounded above: 16 hex digits and at most 10 decimal digits.
++     The ordinary-host formatter retains the existing name unchanged. */
++  __small_sprintf (name, "%s%S-pty%d-master-ctl", prefix,
++                   &cygheap->installation_key, unit);
++  return ERROR_SUCCESS;
++}
++
++static bool
++pty_control_pipe_name (char (&name)[MAX_PATH], int unit)
++{
++  DWORD error;
++  {
++    appcontainer_pipe_security security;
++    error = security.prepare (NULL);
++    if (!error)
++      error = pty_control_pipe_name (name, unit, security.is_appcontainer ());
++  }
++  /* Restore after owned descriptor cleanup, including on an ordinary host. */
++  if (error)
++    SetLastError (error);
++  return !error;
++}
++
++static HANDLE
++create_pty_control_pipe (char (&name)[MAX_PATH], int unit)
++{
++  HANDLE result = INVALID_HANDLE_VALUE;
++  DWORD error;
++  {
++    appcontainer_pipe_security security;
++    error = security.prepare (&sec_all_nih);
++    if (!error)
++      error = pty_control_pipe_name (name, unit, security.is_appcontainer ());
++    if (!error)
++      {
++        result = CreateNamedPipe (name, PIPE_ACCESS_DUPLEX
++                                       | FILE_FLAG_FIRST_PIPE_INSTANCE,
++                                  PIPE_WAIT | PIPE_TYPE_MESSAGE
++                                  | PIPE_READMODE_MESSAGE
++                                  | PIPE_REJECT_REMOTE_CLIENTS,
++                                  1, 4096, 4096, 0, security.get ());
++        error = GetLastError ();
++      }
++  }
++  SetLastError (error);
++  return result;
++}
++
+ /* pty master control pipe messages */
+ enum pipe_request_cmd {
+   GET_HANDLES,
+@@ -988,12 +1062,11 @@ fhandler_pty_slave::open (int flags, mode_t)
+       pipe_reply repl;
+       DWORD len;
+ 
+-#ifdef __MSYS__
+-      __small_sprintf (buf, "\\\\.\\pipe\\msys-%S-pty%d-master-ctl",
+-#else
+-      __small_sprintf (buf, "\\\\.\\pipe\\cygwin-%S-pty%d-master-ctl",
+-#endif
+-		       &cygheap->installation_key, get_minor ());
++      if (!pty_control_pipe_name (buf, get_minor ()))
++        {
++          errmsg = "can't name master control pipe, %E";
++          goto err;
++        }
+       termios_printf ("dup handles via master control pipe %s", buf);
+       if (!CallNamedPipe (buf, &req, sizeof req, &repl, sizeof repl,
+ 			  &len, 500))
+@@ -1295,13 +1368,8 @@ fhandler_pty_slave::reset_switch_to_nat_pipe (void)
+ 		  else
+ 		    {
+ 		      char pipe[MAX_PATH];
+-		      __small_sprintf (pipe,
+-#ifdef __MSYS__
+-			       "\\\\.\\pipe\\msys-%S-pty%d-master-ctl",
+-#else
+-			       "\\\\.\\pipe\\cygwin-%S-pty%d-master-ctl",
+-#endif
+-			       &cygheap->installation_key, get_minor ());
++		      if (!pty_control_pipe_name (pipe, get_minor ()))
++                        return;
+ 		      pipe_request req = { GET_HANDLES, GetCurrentProcessId () };
+ 		      pipe_reply repl;
+ 		      DWORD len;
+@@ -1789,15 +1857,11 @@ fhandler_pty_slave::tcflush (int queue)
+   if (queue == TCIFLUSH || queue == TCIOFLUSH)
+     {
+       char pipe[MAX_PATH];
+-#ifdef __MSYS__
+-      __small_sprintf (pipe,
+-		       "\\\\.\\pipe\\msys-%S-pty%d-master-ctl",
+-		       &cygheap->installation_key, get_minor ());
+-#else
+-      __small_sprintf (pipe,
+-		       "\\\\.\\pipe\\cygwin-%S-pty%d-master-ctl",
+-		       &cygheap->installation_key, get_minor ());
+-#endif
++      if (!pty_control_pipe_name (pipe, get_minor ()))
++        {
++          __seterrno ();
++          return -1;
++        }
+       pipe_request req = { FLUSH_INPUT, GetCurrentProcessId () };
+       pipe_reply repl;
+       DWORD n;
+@@ -2253,17 +2317,13 @@ fhandler_pty_master::close (int flag)
+ 	  pipe_reply repl;
+ 	  DWORD len;
+ 
+-#ifdef __MSYS__
+-	  __small_sprintf (buf, "\\\\.\\pipe\\msys-%S-pty%d-master-ctl",
+-#else
+-	  __small_sprintf (buf, "\\\\.\\pipe\\cygwin-%S-pty%d-master-ctl",
+-#endif
+-			   &cygheap->installation_key, get_minor ());
++	  bool have_control_name = pty_control_pipe_name (buf, get_minor ());
+ 	  acquire_output_mutex (mutex_timeout);
+ 	  if (master_ctl)
+ 	    {
+-	      CallNamedPipe (buf, &req, sizeof req, &repl, sizeof repl, &len,
+-			     500);
++	      if (have_control_name)
++                CallNamedPipe (buf, &req, sizeof req, &repl, sizeof repl, &len,
++                               500);
+ 	      CloseHandle (master_ctl);
+ 	      master_thread->detach ();
+ 	      get_ttyp ()->set_master_ctl_closed ();
+@@ -3422,18 +3482,7 @@ fhandler_pty_master::setup ()
+ 
+   /* Create master control pipe which allows the master to duplicate
+      the pty pipe handles to processes which deserve it. */
+-#ifdef __MSYS__
+-  __small_sprintf (buf, "\\\\.\\pipe\\msys-%S-pty%d-master-ctl",
+-#else
+-  __small_sprintf (buf, "\\\\.\\pipe\\cygwin-%S-pty%d-master-ctl",
+-#endif
+-		   &cygheap->installation_key, unit);
+-  master_ctl = CreateNamedPipe (buf, PIPE_ACCESS_DUPLEX
+-				     | FILE_FLAG_FIRST_PIPE_INSTANCE,
+-				PIPE_WAIT | PIPE_TYPE_MESSAGE
+-				| PIPE_READMODE_MESSAGE
+-				| PIPE_REJECT_REMOTE_CLIENTS,
+-				1, 4096, 4096, 0, &sec_all_nih);
++  master_ctl = create_pty_control_pipe (buf, unit);
+   if (master_ctl == INVALID_HANDLE_VALUE)
+     {
+       errstr = "pty master control pipe";
+@@ -3718,7 +3767,7 @@ fhandler_pty_slave::setup_pseudoconsole ()
+   STARTUPINFOEXW si;
+   PROCESS_INFORMATION pi;
+   HANDLE hello, goodbye;
+-  HANDLE hr, hw;
++  HANDLE hr, hw; /* Initialize below: earlier goto skips this scope. */
+   HPCON hpcon;
+ 
+   do
+@@ -3761,7 +3810,9 @@ fhandler_pty_slave::setup_pseudoconsole ()
+ 
+       hello = CreateEvent (&sec_none, true, false, NULL);
+       goodbye = CreateEvent (&sec_none, true, false, NULL);
+-      CreatePipe (&hr, &hw, &sec_none, 0);
++      hr = hw = NULL;
++      if (!appcontainer_create_pipe (&hr, &hw, &sec_none, 0))
++	goto cleanup_event_and_pipes;
+ 
+       HANDLE handles_to_inherit[] = {hello, goodbye, hw};
+       if (!UpdateProcThreadAttribute (si.lpAttributeList,
+@@ -4323,13 +4373,8 @@ fhandler_pty_slave::transfer_input (tty::xfer_dir dir, HANDLE from, tty *ttyp,
+   if (to == NULL)
+     {
+       char pipe[MAX_PATH];
+-      __small_sprintf (pipe,
+-#ifdef __MSYS__
+-		       "\\\\.\\pipe\\msys-%S-pty%d-master-ctl",
+-#else
+-		       "\\\\.\\pipe\\cygwin-%S-pty%d-master-ctl",
+-#endif
+-		       &cygheap->installation_key, ttyp->get_minor ());
++      if (!pty_control_pipe_name (pipe, ttyp->get_minor ()))
++        return;
+       pipe_request req = { GET_HANDLES, GetCurrentProcessId () };
+       pipe_reply repl;
+       DWORD len;
+diff --git a/winsup/cygwin/fhandler/socket_inet.cc b/winsup/cygwin/fhandler/socket_inet.cc
+index 5ed0cb0..ada53db 100644
+--- a/winsup/cygwin/fhandler/socket_inet.cc
++++ b/winsup/cygwin/fhandler/socket_inet.cc
+@@ -43,6 +43,7 @@
+ #include "shared_info.h"
+ #include "wininfo.h"
+ #include "tls_pbuf.h"
++#include "appcontainer_named_kernel.h"
+ 
+ #define ASYNC_MASK (FD_READ|FD_WRITE|FD_OOB|FD_ACCEPT|FD_CONNECT)
+ #define EVENT_MASK (FD_READ|FD_WRITE|FD_OOB|FD_ACCEPT|FD_CONNECT|FD_CLOSE)
+@@ -97,7 +98,10 @@ search_wsa_event_slot (LONG new_serial_number)
+       InitializeObjectAttributes (&attr, &uname, OBJ_INHERIT | OBJ_OPENIF,
+ 				  get_session_parent_dir (),
+ 				  everyone_sd (CYG_MUTANT_ACCESS));
+-      status = NtCreateMutant (&wsa_slot_mtx, CYG_MUTANT_ACCESS, &attr, FALSE);
++      status = appcontainer_named_kernel_create (&wsa_slot_mtx, &attr,
++        [&] (POBJECT_ATTRIBUTES private_attributes) {
++          return NtCreateMutant (&wsa_slot_mtx, CYG_MUTANT_ACCESS, private_attributes, FALSE);
++        });
+       if (!NT_SUCCESS (status))
+ 	api_fatal ("Couldn't create/open shared socket mutex %S, %y",
+ 		   &uname, status);
+@@ -219,7 +223,10 @@ fhandler_socket_wsock::init_events ()
+       InitializeObjectAttributes (&attr, &uname, OBJ_INHERIT | OBJ_OPENIF,
+ 				  get_session_parent_dir (),
+ 				  everyone_sd (CYG_MUTANT_ACCESS));
+-      status = NtCreateMutant (&wsock_mtx, CYG_MUTANT_ACCESS, &attr, FALSE);
++      status = appcontainer_named_kernel_create (&wsock_mtx, &attr,
++        [&] (POBJECT_ATTRIBUTES private_attributes) {
++          return NtCreateMutant (&wsock_mtx, CYG_MUTANT_ACCESS, private_attributes, FALSE);
++        });
+       if (!NT_SUCCESS (status))
+ 	{
+ 	  debug_printf ("NtCreateMutant(%S), %y", &uname, status);
+diff --git a/winsup/cygwin/flock.cc b/winsup/cygwin/flock.cc
+index 5a40e39..d7b3ec2 100644
+--- a/winsup/cygwin/flock.cc
++++ b/winsup/cygwin/flock.cc
+@@ -108,6 +108,7 @@
+ #include "ntdll.h"
+ #include <sys/queue.h>
+ #include <wchar.h>
++#include "appcontainer_named_kernel.h"
+ 
+ #define F_WAIT 0x10	/* Wait until lock is granted */
+ #define F_FLOCK 0x20	/* Use flock(2) semantics for lock */
+@@ -531,14 +532,20 @@ inode_t::inode_t (dev_t dev, ino_t ino)
+   RtlInitCountedUnicodeString (&uname, name, len * sizeof (WCHAR));
+   InitializeObjectAttributes (&attr, &uname, OBJ_INHERIT | OBJ_OPENIF,
+ 			      parent_dir, everyone_sd (FLOCK_INODE_DIR_ACCESS));
+-  status = NtCreateDirectoryObject (&i_dir, FLOCK_INODE_DIR_ACCESS, &attr);
++  status = appcontainer_named_kernel_create (&i_dir, &attr,
++    [&] (POBJECT_ATTRIBUTES private_attributes) {
++      return NtCreateDirectoryObject (&i_dir, FLOCK_INODE_DIR_ACCESS, private_attributes);
++    });
+   if (!NT_SUCCESS (status))
+     api_fatal ("NtCreateDirectoryObject(inode): %y", status);
+   /* Create a mutex object in the file specific dir, which is used for
+      access synchronization on the dir and its objects. */
+   InitializeObjectAttributes (&attr, &ro_u_mtx, OBJ_INHERIT | OBJ_OPENIF, i_dir,
+ 			      everyone_sd (CYG_MUTANT_ACCESS));
+-  status = NtCreateMutant (&i_mtx, CYG_MUTANT_ACCESS, &attr, FALSE);
++  status = appcontainer_named_kernel_create (&i_mtx, &attr,
++    [&] (POBJECT_ATTRIBUTES private_attributes) {
++      return NtCreateMutant (&i_mtx, CYG_MUTANT_ACCESS, private_attributes, FALSE);
++    });
+   if (!NT_SUCCESS (status))
+     api_fatal ("NtCreateMutant(inode): %y", status);
+ }
+@@ -774,8 +781,11 @@ lockf_t::create_lock_obj ()
+   do
+     {
+       lock_obj_attr = create_lock_obj_attr (&attr, OBJ_INHERIT, sd_buf);
+-      status = NtCreateEvent (&lf_obj, CYG_EVENT_ACCESS, lock_obj_attr,
++      status = appcontainer_named_kernel_create (&lf_obj, lock_obj_attr,
++        [&] (POBJECT_ATTRIBUTES private_attributes) {
++          return NtCreateEvent (&lf_obj, CYG_EVENT_ACCESS, private_attributes,
+ 			      NotificationEvent, FALSE);
++        });
+       if (!NT_SUCCESS (status))
+ 	{
+ 	  if (status != STATUS_OBJECT_NAME_COLLISION)
+diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
+index 2aa52737ca951305b3ffd5fba417ba7e8f972cd0..fd8ce2ed92c2ebf2095bde127748b62f163ad1ea 100644
+--- a/winsup/cygwin/fork.cc
++++ b/winsup/cygwin/fork.cc
+@@ -7,6 +7,8 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_child_security.h"
++#include "appcontainer_anonymous_pipe.h"
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <stdlib.h>
+@@ -119,7 +121,7 @@ child_info::prefork (bool detached)
+ {
+   if (!detached)
+     {
+-      if (!CreatePipe (&rd_proc_pipe, &wr_proc_pipe, &sec_none_nih, 16))
++      if (!appcontainer_create_pipe (&rd_proc_pipe, &wr_proc_pipe, &sec_none_nih, 16))
+ 	api_fatal ("prefork: couldn't create pipe process tracker, %E");
+ 
+       if (!SetHandleInformation (wr_proc_pipe, HANDLE_FLAG_INHERIT,
+@@ -363,20 +365,24 @@ frok::parent (volatile char * volatile stack_here)
+       hchild = NULL;
+       /* cygwin1.dll may reuse the forking_progname buffer, even
+ 	 in case of failure: don't reuse forking_progname later */
+-      rc = CreateProcessW (forking_progname,	/* image to run */
++      rc = appcontainer_child_create (sa, &si, c_flags, true,
++        [&] (LPSECURITY_ATTRIBUTES child_security, LPSTARTUPINFOW child_startup,
++             DWORD child_flags) {
++      return CreateProcessW (forking_progname,	/* image to run */
+ 			   GetCommandLineW (),	/* Take same space for command
+ 						   line as in parent to make
+ 						   sure child stack is allocated
+ 						   in the same memory location
+ 						   as in parent. */
+-			   sa,
+-			   sa,
++			   child_security,
++			   child_security,
+ 			   TRUE,		/* inherit handles */
+-			   c_flags,
++			   child_flags,
+ 			   NULL,		/* environ filled in later */
+ 			   0,			/* use cwd */
+-			   &si,
++			   child_startup,
+ 			   &pi);
++        });
+ 
+       if (rc)
+ 	debug_printf ("forked pid %u", pi.dwProcessId);
+@@ -423,6 +429,12 @@ frok::parent (volatile char * volatile stack_here)
+   fix_impersonation = false;
+ 
+   child_pid = cygwin_pid (pi.dwProcessId);
++  if (child_pid < 2)
++    {
++      this_errno = EAGAIN;
++      syscall_printf ("failed to map Windows pid %u to Cygwin pid", pi.dwProcessId);
++      goto cleanup;
++    }
+   child.init (child_pid, PID_IN_USE | PID_NEW, NULL);
+ 
+   if (!child)
+diff --git a/winsup/cygwin/kernel32.cc b/winsup/cygwin/kernel32.cc
+index f07f80d..f7a41e8 100644
+--- a/winsup/cygwin/kernel32.cc
++++ b/winsup/cygwin/kernel32.cc
+@@ -7,6 +7,9 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include <ntsecapi.h>
++#include "appcontainer_anonymous_pipe.h"
++#include "appcontainer_pipe_security.h"
+ #include "shared_info.h"
+ #include "ntdll.h"
+ #include "cygerrno.h"
+@@ -19,6 +22,97 @@ details. */
+ #include "winf.h"
+ #include "sys/cygwin.h"
+ 
++/* CreatePipe chooses an inaccessible bare NPFS name in an AppContainer.
++   These two MSYS-internal users need synchronous byte pipes, not the message
++   and FILE_READ_ATTRIBUTES behavior of fhandler_pipe::create. */
++static BOOL
++create_appcontainer_anonymous_pipe (PHANDLE read_pipe, PHANDLE write_pipe,
++                                   LPSECURITY_ATTRIBUTES attributes,
++                                   DWORD size)
++{
++  if (!read_pipe || !write_pipe || read_pipe == write_pipe || size > 65536)
++    {
++      SetLastError (ERROR_INVALID_PARAMETER);
++      return FALSE;
++    }
++  *read_pipe = NULL;
++  *write_pipe = NULL;
++  for (unsigned attempt = 0; attempt < 8; ++attempt)
++    {
++      BYTE nonce[16];
++      if (!RtlGenRandom (nonce, sizeof nonce))
++        {
++          /* RtlGenRandom does not specify GetLastError on failure. */
++          SetLastError (ERROR_GEN_FAILURE);
++          return FALSE;
++        }
++      WCHAR name[80] = L"\\\\.\\pipe\\LOCAL\\msys-anon-";
++      static const WCHAR hex[] = L"0123456789abcdef";
++      size_t offset = wcslen (name);
++      for (size_t i = 0; i < sizeof nonce; ++i)
++        {
++          name[offset++] = hex[nonce[i] >> 4];
++          name[offset++] = hex[nonce[i] & 15];
++        }
++      name[offset] = L'\0';
++      HANDLE reader = CreateNamedPipeW
++        (name, PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
++         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
++         | PIPE_REJECT_REMOTE_CLIENTS,
++         1, size, size, 0, attributes);
++      if (reader == INVALID_HANDLE_VALUE)
++        {
++          DWORD error = GetLastError ();
++          if (error == ERROR_PIPE_BUSY && attempt + 1 < 8)
++            continue;
++          SetLastError (error ? error : ERROR_GEN_FAILURE);
++          return FALSE;
++        }
++      HANDLE writer = CreateFileW (name, GENERIC_WRITE, 0, attributes,
++                                  OPEN_EXISTING, 0, NULL);
++      if (writer == INVALID_HANDLE_VALUE)
++        {
++          DWORD error = GetLastError ();
++          CloseHandle (reader);
++          SetLastError (error ? error : ERROR_GEN_FAILURE);
++          return FALSE;
++        }
++      *read_pipe = reader;
++      *write_pipe = writer;
++      return TRUE;
++    }
++  SetLastError (ERROR_PIPE_BUSY);
++  return FALSE;
++}
++
++BOOL
++appcontainer_create_pipe (PHANDLE read_pipe, PHANDLE write_pipe,
++                          LPSECURITY_ATTRIBUTES attributes, DWORD size)
++{
++  DWORD error = GetLastError ();
++  BOOL result = FALSE;
++  {
++    appcontainer_pipe_security security;
++    DWORD prepare_error = security.prepare (attributes);
++    if (prepare_error)
++      error = prepare_error;
++    else
++      {
++        /* Preserve the original host API arguments and LastError input.
++           No environment, cached SID or caller flag selects the AC branch. */
++        SetLastError (error);
++        result = security.is_appcontainer ()
++          ? create_appcontainer_anonymous_pipe (read_pipe, write_pipe,
++                                               security.get (), size)
++          : CreatePipe (read_pipe, write_pipe, attributes, size);
++        error = GetLastError ();
++      }
++  }
++  /* The owned descriptor destructor must not replace the operation error. */
++  SetLastError (error);
++  return result;
++}
++
+ /* Implement CreateEvent/OpenEvent so that named objects are always created in
+    Cygwin shared object namespace. */
+ 
+@@ -39,14 +133,39 @@ CreateEventW (LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset,
+       RtlInitUnicodeString (&uname, lpName);
+       flags |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
+     }
+-  InitializeObjectAttributes (&attr, lpName ? &uname : NULL, flags,
+-			      lpName ? get_shared_parent_dir () : NULL,
+-			      lpEventAttributes
+-			      ? lpEventAttributes->lpSecurityDescriptor : NULL);
+-  status = NtCreateEvent (&evt, EVENT_ALL_ACCESS, &attr,
+-			  bManualReset ? NotificationEvent
+-				       : SynchronizationEvent,
+-			  bInitialState);
++  /* Reuse the bounded token-derived descriptor builder only for named
++     objects in the MSYS shared namespace. Unnamed objects and ordinary host
++     descriptors retain their original behavior. This is not a filesystem
++     descriptor adaptation. The helper owns all appended ACE storage. */
++  DWORD security_error = ERROR_SUCCESS;
++  {
++    appcontainer_pipe_security named_security;
++    LPSECURITY_ATTRIBUTES effective_attributes = lpEventAttributes;
++    if (lpName)
++      {
++        security_error = named_security.prepare (lpEventAttributes);
++        if (!security_error)
++          effective_attributes = named_security.get ();
++      }
++    if (!security_error)
++      {
++        InitializeObjectAttributes (&attr, lpName ? &uname : NULL, flags,
++                              lpName ? get_shared_parent_dir () : NULL,
++                              effective_attributes
++                              ? effective_attributes->lpSecurityDescriptor : NULL);
++        status = NtCreateEvent (&evt, EVENT_ALL_ACCESS, &attr,
++                          bManualReset ? NotificationEvent
++                                       : SynchronizationEvent,
++                          bInitialState);
++      }
++  }
++  /* Destroy the owned descriptor before publishing the Win32 error. Heap
++     cleanup must not overwrite the result of this creation operation. */
++  if (security_error)
++    {
++      SetLastError (security_error);
++      return NULL;
++    }
+   if (!NT_SUCCESS (status))
+     {
+       SetLastError (RtlNtStatusToDosError (status));
+@@ -133,11 +252,36 @@ CreateMutexW (LPSECURITY_ATTRIBUTES lpMutexAttributes, BOOL bInitialOwner,
+       RtlInitUnicodeString (&uname, lpName);
+       flags |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
+     }
+-  InitializeObjectAttributes (&attr, lpName ? &uname : NULL, flags,
+-			      lpName ? get_shared_parent_dir () : NULL,
+-			      lpMutexAttributes
+-			      ? lpMutexAttributes->lpSecurityDescriptor : NULL);
+-  status = NtCreateMutant (&mtx, MUTEX_ALL_ACCESS, &attr, bInitialOwner);
++  /* Reuse the bounded token-derived descriptor builder only for named
++     objects in the MSYS shared namespace. Unnamed objects and ordinary host
++     descriptors retain their original behavior. This is not a filesystem
++     descriptor adaptation. The helper owns all appended ACE storage. */
++  DWORD security_error = ERROR_SUCCESS;
++  {
++    appcontainer_pipe_security named_security;
++    LPSECURITY_ATTRIBUTES effective_attributes = lpMutexAttributes;
++    if (lpName)
++      {
++        security_error = named_security.prepare (lpMutexAttributes);
++        if (!security_error)
++          effective_attributes = named_security.get ();
++      }
++    if (!security_error)
++      {
++        InitializeObjectAttributes (&attr, lpName ? &uname : NULL, flags,
++                              lpName ? get_shared_parent_dir () : NULL,
++                              effective_attributes
++                              ? effective_attributes->lpSecurityDescriptor : NULL);
++        status = NtCreateMutant (&mtx, MUTEX_ALL_ACCESS, &attr, bInitialOwner);
++      }
++  }
++  /* Destroy the owned descriptor before publishing the Win32 error. Heap
++     cleanup must not overwrite the result of this creation operation. */
++  if (security_error)
++    {
++      SetLastError (security_error);
++      return NULL;
++    }
+   if (!NT_SUCCESS (status))
+     {
+       SetLastError (RtlNtStatusToDosError (status));
+@@ -223,13 +367,38 @@ CreateSemaphoreW (LPSECURITY_ATTRIBUTES lpSemaphoreAttributes,
+       RtlInitUnicodeString (&uname, lpName);
+       flags |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
+     }
+-  InitializeObjectAttributes (&attr, lpName ? &uname : NULL, flags,
+-			      lpName ? get_shared_parent_dir () : NULL,
+-			      lpSemaphoreAttributes
+-			      ? lpSemaphoreAttributes->lpSecurityDescriptor
+-			      : NULL);
+-  status = NtCreateSemaphore (&sem, SEMAPHORE_ALL_ACCESS, &attr,
+-			      lInitialCount, lMaximumCount);
++  /* Reuse the bounded token-derived descriptor builder only for named
++     objects in the MSYS shared namespace. Unnamed objects and ordinary host
++     descriptors retain their original behavior. This is not a filesystem
++     descriptor adaptation. The helper owns all appended ACE storage. */
++  DWORD security_error = ERROR_SUCCESS;
++  {
++    appcontainer_pipe_security named_security;
++    LPSECURITY_ATTRIBUTES effective_attributes = lpSemaphoreAttributes;
++    if (lpName)
++      {
++        security_error = named_security.prepare (lpSemaphoreAttributes);
++        if (!security_error)
++          effective_attributes = named_security.get ();
++      }
++    if (!security_error)
++      {
++        InitializeObjectAttributes (&attr, lpName ? &uname : NULL, flags,
++                              lpName ? get_shared_parent_dir () : NULL,
++                              effective_attributes
++                              ? effective_attributes->lpSecurityDescriptor
++                              : NULL);
++        status = NtCreateSemaphore (&sem, SEMAPHORE_ALL_ACCESS, &attr,
++                              lInitialCount, lMaximumCount);
++      }
++  }
++  /* Destroy the owned descriptor before publishing the Win32 error. Heap
++     cleanup must not overwrite the result of this creation operation. */
++  if (security_error)
++    {
++      SetLastError (security_error);
++      return NULL;
++    }
+   if (!NT_SUCCESS (status))
+     {
+       SetLastError (RtlNtStatusToDosError (status));
+@@ -334,16 +503,41 @@ CreateFileMappingW (HANDLE hFile, LPSECURITY_ATTRIBUTES lpAttributes,
+       RtlInitUnicodeString (&uname, lpName);
+       flags |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
+     }
+-  InitializeObjectAttributes (&attr, lpName ? &uname : NULL, flags,
+-			      lpName ? get_shared_parent_dir () : NULL,
+-			      lpAttributes
+-			      ? lpAttributes->lpSecurityDescriptor
+-			      : NULL);
+-  if (!(attribs & (SEC_RESERVE | SEC_COMMIT)))
+-    attribs |= SEC_COMMIT;
+-  if (hFile == INVALID_HANDLE_VALUE)
+-    hFile = NULL;
+-  status = NtCreateSection (&sect, access, &attr, psize, prot, attribs, hFile);
++  /* Reuse the bounded token-derived descriptor builder only for named
++     objects in the MSYS shared namespace. Unnamed objects and ordinary host
++     descriptors retain their original behavior. This is not a filesystem
++     descriptor adaptation. The helper owns all appended ACE storage. */
++  DWORD security_error = ERROR_SUCCESS;
++  {
++    appcontainer_pipe_security named_security;
++    LPSECURITY_ATTRIBUTES effective_attributes = lpAttributes;
++    if (lpName)
++      {
++        security_error = named_security.prepare (lpAttributes);
++        if (!security_error)
++          effective_attributes = named_security.get ();
++      }
++    if (!security_error)
++      {
++        InitializeObjectAttributes (&attr, lpName ? &uname : NULL, flags,
++                              lpName ? get_shared_parent_dir () : NULL,
++                              effective_attributes
++                              ? effective_attributes->lpSecurityDescriptor
++                              : NULL);
++        if (!(attribs & (SEC_RESERVE | SEC_COMMIT)))
++          attribs |= SEC_COMMIT;
++        if (hFile == INVALID_HANDLE_VALUE)
++          hFile = NULL;
++        status = NtCreateSection (&sect, access, &attr, psize, prot, attribs, hFile);
++      }
++  }
++  /* Destroy the owned descriptor before publishing the Win32 error. Heap
++     cleanup must not overwrite the result of this creation operation. */
++  if (security_error)
++    {
++      SetLastError (security_error);
++      return NULL;
++    }
+   if (!NT_SUCCESS (status))
+     {
+       SetLastError (RtlNtStatusToDosError (status));
+diff --git a/winsup/cygwin/local_includes/appcontainer_anonymous_pipe.h b/winsup/cygwin/local_includes/appcontainer_anonymous_pipe.h
+new file mode 100644
+index 0000000..198ab39
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_anonymous_pipe.h
+@@ -0,0 +1,5 @@
++/* MSYS-internal synchronous byte pipe; include after winsup.h. */
++#ifndef _APPCONTAINER_ANONYMOUS_PIPE_H
++#define _APPCONTAINER_ANONYMOUS_PIPE_H
++BOOL appcontainer_create_pipe (PHANDLE, PHANDLE, LPSECURITY_ATTRIBUTES, DWORD);
++#endif
+diff --git a/winsup/cygwin/local_includes/appcontainer_child_security.h b/winsup/cygwin/local_includes/appcontainer_child_security.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba1fa94b282c60bd336b3dd7387b6c9a41cb6897
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_child_security.h
+@@ -0,0 +1,106 @@
++/* Same-primary-token child creation only; include after winsup.h. */
++#ifndef _APPCONTAINER_CHILD_SECURITY_H
++#define _APPCONTAINER_CHILD_SECURITY_H
++#include "appcontainer_pipe_security.h"
++
++/* Windows does not inherit the root process's explicit HEVA-off creation
++   policy into MSYS fork children.  Prepare a private STARTUPINFOEX only for
++   same-token AppContainer Cygwin children.  This allocation must remain on the
++   Windows process heap: fork calls this helper while the Cygwin malloc heap is
++   locked. */
++class appcontainer_child_startup
++{
++  STARTUPINFOEXW extended_;
++  PPROC_THREAD_ATTRIBUTE_LIST attributes_;
++  bool initialized_;
++  DWORD64 mitigation_;
++  LPSTARTUPINFOW startup_;
++  DWORD flags_;
++
++public:
++  appcontainer_child_startup () : extended_ {}, attributes_ (NULL),
++    initialized_ (false), mitigation_ (0), startup_ (NULL), flags_ (0) {}
++  ~appcontainer_child_startup ()
++  {
++    if (initialized_)
++      DeleteProcThreadAttributeList (attributes_);
++    if (attributes_)
++      HeapFree (GetProcessHeap (), 0, attributes_);
++  }
++
++  DWORD prepare (LPSTARTUPINFOW original, DWORD original_flags, bool enabled)
++  {
++    startup_ = original;
++    flags_ = original_flags;
++    if (!enabled)
++      return ERROR_SUCCESS;
++    if (!original || (original_flags & EXTENDED_STARTUPINFO_PRESENT))
++      return ERROR_INVALID_PARAMETER;
++
++    SIZE_T bytes = 0;
++    SetLastError (ERROR_SUCCESS);
++    if (InitializeProcThreadAttributeList (NULL, 1, 0, &bytes)
++        || !bytes || GetLastError () != ERROR_INSUFFICIENT_BUFFER)
++      return GetLastError () ? GetLastError () : ERROR_INVALID_PARAMETER;
++    attributes_ = (PPROC_THREAD_ATTRIBUTE_LIST)
++      HeapAlloc (GetProcessHeap (), 0, bytes);
++    if (!attributes_)
++      return ERROR_NOT_ENOUGH_MEMORY;
++    if (!InitializeProcThreadAttributeList (attributes_, 1, 0, &bytes))
++      return GetLastError ();
++    initialized_ = true;
++
++    mitigation_ = 2ULL << 20;
++    if (!UpdateProcThreadAttribute (attributes_, 0,
++          PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation_,
++          sizeof mitigation_, NULL, NULL))
++      return GetLastError ();
++    extended_.StartupInfo = *original;
++    extended_.StartupInfo.cb = sizeof extended_;
++    extended_.lpAttributeList = attributes_;
++    startup_ = &extended_.StartupInfo;
++    flags_ |= EXTENDED_STARTUPINFO_PRESENT;
++    return ERROR_SUCCESS;
++  }
++
++  LPSTARTUPINFOW startup () const { return startup_; }
++  DWORD flags () const { return flags_; }
++};
++
++/* CreateProcessW inherits the primary token, but an explicit sec_user_nih SD
++   omits that token's package SID. Preserve that SD and append only the actual
++   package grant for both child objects. Never use this for CreateProcessAsUser:
++   its target token can identify a different user or package. One synchronous
++   operation owns the descriptor and optional startup attributes; no environment
++   SID, globals or fork cache. Both helpers use Windows HeapAlloc, never the
++   locked Cygwin malloc heap. */
++template <typename Create>
++static BOOL
++appcontainer_child_create (LPSECURITY_ATTRIBUTES original,
++                           LPSTARTUPINFOW startup, DWORD flags,
++                           bool cygwin_child, Create create)
++{
++  BOOL result = FALSE;
++  DWORD error;
++  {
++    appcontainer_pipe_security security;
++    error = security.prepare (original);
++    if (!error)
++      {
++        appcontainer_child_startup child_startup;
++        error = child_startup.prepare (startup, flags,
++                    security.is_appcontainer () && cygwin_child);
++        if (!error)
++          {
++            result = create (security.get (), child_startup.startup (),
++                             child_startup.flags ());
++            error = GetLastError ();
++          }
++      }
++  }
++  /* Token/descriptor/attribute cleanup must not replace preparation or
++     CreateProcessW failure. The caller retains its complete cleanup/errno path. */
++  SetLastError (error);
++  return result;
++}
++#endif
+diff --git a/winsup/cygwin/local_includes/appcontainer_named_kernel.h b/winsup/cygwin/local_includes/appcontainer_named_kernel.h
+new file mode 100644
+index 0000000..6548c73
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_named_kernel.h
+@@ -0,0 +1,38 @@
++/* Source-only raw named-kernel-object adapter. Include after winsup.h. */
++#ifndef _APPCONTAINER_NAMED_KERNEL_H
++#define _APPCONTAINER_NAMED_KERNEL_H
++#include "ntdll.h"
++#include "appcontainer_pipe_security.h"
++
++/* Only synchronous object creation belongs here, never file/pipe I/O or
++   user filesystem security. Preserve the original attributes for later open
++   calls; a copied descriptor must never escape the owning helper's lifetime.
++   The callback runs exactly once after successful preparation, or directly
++   for unnamed/ordinary-host calls. */
++template <typename Create>
++static NTSTATUS
++appcontainer_named_kernel_create (PHANDLE target, POBJECT_ATTRIBUTES original,
++                                   Create create)
++{
++  if (!original || !original->ObjectName)
++    return create (original);
++  SECURITY_ATTRIBUTES source = { sizeof source, original->SecurityDescriptor,
++                                  (original->Attributes & OBJ_INHERIT) != 0 };
++  appcontainer_pipe_security security;
++  DWORD error = security.prepare (&source);
++  if (error)
++    {
++      /* Do not reinterpret a positive DWORD as NT_SUCCESS. Existing callers
++         retain their native-failure/errno/fatal branches; log the real cause. */
++      if (target)
++        *target = NULL;
++      debug_printf ("AppContainer named kernel descriptor failed, Win32 %u", error);
++      return static_cast<NTSTATUS> (0xc0000001); /* STATUS_UNSUCCESSFUL */
++    }
++  if (!security.is_appcontainer ())
++    return create (original);
++  OBJECT_ATTRIBUTES adapted = *original;
++  adapted.SecurityDescriptor = security.get ()->lpSecurityDescriptor;
++  return create (&adapted);
++}
++#endif
+diff --git a/winsup/cygwin/local_includes/appcontainer_null.h b/winsup/cygwin/local_includes/appcontainer_null.h
+new file mode 100644
+index 0000000..a691bd4
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_null.h
+@@ -0,0 +1,4 @@
++#ifndef CYGWIN_APPCONTAINER_NULL_H
++#define CYGWIN_APPCONTAINER_NULL_H
++bool appcontainer_null_open (HANDLE *, DWORD, ULONG, ULONG, int, DWORD *);
++#endif
+diff --git a/winsup/cygwin/local_includes/appcontainer_pipe_name.h b/winsup/cygwin/local_includes/appcontainer_pipe_name.h
+new file mode 100644
+index 0000000..a3857c6
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_pipe_name.h
+@@ -0,0 +1,30 @@
++/* Source-only helper proposal; requires appcontainer_pipe_security. */
++#ifndef _APPCONTAINER_PIPE_NAME_H
++#define _APPCONTAINER_PIPE_NAME_H
++
++/* Include after winsup.h and ntdll.h. One local object owns one current NT
++   pipe name; no cache/fork state. get() is read-only to callers and stays valid
++   only until the next prepare() or destruction. Complete the synchronous NT
++   call before preparing another name. Never concurrently use this object. */
++class appcontainer_pipe_name
++{
++  WCHAR buffer_[513];
++  UNICODE_STRING value_;
++  PUNICODE_STRING result_;
++  bool appcontainer_;
++  appcontainer_pipe_name (const appcontainer_pipe_name &) = delete;
++  appcontainer_pipe_name &operator= (const appcontainer_pipe_name &) = delete;
++public:
++  appcontainer_pipe_name ();
++  /* Returns an actual Win32 failure or explicit validation failure. Failure
++     leaves get()==NULL. Host success returns the exact original pointer;
++     AppContainer success returns this object's bounded owned name. Reusable
++     after each previous synchronous operation has finished. */
++  DWORD prepare (PUNICODE_STRING original);
++  PUNICODE_STRING get () const { return result_; }
++  bool is_appcontainer () const { return appcontainer_; }
++  /* Failure-only adapter for NT callers: log the actual DWORD separately.
++     Never use stale RtlGetLastNtStatus or cast a positive DWORD to NTSTATUS. */
++  static NTSTATUS error_status (DWORD error);
++};
++#endif
+diff --git a/winsup/cygwin/local_includes/appcontainer_pipe_security.h b/winsup/cygwin/local_includes/appcontainer_pipe_security.h
+new file mode 100644
+index 0000000..597753b
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_pipe_security.h
+@@ -0,0 +1,31 @@
++/* Source-only prototype; not part of an installed or tested MSYS runtime. */
++#ifndef _APPCONTAINER_PIPE_SECURITY_H
++#define _APPCONTAINER_PIPE_SECURITY_H
++
++/* Include after winsup.h. One object owns one synchronous pipe-creation
++   descriptor. Do not retain it across fork or cache it in global storage. */
++class appcontainer_pipe_security
++{
++  SECURITY_ATTRIBUTES attributes_;
++  SECURITY_DESCRIPTOR descriptor_;
++  LPSECURITY_ATTRIBUTES result_;
++  void *storage_;
++  bool prepared_;
++  bool appcontainer_;
++
++  appcontainer_pipe_security (const appcontainer_pipe_security &) = delete;
++  appcontainer_pipe_security &operator=
++    (const appcontainer_pipe_security &) = delete;
++
++public:
++  appcontainer_pipe_security ();
++  ~appcontainer_pipe_security ();
++
++  /* Return a Win32 error. On error get() is NULL and callers MUST refuse the
++     pipe operation. On ordinary hosts get() is exactly source, including NULL.
++     In an AppContainer get() owns its complete descriptor until destruction. */
++  DWORD prepare (LPSECURITY_ATTRIBUTES source);
++  LPSECURITY_ATTRIBUTES get () const { return result_; }
++  bool is_appcontainer () const { return appcontainer_; }
++};
++#endif
+diff --git a/winsup/cygwin/sec/appcontainer_null.cc b/winsup/cygwin/sec/appcontainer_null.cc
+new file mode 100644
+index 0000000..50f7e7b
+--- /dev/null
++++ b/winsup/cygwin/sec/appcontainer_null.cc
+@@ -0,0 +1,200 @@
++/* Private inherited NUL adapter; candidate, not native-runtime accepted.
++   Validation derived from the reviewed pinned libuv NUL capability helper.
++   No global capability cache, environment mutation, or device ACL changes. */
++#include "winsup.h"
++#include <stdint.h>
++#include <fcntl.h>
++#include "appcontainer_null.h"
++
++/* Private NUL capability validation adapted from the reviewed libuv helper.
++ * No environment value grants authority; an owned duplicate must prove its
++ * actual kernel object and access mask. No global environment or handle cache.
++ */
++#define MSYS_NULL_ENV L"AUTOPROMPT_PRIVATE_NUL_HANDLE"
++#define MSYS_NULL_ALL ((DWORD) (FILE_GENERIC_READ | FILE_GENERIC_WRITE))
++
++typedef struct {
++  USHORT length;
++  USHORT maximum_length;
++  WCHAR* buffer;
++} null_string_t;
++
++typedef struct {
++  ULONG attributes;
++  ACCESS_MASK granted_access;
++  ULONG handle_count;
++  ULONG pointer_count;
++  ULONG reserved[10];
++} null_basic_t;
++
++typedef LONG (NTAPI *null_query_t)(HANDLE, ULONG, void*, ULONG, ULONG*);
++
++static int null_error(void) {
++  DWORD error = GetLastError();
++  return error != 0 ? (int) error : ERROR_INVALID_DATA;
++}
++
++static int null_token(int* app) {
++  HANDLE token;
++  DWORD value, returned;
++  int error;
++  token = NULL;
++  value = returned = 0;
++  *app = 0;
++  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
++    return null_error();
++  error = GetTokenInformation(token, TokenIsAppContainer, &value,
++                              sizeof(value), &returned) ? 0 : null_error();
++  if (!error && (returned != sizeof(value) || value > 1))
++    error = ERROR_INVALID_DATA;
++  if (!CloseHandle(token) && !error)
++    error = null_error();
++  if (!error)
++    *app = value != 0;
++  return error;
++}
++
++static int null_parse(const WCHAR* text, size_t length, uintptr_t* value) {
++  size_t i;
++  uintptr_t result = 0;
++  unsigned int digit;
++  if (length != sizeof(uintptr_t) * 2)
++    return ERROR_INVALID_DATA;
++  for (i = 0; i < length; i++) {
++    if (text[i] >= L'0' && text[i] <= L'9')
++      digit = text[i] - L'0';
++    else if (text[i] >= L'a' && text[i] <= L'f')
++      digit = text[i] - L'a' + 10;
++    else
++      return ERROR_INVALID_DATA;
++    result = (result << 4) | digit;
++  }
++  /* Positive pointer-sized values only: never process/thread pseudo handles. */
++  if (result == 0 || result > UINTPTR_MAX / 2)
++    return ERROR_INVALID_HANDLE;
++  *value = result;
++  return 0;
++}
++
++static int null_query_string(null_query_t query, HANDLE handle,
++                                ULONG kind, const WCHAR* expected,
++                                size_t expected_length) {
++  union { uintptr_t alignment; unsigned char bytes[4096]; } storage;
++  null_string_t* name;
++  ULONG returned = 0;
++  uintptr_t start, pointer;
++  if (query(handle, kind, storage.bytes, sizeof(storage.bytes), &returned) != 0)
++    return ERROR_INVALID_DATA;
++  if (returned < sizeof(null_string_t) || returned > sizeof(storage.bytes))
++    return ERROR_INVALID_DATA;
++  name = (null_string_t*) storage.bytes;
++  start = (uintptr_t) storage.bytes;
++  pointer = (uintptr_t) name->buffer;
++  if (name->length != expected_length * sizeof(WCHAR) ||
++      name->maximum_length < name->length || pointer % alignof(WCHAR) || pointer < start ||
++      pointer - start < sizeof(null_string_t) || pointer - start > returned ||
++      name->maximum_length > returned - (pointer - start))
++    return ERROR_INVALID_DATA;
++  if (CompareStringOrdinal(name->buffer, (int) expected_length,
++                           expected, (int) expected_length, TRUE) != CSTR_EQUAL)
++    return ERROR_INVALID_HANDLE;
++  return 0;
++}
++
++static int null_validate(HANDLE handle, DWORD wanted, int exact_mask) {
++  union { FARPROC address; null_query_t query; } api;
++  null_basic_t basic;
++  ULONG returned = 0;
++  int error;
++  /* Reject disks/pipes before querying their object names. */
++  if (GetFileType(handle) != FILE_TYPE_CHAR)
++    return ERROR_INVALID_HANDLE;
++  api.address = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
++  if (api.address == NULL)
++    return ERROR_PROC_NOT_FOUND;
++  error = null_query_string(api.query, handle, 2, L"File", 4);
++  if (error)
++    return error;
++  error = null_query_string(api.query, handle, 1, L"\\Device\\Null", 12);
++  if (error)
++    return error;
++  if (api.query(handle, 0, &basic, sizeof(basic), &returned) != 0 ||
++      returned != sizeof(basic))
++    return ERROR_INVALID_DATA;
++  if ((basic.granted_access & wanted) != wanted ||
++      (exact_mask && basic.granted_access != wanted))
++    return ERROR_ACCESS_DENIED;
++  return 0;
++}
++
++static_assert (sizeof (null_basic_t) == 56, "Native object basic layout");
++
++struct null_owner
++{
++  HANDLE value = NULL;
++  ~null_owner () {
++    DWORD error = GetLastError ();
++    if (value) CloseHandle (value);
++    SetLastError (error);
++  }
++};
++
++/* false means untouched ordinary path; true means success or strict refusal.
++   Only a host token or absent locator selects the original NtCreateFile. */
++bool
++appcontainer_null_open (HANDLE *output, DWORD access, ULONG disposition,
++                       ULONG options, int flags, DWORD *error)
++{
++  int app = 0;
++  *error = null_token (&app);
++  if (*error) return true;
++  if (!app) return false;
++  WCHAR locator[sizeof (uintptr_t) * 2 + 1];
++  SetLastError (0);
++  DWORD length = GetEnvironmentVariableW (MSYS_NULL_ENV, locator,
++                                         sizeof locator / sizeof locator[0]);
++  if (!length && GetLastError () == ERROR_ENVVAR_NOT_FOUND) return false;
++  if (!length || length >= sizeof locator / sizeof locator[0]
++      || locator[length]) { *error = ERROR_INVALID_DATA; return true; }
++  uintptr_t source = 0;
++  *error = null_parse (locator, length, &source);
++  if (*error) return true;
++  null_owner capability;
++  if (!DuplicateHandle (GetCurrentProcess (), (HANDLE) source,
++                        GetCurrentProcess (), &capability.value, 0, FALSE,
++                        DUPLICATE_SAME_ACCESS)) {
++    *error = null_error (); return true;
++  }
++  *error = null_validate (capability.value, MSYS_NULL_ALL, 1);
++  if (*error) return true;
++  if (flags & (O_DIRECTORY | O_TMPFILE)) {
++    *error = ERROR_DIRECTORY; return true;
++  }
++  if (disposition == FILE_CREATE) { *error = ERROR_FILE_EXISTS; return true; }
++  if (disposition != FILE_OPEN && disposition != FILE_OPEN_IF) {
++    *error = ERROR_INVALID_PARAMETER; return true;
++  }
++  const ULONG supported = FILE_OPEN_FOR_BACKUP_INTENT
++    | FILE_SYNCHRONOUS_IO_NONALERT | FILE_WRITE_THROUGH
++    | FILE_NO_INTERMEDIATE_BUFFERING;
++  if (options & ~supported) { *error = ERROR_INVALID_PARAMETER; return true; }
++  DWORD wanted = access;
++  if (wanted & GENERIC_READ) wanted = (wanted & ~GENERIC_READ) | FILE_GENERIC_READ;
++  if (wanted & GENERIC_WRITE) wanted = (wanted & ~GENERIC_WRITE) | FILE_GENERIC_WRITE;
++  /* Every non-read/write generic right and MAXIMUM_ALLOWED lies outside this
++     explicit subset. Duplicating cannot silently widen requested authority. */
++  if (!wanted || (wanted & ~MSYS_NULL_ALL)) {
++    *error = ERROR_ACCESS_DENIED; return true;
++  }
++  null_owner result;
++  if (!DuplicateHandle (GetCurrentProcess (), capability.value,
++                        GetCurrentProcess (), &result.value, wanted,
++                        !(flags & O_CLOEXEC), 0)) {
++    *error = null_error (); return true;
++  }
++  *error = null_validate (result.value, wanted, 1);
++  if (*error) return true;
++  *output = result.value;
++  result.value = NULL;
++  return true;
++}
+diff --git a/winsup/cygwin/sec/appcontainer_pipe.cc b/winsup/cygwin/sec/appcontainer_pipe.cc
+new file mode 100644
+--- /dev/null
++++ b/winsup/cygwin/sec/appcontainer_pipe.cc
+@@ -0,0 +1,285 @@
++/* Pipe-only AppContainer descriptor prototype.
++
++   Baseline: git-for-windows/msys2-runtime
++   270ba2980700e6e2a0813944d506eecea0f86402.
++   No global sec_acl change, no environment inputs and no cached token state.
++   Security API calls use direct Nt/Rtl imports for early fork initialization. */
++
++#include "winsup.h"
++#include <stdint.h>
++#include <string.h>
++#include "appcontainer_pipe_security.h"
++#include "appcontainer_nt_security.h"
++
++namespace
++{
++constexpr DWORD pipe_sd_limit = 128 * 1024;
++constexpr DWORD pipe_acl_limit = 0xffff;
++/* Legacy SECURITY_DESCRIPTOR_CONTROL bits are absent from the pinned headers.
++   Values are defined by Microsoft's security-descriptor-control contract. */
++constexpr SECURITY_DESCRIPTOR_CONTROL legacy_dacl_untrusted = 0x0040;
++constexpr SECURITY_DESCRIPTOR_CONTROL legacy_server_security = 0x0080;
++
++struct scoped_token
++{
++  HANDLE value;
++  scoped_token () : value (NULL) {}
++  ~scoped_token () { if (value) CloseHandle (value); }
++};
++
++/* Token information includes a pointer followed by an inline variable SID.
++   Check that pointer against the returned buffer before inspecting the SID. */
++bool
++bounded_sid (PSID sid, const void *buffer, DWORD size)
++{
++  uintptr_t start = reinterpret_cast<uintptr_t> (buffer);
++  uintptr_t value = reinterpret_cast<uintptr_t> (sid);
++  if (!sid || value < start || value - start > size
++      || size - (value - start) < 8)
++    return false;
++  DWORD remaining = size - (value - start);
++  BYTE count = *appcontainer_nt::GetSidSubAuthorityCount (sid);
++  DWORD length = appcontainer_nt::GetSidLengthRequired (count);
++  return length <= SECURITY_MAX_SID_SIZE && length <= remaining
++         && appcontainer_nt::IsValidSid (sid);
++}
++
++union sid_buffer
++{
++  ULONG_PTR align;
++  BYTE bytes[SECURITY_MAX_SID_SIZE];
++};
++
++/* GetTokenInformation is used rather than a user-controlled SID string.
++   Buffers are fixed and bounded; an oversized or malformed result refuses. */
++DWORD
++token_sid (HANDLE token, TOKEN_INFORMATION_CLASS kind, sid_buffer &destination)
++{
++  union
++  {
++    ULONG_PTR align;
++    BYTE bytes[sizeof (TOKEN_USER) + SECURITY_MAX_SID_SIZE];
++  } information;
++  DWORD returned = 0;
++  if (!appcontainer_nt::GetTokenInformation (token, kind, information.bytes,
++                            sizeof information, &returned))
++    return GetLastError ();
++  if (returned > sizeof information || returned < sizeof (PSID))
++    return ERROR_INVALID_DATA;
++  PSID sid = kind == TokenUser
++    ? reinterpret_cast<TOKEN_USER *> (information.bytes)->User.Sid
++    : reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION *>
++        (information.bytes)->TokenAppContainer;
++  if (!bounded_sid (sid, information.bytes, returned))
++    return ERROR_INVALID_SID;
++  if (!appcontainer_nt::CopySid (sizeof destination.bytes, destination.bytes, sid))
++    return GetLastError ();
++  return ERROR_SUCCESS;
++}
++
++DWORD
++sid_size (PSID sid)
++{
++  if (!sid)
++    return 0;
++  return appcontainer_nt::IsValidSid (sid) ? appcontainer_nt::GetLengthSid (sid) : 0xffffffff;
++}
++
++DWORD
++acl_used (PACL acl, ACL_SIZE_INFORMATION &info)
++{
++  if (!acl || !appcontainer_nt::IsValidAcl (acl)
++      || !appcontainer_nt::GetAclInformation (acl, &info, sizeof info, AclSizeInformation)
++      || (acl->AclSize & 3) || (info.AclBytesInUse & 3)
++      || info.AclBytesInUse < sizeof (ACL)
++      || info.AclBytesInUse > acl->AclSize
++      || (acl->AclRevision != ACL_REVISION
++          && acl->AclRevision != ACL_REVISION_DS))
++    return ERROR_INVALID_ACL;
++  return ERROR_SUCCESS;
++}
++}
++
++appcontainer_pipe_security::appcontainer_pipe_security ()
++  : attributes_ {}, descriptor_ {}, result_ (NULL), storage_ (NULL),
++    prepared_ (false), appcontainer_ (false)
++{
++}
++
++appcontainer_pipe_security::~appcontainer_pipe_security ()
++{
++  if (storage_)
++    HeapFree (GetProcessHeap (), 0, storage_);
++}
++
++DWORD
++appcontainer_pipe_security::prepare (LPSECURITY_ATTRIBUTES source)
++{
++  DWORD previous_last_error = GetLastError ();
++  result_ = NULL;
++  if (prepared_)
++    return ERROR_INVALID_FUNCTION;
++  prepared_ = true;
++
++  scoped_token token;
++  if (!appcontainer_nt::OpenProcessToken (GetCurrentProcess (), TOKEN_QUERY, &token.value))
++    return GetLastError ();
++  DWORD container = 0, returned = 0;
++  if (!appcontainer_nt::GetTokenInformation (token.value, TokenIsAppContainer, &container,
++                            sizeof container, &returned))
++    return GetLastError ();
++  if (returned != sizeof container || container > 1)
++    return ERROR_INVALID_DATA;
++  if (!container)
++    {
++      /* Do not inspect, normalize, copy or relabel an ordinary host SD. */
++      result_ = source;
++      CloseHandle (token.value);
++      token.value = NULL;
++      SetLastError (previous_last_error);
++      return ERROR_SUCCESS;
++    }
++  appcontainer_ = true;
++
++  if (source && source->nLength != sizeof (SECURITY_ATTRIBUTES))
++    return ERROR_INVALID_PARAMETER;
++  sid_buffer package, user, system;
++  DWORD error = token_sid (token.value, TokenAppContainerSid, package);
++  if (error)
++    return error;
++
++  PSECURITY_DESCRIPTOR supplied = source ? source->lpSecurityDescriptor : NULL;
++  PSID owner = NULL, group = NULL;
++  PACL old_dacl = NULL, old_sacl = NULL;
++  BOOL owner_defaulted = FALSE, group_defaulted = FALSE;
++  BOOL dacl_present = FALSE, dacl_defaulted = FALSE;
++  BOOL sacl_present = FALSE, sacl_defaulted = FALSE;
++  SECURITY_DESCRIPTOR_CONTROL control = 0;
++  UCHAR rm_control = 0;
++  DWORD revision = 0;
++  if (supplied)
++    {
++      if (!appcontainer_nt::IsValidSecurityDescriptor (supplied)
++          || !appcontainer_nt::GetSecurityDescriptorControl (supplied, &control, &revision)
++          || revision != SECURITY_DESCRIPTOR_REVISION
++          || !appcontainer_nt::GetSecurityDescriptorOwner (supplied, &owner, &owner_defaulted)
++          || !appcontainer_nt::GetSecurityDescriptorGroup (supplied, &group, &group_defaulted)
++          || !appcontainer_nt::GetSecurityDescriptorDacl (supplied, &dacl_present, &old_dacl,
++                                         &dacl_defaulted)
++          || !appcontainer_nt::GetSecurityDescriptorSacl (supplied, &sacl_present, &old_sacl,
++                                         &sacl_defaulted))
++        return ERROR_INVALID_SECURITY_DESCR;
++      /* These legacy control modes cannot be reproduced by the documented
++         component/inheritance setters below. Refuse rather than drop them. */
++      if (control & (legacy_dacl_untrusted | legacy_server_security))
++        return ERROR_INVALID_SECURITY_DESCR;
++      if ((control & SE_RM_CONTROL_VALID)
++          && (error = appcontainer_nt::GetSecurityDescriptorRMControl (supplied, &rm_control)))
++        return error;
++    }
++
++  /* An absent/default/NULL DACL is not copied as broad access. Only these
++     cases receive the explicit private user+SYSTEM+package descriptor. An
++     explicit empty DACL remains empty except for the appended package ACE;
++     it does NOT acquire an otherwise missing user grant. */
++  bool private_default = !dacl_present || !old_dacl;
++  if (private_default)
++    {
++      error = token_sid (token.value, TokenUser, user);
++      if (error)
++        return error;
++      DWORD system_size = sizeof system.bytes;
++      if (!appcontainer_nt::CreateWellKnownSid (WinLocalSystemSid, NULL, system.bytes,
++                               &system_size))
++        return GetLastError ();
++    }
++
++  DWORD owner_size = sid_size (owner), group_size = sid_size (group);
++  if (owner_size > SECURITY_MAX_SID_SIZE || group_size > SECURITY_MAX_SID_SIZE)
++    return ERROR_INVALID_SID;
++  ACL_SIZE_INFORMATION dacl_info {}, sacl_info {};
++  if (!private_default && (error = acl_used (old_dacl, dacl_info)))
++    return error;
++  if (sacl_present && old_sacl && (error = acl_used (old_sacl, sacl_info)))
++    return error;
++  DWORD original_aces = private_default ? 0
++    : dacl_info.AclBytesInUse - sizeof (ACL);
++  DWORD package_ace = sizeof (ACCESS_ALLOWED_ACE) - sizeof (DWORD)
++                      + appcontainer_nt::GetLengthSid (package.bytes);
++  DWORD dacl_size = sizeof (ACL) + original_aces + package_ace;
++  if (private_default)
++    dacl_size += 2 * (sizeof (ACCESS_ALLOWED_ACE) - sizeof (DWORD))
++                 + appcontainer_nt::GetLengthSid (user.bytes) + appcontainer_nt::GetLengthSid (system.bytes);
++  DWORD sacl_size = sacl_present && old_sacl ? old_sacl->AclSize : 0;
++  DWORD total = owner_size + group_size + sacl_size + dacl_size;
++  if (dacl_size > pipe_acl_limit || sacl_size > pipe_acl_limit
++      || total > pipe_sd_limit)
++    return ERROR_ALLOTTED_SPACE_EXCEEDED;
++  storage_ = HeapAlloc (GetProcessHeap (), HEAP_ZERO_MEMORY, total);
++  if (!storage_)
++    return ERROR_NOT_ENOUGH_MEMORY;
++  BYTE *cursor = static_cast<BYTE *> (storage_);
++
++  /* Copy all components. Descriptor pointers never refer back to caller
++     storage or a token-query buffer after prepare returns. */
++  if (!appcontainer_nt::InitializeSecurityDescriptor (&descriptor_, SECURITY_DESCRIPTOR_REVISION))
++    return GetLastError ();
++  PSID copied_owner = NULL, copied_group = NULL;
++  PACL copied_sacl = NULL;
++  if (owner_size)
++    { memcpy (cursor, owner, owner_size); copied_owner = cursor;
++      cursor += owner_size; }
++  if (group_size)
++    { memcpy (cursor, group, group_size); copied_group = cursor;
++      cursor += group_size; }
++  if (sacl_size)
++    { memcpy (cursor, old_sacl, sacl_size);
++      copied_sacl = reinterpret_cast<PACL> (cursor); cursor += sacl_size; }
++
++  PACL dacl = reinterpret_cast<PACL> (cursor);
++  DWORD acl_revision = private_default ? ACL_REVISION : old_dacl->AclRevision;
++  if (!appcontainer_nt::InitializeAcl (dacl, dacl_size, acl_revision))
++    return GetLastError ();
++  if (original_aces
++      && !appcontainer_nt::AddAce (dacl, acl_revision, MAXDWORD,
++                   reinterpret_cast<BYTE *> (old_dacl) + sizeof (ACL),
++                   original_aces))
++    return GetLastError ();
++  if (private_default
++      && (!appcontainer_nt::AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL, user.bytes)
++          || !appcontainer_nt::AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL,
++                                     system.bytes)))
++    return GetLastError ();
++  /* Append AFTER every original ACE. Preserve every deny/allow byte and its
++     order. Never insert the new allow in front of an existing inherited deny.
++     This does not promise canonical reordering; authorization remains subject
++     to the original restrictions and the OS object access check. */
++  if (!appcontainer_nt::AddAccessAllowedAceEx (dacl, acl_revision, 0, GENERIC_ALL, package.bytes))
++    return GetLastError ();
++  if (!appcontainer_nt::SetSecurityDescriptorOwner (&descriptor_, copied_owner, owner_defaulted)
++      || !appcontainer_nt::SetSecurityDescriptorGroup (&descriptor_, copied_group, group_defaulted)
++      || !appcontainer_nt::SetSecurityDescriptorSacl (&descriptor_, sacl_present, copied_sacl,
++                                     sacl_defaulted)
++      || !appcontainer_nt::SetSecurityDescriptorDacl (&descriptor_, TRUE, dacl, dacl_defaulted))
++    return GetLastError ();
++  const SECURITY_DESCRIPTOR_CONTROL inheritance = SE_DACL_AUTO_INHERIT_REQ
++    | SE_SACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED | SE_SACL_AUTO_INHERITED
++    | SE_DACL_PROTECTED | SE_SACL_PROTECTED;
++  if (!appcontainer_nt::SetSecurityDescriptorControl (&descriptor_, inheritance,
++                                     control & inheritance))
++    return GetLastError ();
++  if ((control & SE_RM_CONTROL_VALID)
++      && (error = appcontainer_nt::SetSecurityDescriptorRMControl (&descriptor_, &rm_control)))
++    return error;
++  SECURITY_DESCRIPTOR_CONTROL copied_control;
++  if (!appcontainer_nt::GetSecurityDescriptorControl (&descriptor_, &copied_control, &revision)
++      || copied_control != ((control & ~SE_SELF_RELATIVE) | SE_DACL_PRESENT))
++    return ERROR_INVALID_SECURITY_DESCR;
++  if (!appcontainer_nt::IsValidSecurityDescriptor (&descriptor_))
++    return ERROR_INVALID_SECURITY_DESCR;
++  attributes_.nLength = sizeof attributes_;
++  attributes_.lpSecurityDescriptor = &descriptor_;
++  attributes_.bInheritHandle = source ? source->bInheritHandle : FALSE;
++  result_ = &attributes_;
++  return ERROR_SUCCESS;
++}
+diff --git a/winsup/cygwin/sec/appcontainer_pipe_name.cc b/winsup/cygwin/sec/appcontainer_pipe_name.cc
+new file mode 100644
+index 0000000..288fc5c
+--- /dev/null
++++ b/winsup/cygwin/sec/appcontainer_pipe_name.cc
+@@ -0,0 +1,239 @@
++/* Source-only NT pipe-name adapter proposal for pinned git-for-windows/MSYS
++   270ba2980700e6e2a0813944d506eecea0f86402. Requires the pipe-security helper.
++   No global state, guessed profile path, environment input or retry fallback. */
++#include "winsup.h"
++#include <stdint.h>
++#include <string.h>
++#include <ntsecapi.h>
++#include "ntdll.h"
++#include "appcontainer_pipe_security.h"
++#include "appcontainer_pipe_name.h"
++
++namespace
++{
++constexpr size_t name_limit = 512;
++static const WCHAR npfs[] = L"\\Device\\NamedPipe\\";
++static const WCHAR local[] = L"\\\\.\\pipe\\LOCAL\\";
++static const WCHAR probe_intro[] = L"autoprompt-msys-name-";
++constexpr size_t npfs_units = sizeof npfs / sizeof (WCHAR) - 1;
++constexpr size_t local_units = sizeof local / sizeof (WCHAR) - 1;
++constexpr size_t intro_units = sizeof probe_intro / sizeof (WCHAR) - 1;
++constexpr size_t suffix_units = intro_units + 32;
++
++bool valid_handle (HANDLE handle)
++{ return handle && handle != INVALID_HANDLE_VALUE; }
++
++struct owned_pair
++{
++  HANDLE server, client;
++  owned_pair () : server (NULL), client (NULL) {}
++  DWORD close ()
++  {
++    DWORD error = ERROR_SUCCESS;
++    if (valid_handle (client) && !CloseHandle (client))
++      { error = GetLastError (); if (!error) error = ERROR_GEN_FAILURE; }
++    client = NULL;
++    if (valid_handle (server) && !CloseHandle (server))
++      { DWORD next = GetLastError (); if (!error) error = next ? next : ERROR_GEN_FAILURE; }
++    server = NULL;
++    return error;
++  }
++  ~owned_pair () { close (); }
++};
++
++bool name_character (WCHAR c)
++{
++  return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')
++         || (c >= L'0' && c <= L'9') || c == L'-' || c == L'_'
++         || c == L'.' || c == L'{' || c == L'}';
++}
++
++bool components_valid (const WCHAR *name, size_t units, bool separators)
++{
++  if (!units)
++    return false;
++  size_t component = 0;
++  for (size_t i = 0; i <= units; ++i)
++    {
++      if (i == units || (separators && name[i] == L'\\'))
++        {
++          size_t length = i - component;
++          if (!length || (length == 1 && name[component] == L'.')
++              || (length == 2 && name[component] == L'.'
++                  && name[component + 1] == L'.'))
++            return false;
++          component = i + 1;
++        }
++      else if (!name_character (name[i]))
++        return false;
++    }
++  return true;
++}
++
++/* Query one held handle once. Never trust a pointer outside returned storage,
++   a truncated kernel name, or an unrelated endpoint's suffix. */
++DWORD query_name (HANDLE handle, const WCHAR *suffix, WCHAR *destination,
++                  size_t &units)
++{
++  union { ULONG_PTR align; BYTE bytes[4096]; } storage;
++  ULONG returned = 0;
++  NTSTATUS status = NtQueryObject (handle, ObjectNameInformation,
++                                   storage.bytes, sizeof storage, &returned);
++  if (status != STATUS_SUCCESS)
++    {
++      DWORD error = RtlNtStatusToDosError (status);
++      return error ? error : ERROR_INVALID_DATA;
++    }
++  if (returned < sizeof (OBJECT_NAME_INFORMATION) || returned > sizeof storage)
++    return ERROR_INVALID_DATA;
++  UNICODE_STRING &name = reinterpret_cast<OBJECT_NAME_INFORMATION *>
++                          (storage.bytes)->Name;
++  uintptr_t begin = reinterpret_cast<uintptr_t> (storage.bytes);
++  uintptr_t pointer = reinterpret_cast<uintptr_t> (name.Buffer);
++  if (!name.Buffer || pointer < begin || pointer - begin < sizeof (OBJECT_NAME_INFORMATION)
++      || pointer - begin > returned || !name.Length || name.Length % sizeof (WCHAR)
++      || name.Length > name_limit * sizeof (WCHAR) || name.MaximumLength < name.Length
++      || name.Length > returned - (pointer - begin)
++      || pointer % alignof (WCHAR))
++    return ERROR_INVALID_DATA;
++  units = name.Length / sizeof (WCHAR);
++  if (units <= npfs_units + suffix_units ||
++      name.Buffer[units - suffix_units - 1] != L'\\' ||
++      memcmp (name.Buffer + units - suffix_units, suffix,
++               suffix_units * sizeof (WCHAR)))
++    return ERROR_INVALID_NAME;
++  UNICODE_STRING observed_root { static_cast<USHORT> (npfs_units * sizeof (WCHAR)),
++                                 static_cast<USHORT> (npfs_units * sizeof (WCHAR)),
++                                 name.Buffer };
++  UNICODE_STRING expected_root { static_cast<USHORT> (npfs_units * sizeof (WCHAR)),
++                                 static_cast<USHORT> (sizeof npfs),
++                                 const_cast<PWCHAR> (npfs) };
++  if (!RtlEqualUnicodeString (&observed_root, &expected_root, TRUE)
++      || !components_valid (name.Buffer + npfs_units, units - npfs_units, true))
++    return ERROR_INVALID_NAME;
++  memcpy (destination, name.Buffer, name.Length);
++  destination[units] = L'\0';
++  return ERROR_SUCCESS;
++}
++}
++
++appcontainer_pipe_name::appcontainer_pipe_name ()
++  : buffer_ {}, value_ {}, result_ (NULL), appcontainer_ (false)
++{
++}
++
++NTSTATUS appcontainer_pipe_name::error_status (DWORD error)
++{
++  switch (error)
++    {
++    case ERROR_SUCCESS: return STATUS_SUCCESS;
++    case ERROR_ACCESS_DENIED: return static_cast<NTSTATUS> (0xc0000022);
++    case ERROR_NOT_ENOUGH_MEMORY:
++    case ERROR_OUTOFMEMORY: return static_cast<NTSTATUS> (0xc0000017);
++    case ERROR_INVALID_PARAMETER:
++    case ERROR_INVALID_DATA: return static_cast<NTSTATUS> (0xc000000d);
++    case ERROR_INVALID_NAME: return static_cast<NTSTATUS> (0xc0000033);
++    case ERROR_FILENAME_EXCED_RANGE: return static_cast<NTSTATUS> (0xc0000106);
++    case ERROR_FILE_NOT_FOUND: return static_cast<NTSTATUS> (0xc0000034);
++    case ERROR_PATH_NOT_FOUND: return static_cast<NTSTATUS> (0xc000003a);
++    case ERROR_ALREADY_EXISTS:
++    case ERROR_FILE_EXISTS: return static_cast<NTSTATUS> (0xc0000035);
++    case ERROR_PIPE_BUSY: return static_cast<NTSTATUS> (0xc00000ae);
++    case ERROR_NOT_SUPPORTED: return static_cast<NTSTATUS> (0xc00000bb);
++    default: return static_cast<NTSTATUS> (0xc0000001);
++    }
++}
++
++DWORD appcontainer_pipe_name::prepare (PUNICODE_STRING original)
++{
++  result_ = NULL;
++  appcontainer_ = false;
++  /* Deliberately do not validate/dereference/normalize a host name. The
++     existing security helper verifies the actual primary process token. */
++  appcontainer_pipe_security security;
++  DWORD error = security.prepare (NULL);
++  if (error)
++    return error;
++  if (!security.is_appcontainer ())
++    {
++      result_ = original;
++      return ERROR_SUCCESS;
++    }
++  appcontainer_ = true;
++  if (!original || !original->Buffer || !original->Length
++      || original->Length % sizeof (WCHAR)
++      || original->Length > name_limit * sizeof (WCHAR)
++      || original->MaximumLength < original->Length)
++    return ERROR_INVALID_NAME;
++  /* A previous get() cannot be fed back as input: it is already adapted and
++     is invalidated by this call. Reject overlapping owned storage explicitly. */
++  uintptr_t input_pointer = reinterpret_cast<uintptr_t> (original->Buffer);
++  uintptr_t owned_pointer = reinterpret_cast<uintptr_t> (buffer_);
++  if (original == &value_ || (input_pointer >= owned_pointer
++                             && input_pointer - owned_pointer < sizeof buffer_))
++    return ERROR_INVALID_PARAMETER;
++  size_t original_units = original->Length / sizeof (WCHAR);
++  /* MSYS synthesizes these ASCII relative basenames (not user paths).
++     Refuse separators, embedded NULs, controls, colon and dot components. */
++  if (!components_valid (original->Buffer, original_units, false))
++    return ERROR_INVALID_NAME;
++
++  BYTE random[16];
++  /* RtlGenRandom's BOOLEAN contract does not document a GetLastError value.
++     An RNG refusal therefore has an explicit generic failure, never stale 0. */
++  if (!RtlGenRandom (random, sizeof random))
++    return ERROR_GEN_FAILURE;
++  static const WCHAR digits[] = L"0123456789abcdef";
++  WCHAR suffix[suffix_units + 1], win32_name[local_units + suffix_units + 1];
++  memcpy (suffix, probe_intro, intro_units * sizeof (WCHAR));
++  for (size_t i = 0; i < sizeof random; ++i)
++    {
++      suffix[intro_units + i * 2] = digits[random[i] >> 4];
++      suffix[intro_units + i * 2 + 1] = digits[random[i] & 15];
++    }
++  suffix[suffix_units] = L'\0';
++  memcpy (win32_name, local, local_units * sizeof (WCHAR));
++  memcpy (win32_name + local_units, suffix, sizeof suffix);
++
++  /* Security descriptor and handles remain owned through both connected-end
++     queries. First-instance creation refuses collisions; there is no retry. */
++  owned_pair probe;
++  probe.server = CreateNamedPipeW (win32_name,
++                   PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
++                   PIPE_TYPE_MESSAGE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
++                   1, 8192, 8192, 50, security.get ());
++  if (!valid_handle (probe.server))
++    { error = GetLastError (); return error ? error : ERROR_GEN_FAILURE; }
++  probe.client = CreateFileW (win32_name, GENERIC_WRITE | FILE_READ_ATTRIBUTES,
++                              0, security.get (), OPEN_EXISTING, 0, NULL);
++  if (!valid_handle (probe.client))
++    { error = GetLastError (); return error ? error : ERROR_GEN_FAILURE; }
++  WCHAR server_name[name_limit + 1], client_name[name_limit + 1];
++  size_t server_units = 0, client_units = 0;
++  error = query_name (probe.server, suffix, server_name, server_units);
++  if (error)
++    return error;
++  error = query_name (probe.client, suffix, client_name, client_units);
++  if (error)
++    return error;
++  if (server_units != client_units ||
++      memcmp (server_name, client_name, server_units * sizeof (WCHAR)))
++    return ERROR_INVALID_NAME;
++  size_t prefix_units = server_units - suffix_units - npfs_units;
++  if (!prefix_units || prefix_units + original_units > name_limit)
++    return ERROR_FILENAME_EXCED_RANGE;
++  /* Prefix is the exact opaque object-manager result, excluding only the
++     known NPFS root and our own nonce basename. No SID path is reconstructed. */
++  memcpy (buffer_, server_name + npfs_units, prefix_units * sizeof (WCHAR));
++  memcpy (buffer_ + prefix_units, original->Buffer, original->Length);
++  size_t total_units = prefix_units + original_units;
++  buffer_[total_units] = L'\0';
++  error = probe.close ();
++  if (error)
++    return error;
++  value_.Buffer = buffer_;
++  value_.Length = static_cast<USHORT> (total_units * sizeof (WCHAR));
++  value_.MaximumLength = static_cast<USHORT> ((total_units + 1) * sizeof (WCHAR));
++  result_ = &value_;
++  return ERROR_SUCCESS;
++}
+diff --git a/winsup/cygwin/spawn.cc b/winsup/cygwin/spawn.cc
+index 9408903659e37d82e391b8f7de572b2546396349..d84852fe9176b03ce0b7dea1be372881b224d397 100644
+--- a/winsup/cygwin/spawn.cc
++++ b/winsup/cygwin/spawn.cc
+@@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_child_security.h"
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <process.h>
+@@ -653,16 +654,21 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
+ 	      && !::cygheap->user.groups.issetgroups ()
+ 	      && !::cygheap->user.setuid_to_restricted))
+ 	{
+-	  rc = CreateProcessW (runpath,		/* image name w/ full path */
++	  rc = appcontainer_child_create (sa, &si, c_flags,
++	    real_path.iscygexec (),
++	    [&] (LPSECURITY_ATTRIBUTES child_security,
++	         LPSTARTUPINFOW child_startup, DWORD child_flags) {
++	  return CreateProcessW (runpath,		/* image name w/ full path */
+ 			       cmd.wcs (wcmd),	/* what was passed to exec */
+-			       sa,		/* process security attrs */
+-			       sa,		/* thread security attrs */
++			       child_security,		/* process security attrs */
++			       child_security,		/* thread security attrs */
+ 			       TRUE,		/* inherit handles */
+-			       c_flags,
++			       child_flags,
+ 			       envblock,	/* environment */
+ 			       NULL,
+-			       &si,
++			       child_startup,
+ 			       &pi);
++	    });
+ 	}
+       else
+ 	{
+diff --git a/winsup/cygwin/uinfo.cc b/winsup/cygwin/uinfo.cc
+--- a/winsup/cygwin/uinfo.cc
++++ b/winsup/cygwin/uinfo.cc
+@@ -77,6 +77,23 @@
+       system_printf ("NtQueryInformationToken (TokenUser), %y", status);
+       return;
+     }
++
++  /* The launcher supplies the AppContainer token and its restricted default
++     DACL.  Replacing it with sec_user_nih removes the package SID needed to
++     open child tokens.  Retain both the inherited token security and the
++     process descriptor; same-primary child creation supplies its own bounded
++     descriptors.  Query the already-open primary token through ntdll: loading
++     advapi32 here would violate the early initialization constraints. */
++  ULONG is_appcontainer = 0;
++  ULONG appcontainer_size = 0;
++  status = NtQueryInformationToken (hProcToken, TokenIsAppContainer,
++                                   &is_appcontainer, sizeof is_appcontainer,
++                                   &appcontainer_size);
++  if (!NT_SUCCESS (status) || appcontainer_size != sizeof is_appcontainer
++      || is_appcontainer > 1)
++    api_fatal ("Cannot determine primary token AppContainer state, %y", status);
++  if (is_appcontainer)
++    return;
+ 
+   /* Set token owner to the same value as token user */
+   status = NtSetInformationToken (hProcToken, TokenOwner, &effec_cygsid,
+diff --git a/winsup/cygwin/local_includes/appcontainer_nt_security.h b/winsup/cygwin/local_includes/appcontainer_nt_security.h
+new file mode 100644
+--- /dev/null
++++ b/winsup/cygwin/local_includes/appcontainer_nt_security.h
+@@ -0,0 +1,114 @@
++/* Loader-lock-safe security operations. All security entry points are direct
++   ntdll imports: never enter Cygwin's ADVAPI32 autoload thunks during fork.
++   BOOL/BOOLEAN and NTSTATUS/Win32 error contracts are translated explicitly. */
++#ifndef APPCONTAINER_NT_SECURITY_H
++#define APPCONTAINER_NT_SECURITY_H
++namespace appcontainer_nt
++{
++extern "C" {
++  LONG NTAPI NtOpenProcessToken (HANDLE, ACCESS_MASK, PHANDLE);
++  LONG NTAPI NtQueryInformationToken (HANDLE, TOKEN_INFORMATION_CLASS, PVOID, ULONG, PULONG);
++  ULONG NTAPI RtlNtStatusToDosError (LONG);
++  BOOLEAN NTAPI RtlValidSid (PSID);
++  ULONG NTAPI RtlLengthSid (PSID);
++  ULONG NTAPI RtlLengthRequiredSid (ULONG);
++  PUCHAR NTAPI RtlSubAuthorityCountSid (PSID);
++  PULONG NTAPI RtlSubAuthoritySid (PSID, ULONG);
++  LONG NTAPI RtlCopySid (ULONG, PSID, PSID);
++  LONG NTAPI RtlInitializeSid (PSID, PSID_IDENTIFIER_AUTHORITY, UCHAR);
++  BOOLEAN NTAPI RtlValidAcl (PACL);
++  LONG NTAPI RtlQueryInformationAcl (PACL, PVOID, ULONG, ACL_INFORMATION_CLASS);
++  BOOLEAN NTAPI RtlValidSecurityDescriptor (PSECURITY_DESCRIPTOR);
++  BOOLEAN NTAPI RtlValidRelativeSecurityDescriptor (PSECURITY_DESCRIPTOR, ULONG, SECURITY_INFORMATION);
++  ULONG NTAPI RtlLengthSecurityDescriptor (PSECURITY_DESCRIPTOR);
++  LONG NTAPI RtlGetControlSecurityDescriptor (PSECURITY_DESCRIPTOR, PSECURITY_DESCRIPTOR_CONTROL, PULONG);
++  LONG NTAPI RtlGetOwnerSecurityDescriptor (PSECURITY_DESCRIPTOR, PSID *, PBOOLEAN);
++  LONG NTAPI RtlGetGroupSecurityDescriptor (PSECURITY_DESCRIPTOR, PSID *, PBOOLEAN);
++  LONG NTAPI RtlGetDaclSecurityDescriptor (PSECURITY_DESCRIPTOR, PBOOLEAN, PACL *, PBOOLEAN);
++  LONG NTAPI RtlGetSaclSecurityDescriptor (PSECURITY_DESCRIPTOR, PBOOLEAN, PACL *, PBOOLEAN);
++  BOOLEAN NTAPI RtlGetSecurityDescriptorRMControl (PSECURITY_DESCRIPTOR, PUCHAR);
++  LONG NTAPI RtlCreateSecurityDescriptor (PSECURITY_DESCRIPTOR, ULONG);
++  LONG NTAPI RtlCreateAcl (PACL, ULONG, ULONG);
++  LONG NTAPI RtlAddAce (PACL, ULONG, ULONG, PVOID, ULONG);
++  LONG NTAPI RtlAddAccessAllowedAceEx (PACL, ULONG, ULONG, ACCESS_MASK, PSID);
++  LONG NTAPI RtlSetOwnerSecurityDescriptor (PSECURITY_DESCRIPTOR, PSID, BOOLEAN);
++  LONG NTAPI RtlSetGroupSecurityDescriptor (PSECURITY_DESCRIPTOR, PSID, BOOLEAN);
++  LONG NTAPI RtlSetDaclSecurityDescriptor (PSECURITY_DESCRIPTOR, BOOLEAN, PACL, BOOLEAN);
++  LONG NTAPI RtlSetSaclSecurityDescriptor (PSECURITY_DESCRIPTOR, BOOLEAN, PACL, BOOLEAN);
++  LONG NTAPI RtlSetControlSecurityDescriptor (PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL, SECURITY_DESCRIPTOR_CONTROL);
++  VOID NTAPI RtlSetSecurityDescriptorRMControl (PSECURITY_DESCRIPTOR, PUCHAR);
++}
++inline BOOL success (LONG status)
++{
++  if (status >= 0) return TRUE;
++  SetLastError (RtlNtStatusToDosError (status));
++  return FALSE;
++}
++inline BOOL OpenProcessToken (HANDLE process, DWORD access, PHANDLE token)
++{ return success (NtOpenProcessToken (process, access, token)); }
++inline BOOL GetTokenInformation (HANDLE token, TOKEN_INFORMATION_CLASS kind, PVOID data, DWORD size, PDWORD returned)
++{ ULONG length = 0; LONG status = NtQueryInformationToken (token, kind, data, size, &length); *returned = length; return success (status); }
++inline PUCHAR GetSidSubAuthorityCount (PSID sid) { return RtlSubAuthorityCountSid (sid); }
++inline DWORD GetSidLengthRequired (UCHAR count) { return RtlLengthRequiredSid (count); }
++inline BOOL IsValidSid (PSID sid) { return RtlValidSid (sid) != FALSE; }
++inline DWORD GetLengthSid (PSID sid) { return RtlLengthSid (sid); }
++inline BOOL CopySid (DWORD size, PSID destination, PSID source) { return success (RtlCopySid (size, destination, source)); }
++inline BOOL CreateWellKnownSid (WELL_KNOWN_SID_TYPE kind, PSID domain, PSID sid, PDWORD size)
++{
++  if (kind != WinLocalSystemSid || domain || !size || *size < 12)
++    { SetLastError (ERROR_INVALID_PARAMETER); return FALSE; }
++  SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
++  if (!success (RtlInitializeSid (sid, &authority, 1))) return FALSE;
++  *RtlSubAuthoritySid (sid, 0) = SECURITY_LOCAL_SYSTEM_RID;
++  *size = 12;
++  return TRUE;
++}
++inline BOOL IsValidAcl (PACL acl) { return RtlValidAcl (acl) != FALSE; }
++inline BOOL GetAclInformation (PACL acl, PVOID data, DWORD size, ACL_INFORMATION_CLASS kind)
++{ return success (RtlQueryInformationAcl (acl, data, size, kind)); }
++inline BOOL GetSecurityDescriptorControl (PSECURITY_DESCRIPTOR sd, PSECURITY_DESCRIPTOR_CONTROL control, PDWORD revision)
++{ ULONG value = 0; LONG status = RtlGetControlSecurityDescriptor (sd, control, &value); *revision = value; return success (status); }
++inline BOOL IsValidSecurityDescriptor (PSECURITY_DESCRIPTOR sd)
++{
++  if (!sd) return FALSE;
++  SECURITY_DESCRIPTOR_CONTROL control = 0; ULONG revision = 0;
++  if (RtlGetControlSecurityDescriptor (sd, &control, &revision) < 0 || revision != SECURITY_DESCRIPTOR_REVISION) return FALSE;
++  if (!(control & SE_SELF_RELATIVE)) return RtlValidSecurityDescriptor (sd) != FALSE;
++  // SDDL native fixtures supply relative descriptors. Keep that support and
++  // bound the computed length before the relative validator. This does not
++  // establish allocation extent: callers still provide readable descriptor
++  // storage, as for the original Win32 API. Never treat one as absolute.
++  ULONG size = RtlLengthSecurityDescriptor (sd);
++  return size >= sizeof (SECURITY_DESCRIPTOR_RELATIVE) && size <= 128 * 1024
++    && RtlValidRelativeSecurityDescriptor (sd, size, 0) != FALSE;
++}
++inline BOOL GetSecurityDescriptorOwner (PSECURITY_DESCRIPTOR sd, PSID *sid, PBOOL defaulted)
++{ BOOLEAN flag = FALSE; LONG status = RtlGetOwnerSecurityDescriptor (sd, sid, &flag); if (status >= 0) *defaulted = flag; return success (status); }
++inline BOOL GetSecurityDescriptorGroup (PSECURITY_DESCRIPTOR sd, PSID *sid, PBOOL defaulted)
++{ BOOLEAN flag = FALSE; LONG status = RtlGetGroupSecurityDescriptor (sd, sid, &flag); if (status >= 0) *defaulted = flag; return success (status); }
++inline BOOL GetSecurityDescriptorDacl (PSECURITY_DESCRIPTOR sd, PBOOL present, PACL *acl, PBOOL defaulted)
++{ BOOLEAN exists = FALSE, flag = FALSE; LONG status = RtlGetDaclSecurityDescriptor (sd, &exists, acl, &flag); if (status >= 0) { *present = exists; *defaulted = flag; } return success (status); }
++inline BOOL GetSecurityDescriptorSacl (PSECURITY_DESCRIPTOR sd, PBOOL present, PACL *acl, PBOOL defaulted)
++{ BOOLEAN exists = FALSE, flag = FALSE; LONG status = RtlGetSaclSecurityDescriptor (sd, &exists, acl, &flag); if (status >= 0) { *present = exists; *defaulted = flag; } return success (status); }
++inline DWORD GetSecurityDescriptorRMControl (PSECURITY_DESCRIPTOR sd, PUCHAR value)
++{ return RtlGetSecurityDescriptorRMControl (sd, value) ? ERROR_SUCCESS : ERROR_INVALID_SECURITY_DESCR; }
++inline BOOL InitializeSecurityDescriptor (PSECURITY_DESCRIPTOR sd, DWORD revision)
++{ return success (RtlCreateSecurityDescriptor (sd, revision)); }
++inline BOOL InitializeAcl (PACL acl, DWORD size, DWORD revision) { return success (RtlCreateAcl (acl, size, revision)); }
++inline BOOL AddAce (PACL acl, DWORD revision, DWORD index, PVOID bytes, DWORD size) { return success (RtlAddAce (acl, revision, index, bytes, size)); }
++inline BOOL AddAccessAllowedAceEx (PACL acl, DWORD revision, DWORD flags, DWORD access, PSID sid)
++{ return success (RtlAddAccessAllowedAceEx (acl, revision, flags, access, sid)); }
++inline BOOL SetSecurityDescriptorOwner (PSECURITY_DESCRIPTOR sd, PSID sid, BOOL defaulted) { return success (RtlSetOwnerSecurityDescriptor (sd, sid, defaulted != FALSE)); }
++inline BOOL SetSecurityDescriptorGroup (PSECURITY_DESCRIPTOR sd, PSID sid, BOOL defaulted) { return success (RtlSetGroupSecurityDescriptor (sd, sid, defaulted != FALSE)); }
++inline BOOL SetSecurityDescriptorDacl (PSECURITY_DESCRIPTOR sd, BOOL present, PACL acl, BOOL defaulted) { return success (RtlSetDaclSecurityDescriptor (sd, present != FALSE, acl, defaulted != FALSE)); }
++inline BOOL SetSecurityDescriptorSacl (PSECURITY_DESCRIPTOR sd, BOOL present, PACL acl, BOOL defaulted) { return success (RtlSetSaclSecurityDescriptor (sd, present != FALSE, acl, defaulted != FALSE)); }
++inline BOOL SetSecurityDescriptorControl (PSECURITY_DESCRIPTOR sd, SECURITY_DESCRIPTOR_CONTROL mask, SECURITY_DESCRIPTOR_CONTROL bits)
++{ return success (RtlSetControlSecurityDescriptor (sd, mask, bits)); }
++inline DWORD SetSecurityDescriptorRMControl (PSECURITY_DESCRIPTOR sd, PUCHAR value)
++{
++  RtlSetSecurityDescriptorRMControl (sd, value);
++  UCHAR copied = 0;
++  return RtlGetSecurityDescriptorRMControl (sd, &copied) && copied == *value ? ERROR_SUCCESS : ERROR_INVALID_SECURITY_DESCR;
++}
++}
++#endif
+
+diff --git a/winsup/cygwin/wincap.cc b/winsup/cygwin/wincap.cc
+--- a/winsup/cygwin/wincap.cc
++++ b/winsup/cygwin/wincap.cc
+@@ -243,7 +243,7 @@
+   },
+ };
+ 
+-wincapc wincap __attribute__((section (".cygwin_dll_common"), shared));
++wincapc wincap NO_COPY;
+ 
+ extern IMAGE_DOS_HEADER
+ __image_base__;
+
+diff --git a/winsup/cygwin/pinfo.cc b/winsup/cygwin/pinfo.cc
+index c69213f9ae9ce31dd6a057366bee40b64edaf8ab..757d0c904f9f284e058d31827c06db547f44ca65 100644
+--- a/winsup/cygwin/pinfo.cc
++++ b/winsup/cygwin/pinfo.cc
+@@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++#include "appcontainer_named_kernel.h"
+ #include "miscfuncs.h"
+ #include <stdlib.h>
+ #include "cygerrno.h"
+@@ -336,8 +337,11 @@ pinfo::create_winpid_symlink ()
+   InitializeObjectAttributes (&attr, &sym_str, OBJ_CASE_INSENSITIVE,
+ 			      get_shared_parent_dir (),
+ 			      everyone_sd (SYMBOLIC_LINK_QUERY));
+-  NtCreateSymbolicLinkObject (&winpid_hdl, SYMBOLIC_LINK_ALL_ACCESS,
+-			      &attr, &pid_str);
++  appcontainer_named_kernel_create (&winpid_hdl, &attr,
++    [&] (POBJECT_ATTRIBUTES private_attributes) {
++      return NtCreateSymbolicLinkObject (&winpid_hdl, SYMBOLIC_LINK_ALL_ACCESS,
++					 private_attributes, &pid_str);
++    });
+ }
+ 
+ inline void
+
+diff --git a/winsup/cygwin/environ.cc b/winsup/cygwin/environ.cc
+--- a/winsup/cygwin/environ.cc
++++ b/winsup/cygwin/environ.cc
+@@ -1011,6 +1011,9 @@
+ /* Keep this list in upper case and sorted */
+ static NO_COPY spenv spenvs[] =
+ {
++  /* The private NUL adapter reads the native environment after MSYS exec.
++     Preserve a supplied locator; never synthesize the handle capability. */
++  {NL ("AUTOPROMPT_PRIVATE_NUL_HANDLE="), false, true, NULL},
+ #ifdef DEBUGGING
+   {NL ("CYGWIN_DEBUG="), false, true, NULL},
+ #endif

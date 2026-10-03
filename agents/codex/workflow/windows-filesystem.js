@@ -6,18 +6,38 @@
 const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
+const {
+  bindWindowsTokenProfileFolders,
+  createWindowsCompilerDirectory,
+  windowsControllerEnvironment,
+} = require('./safe-run-root.js')
 const MAX_RECORD_BYTES = 8 * 1024 * 1024 + 1
+const MAX_TREE_ENTRIES = 16384
+const MAX_RECORD_ENTRIES = 4096
 const MAX_BYTES = 64 * 1024 * 1024
 const MAX_OUTPUT_BYTES = 100 * 1024 * 1024
 const IDENTITY = /^[0-9a-f]{8}:[0-9a-f]{16}$/u
 const DIGEST = /^[a-f0-9]{64}$/u
 
 class WindowsFilesystemError extends Error {
-  constructor(code, message) { super(message); this.name = 'WindowsFilesystemError'; this.code = code }
+  constructor(code, message, details = {}) { super(message); this.name = 'WindowsFilesystemError'; this.code = code; this.details = details }
 }
 function fail(code, message) { throw new WindowsFilesystemError(code, message) }
+function invocationDiagnostics(stderr) {
+  const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'compiled', 'dispatch', 'completed']
+  const phaseElapsedMs = {}; let index = 0, previous = 0
+  let remaining = String(stderr || '')
+  for (const phase of phases) {
+    const match = /^AUTOPROMPT_CAPTURE_PHASE:([a-z-]+):(0|[1-9][0-9]{0,5})\r?\n/u.exec(remaining)
+    if (!match || match[1] !== phase) break
+    const elapsed = Number(match[2])
+    if (elapsed > 300000 || elapsed < previous) break
+    phaseElapsedMs[phase] = elapsed; previous = elapsed
+    remaining = remaining.slice(match[0].length); index++
+  }
+  return { helperPhase: index ? phases[index - 1] : 'startup', phaseElapsedMs, stderr: remaining }
+}
 function exact(value, keys) { return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)) }
 function bounded(value, max) { return Number.isSafeInteger(value) && value >= 0 && value <= max }
 function validComponent(value) {
@@ -43,7 +63,7 @@ function fileContent(value) {
 }
 function parseTree(value) {
   if (!exact(value, ['schemaVersion', 'status', 'operation', 'bytes', 'entries']) || value.schemaVersion !== 1 || value.status !== 'TREE_CAPTURED' || value.operation !== 'tree' ||
-      !bounded(value.bytes, MAX_BYTES) || !Array.isArray(value.entries) || value.entries.length < 1 || value.entries.length > 4096) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows tree capture is malformed')
+      !bounded(value.bytes, MAX_BYTES) || !Array.isArray(value.entries) || value.entries.length < 1 || value.entries.length > MAX_TREE_ENTRIES) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows tree capture is malformed')
   const seen = new Map(), identities = new Set()
   let bytes = 0
   const entries = value.entries.map((entry, index) => {
@@ -117,7 +137,7 @@ function parseRecordResult(stdout, operation, content, leaf) {
   let value; try { value = JSON.parse(stdout) } catch { fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows record response is not JSON') }
   if (value?.status === 'REFUSED') {
     if (!exact(value, ['schemaVersion', 'status', 'code']) || value.schemaVersion !== 1 || typeof value.code !== 'string' || !/^[A-Z_]{3,80}$/u.test(value.code)) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows record refusal is malformed')
-    fail(value.code === 'FILESYSTEM_ALREADY_EXISTS' ? 'EEXIST' : value.code === 'FILESYSTEM_NOT_FOUND' ? 'ENOENT' : value.code, 'Windows record helper refused request')
+    fail(value.code === 'FILESYSTEM_ALREADY_EXISTS' ? 'EEXIST' : value.code === 'FILESYSTEM_NOT_FOUND' ? 'ENOENT' : value.code, `Windows record helper refused ${operation}`)
   }
   if (operation === 'inspect-owned-target') {
     if (!exact(value, ['schemaVersion', 'status', 'parentIdentity', 'targetIdentity']) || value.schemaVersion !== 1 || value.status !== 'INSPECTED') fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows target inspection is malformed')
@@ -126,13 +146,13 @@ function parseRecordResult(stdout, operation, content, leaf) {
     if (parentIdentity.dev !== targetIdentity.dev) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows target crosses a volume')
     return Object.freeze({ parentIdentity, targetIdentity })
   }
-  if (operation === 'remove-owned-target') {
+  if (['remove-owned-target', 'remove-owned-empty-directory'].includes(operation)) {
     if (!exact(value, ['schemaVersion', 'status', 'removed']) || value.schemaVersion !== 1 || value.status !== 'REMOVED' || typeof value.removed !== 'boolean') fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows target removal is malformed')
     return Object.freeze({ removed: value.removed })
   }
   if (operation === 'recover-record-publication') {
     if (!exact(value, ['schemaVersion', 'status', 'removed']) || value.schemaVersion !== 1 || value.status !== 'RECOVERED' || !validComponent(leaf) ||
-        !Array.isArray(value.removed) || value.removed.length > 4096 || new Set(value.removed).size !== value.removed.length) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows record recovery response is malformed')
+        !Array.isArray(value.removed) || value.removed.length > MAX_RECORD_ENTRIES || new Set(value.removed).size !== value.removed.length) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows record recovery response is malformed')
     const prefix = '.' + leaf + '.'
     for (const name of value.removed) {
       if (!validComponent(name) || !name.startsWith(prefix) || !/^[1-9][0-9]{0,9}\.[a-f0-9]{16}\.(?:tmp|create)$/u.test(name.slice(prefix.length)) ||
@@ -211,6 +231,12 @@ function bindPhysical(filename, label, maxBytes, singleLink) {
 function equalBinding(a, b) { return a.path === b.path && a.sha256 === b.sha256 && a.device === b.device && a.inode === b.inode && a.size === b.size }
 function createWindowsFilesystemCapture(options = {}) {
   if (process.platform !== 'win32') fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows filesystem capture is unavailable on this platform')
+  // Do not rely on the provider controller's module-local binding reaching
+  // this Bun capture instance. Bind the already authenticated policy
+  // projection in the exact instance that allocates compiler storage.
+  if (options.windowsControllerProfile !== undefined) {
+    bindWindowsTokenProfileFolders(options.windowsControllerProfile)
+  }
   const systemRoot = process.env.SystemRoot || process.env.WINDIR
   if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows system root is unavailable')
   const helper = options.helper || path.join(__dirname, 'windows-filesystem.ps1')
@@ -223,6 +249,9 @@ function createWindowsFilesystemCapture(options = {}) {
   const invoke = (operation, root, components, maxBytes = MAX_BYTES, recordBytes, ownership) => {
     const target = requestTarget(root, components)
     if (!bounded(maxBytes, MAX_BYTES)) fail('FILESYSTEM_BACKEND_INVALID', 'Windows capture byte limit is invalid')
+    // Large copies perform creation, exact readback, and final durability checks
+    // for every object; all other operations retain the shorter deadline.
+    const timeoutMs = operation === 'copy-tree-exclusive' ? 120000 : 30000
     const transaction = TRANSACTIONS.has(operation)
     const publish = operation === 'publish-record-exclusive' || operation === 'write-exclusive'
     if (publish && (!Buffer.isBuffer(recordBytes) || recordBytes.length > MAX_RECORD_BYTES)) fail('FILESYSTEM_BACKEND_INVALID', 'Windows record bytes exceed the publication limit')
@@ -233,28 +262,44 @@ function createWindowsFilesystemCapture(options = {}) {
     try {
       heldPowerShell = bindPhysical(powershellBinding.path, 'Windows PowerShell', MAX_BYTES, false)
       if (!equalBinding(heldHelper.binding, helperBinding) || !equalBinding(heldPowerShell.binding, powershellBinding)) fail('FILESYSTEM_BACKEND_MISMATCH', 'Windows filesystem runtime changed after binding')
-      temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-capture-'))
+      temporary = createWindowsCompilerDirectory('autoprompt-windows-capture-')
+      const invocationStarted = process.hrtime.bigint()
       const result = cp.spawnSync(powershellBinding.path, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', helperBinding.path, '-Request'], {
-        input: request, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true, shell: false,
+        input: request, encoding: 'utf8', timeout: timeoutMs, maxBuffer: MAX_OUTPUT_BYTES, windowsHide: true, shell: false,
         cwd: path.win32.dirname(powershellBinding.path),
-        env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', TEMP: temporary, TMP: temporary },
+        env: { ...windowsControllerEnvironment(systemRoot, temporary), AUTOPROMPT_CAPTURE_PHASES: '1' },
       })
+      const invocationElapsedMs = Number((process.hrtime.bigint() - invocationStarted) / 1000000n)
       for (const [held, expected, label, cap, singleLink] of [[heldHelper, helperBinding, 'Windows filesystem helper', 4 * 1024 * 1024, true], [heldPowerShell, powershellBinding, 'Windows PowerShell', MAX_BYTES, false]]) {
         const after = bindPhysical(expected.path, label, cap, singleLink)
         try {
           if (!sameStat(held.stat, fs.fstatSync(held.descriptor)) || !equalBinding(after.binding, expected)) fail('FILESYSTEM_BACKEND_MISMATCH', label + ' changed during invocation')
         } finally { fs.closeSync(after.descriptor) }
       }
-      if (result.error || result.signal || result.status !== 0 || result.stderr) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows capture helper invocation failed')
+      const diagnostic = invocationDiagnostics(result.stderr)
+      if (result.error || result.signal || result.status !== 0 || diagnostic.stderr) {
+        const cause = typeof result.error?.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(result.error.code) ? result.error.code : `status ${result.status}`
+        const unaccountedMs = Math.max(0, invocationElapsedMs - (diagnostic.phaseElapsedMs[diagnostic.helperPhase] || 0))
+        const timings = Object.entries(diagnostic.phaseElapsedMs).map(([phase, elapsed]) => `${phase}=${elapsed}`).join(',') || 'none'
+        throw new WindowsFilesystemError('FILESYSTEM_BACKEND_UNAVAILABLE', `Windows capture helper invocation failed (${diagnostic.helperPhase}: ${cause}; totalMs=${invocationElapsedMs}; phaseMs=${timings}; unaccountedMs=${unaccountedMs})`, {
+          stage: 'windows-capture-invocation', helperPhase: diagnostic.helperPhase, phaseElapsedMs: diagnostic.phaseElapsedMs,
+          invocationElapsedMs,
+          // Includes startup before the script clock and work since the last
+          // marker; it cannot identify either interval independently.
+          unaccountedMs,
+          status: result.status,
+          cause: result.error?.code, signal: result.signal, timeoutMs, stderr: diagnostic.stderr.slice(0, 2048),
+        })
+      }
       if (transaction) return parseTransactionResult(result.stdout, operation, recordBytes, ownership?.mode)
-      if (publish || operation === 'assert-record-parent' || operation === 'recover-record-publication' || operation === 'inspect-owned-target' || operation === 'remove-owned-target') return parseRecordResult(result.stdout, operation, recordBytes, target.components.at(-1))
+      if (publish || operation === 'assert-record-parent' || operation === 'recover-record-publication' || operation === 'inspect-owned-target' || ['remove-owned-target', 'remove-owned-empty-directory'].includes(operation)) return parseRecordResult(result.stdout, operation, recordBytes, target.components.at(-1))
       const captured = parseCapture(result.stdout, operation)
       if (captured.bytes > maxBytes) fail('FILESYSTEM_BACKEND_UNAVAILABLE', 'Windows capture exceeds the request byte limit')
       return captured
     } finally {
       fs.closeSync(heldHelper.descriptor)
       if (heldPowerShell) fs.closeSync(heldPowerShell.descriptor)
-      if (temporary) fs.rmSync(temporary, { recursive: true, force: true })
+      if (temporary) fs.rmSync(temporary, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
     }
   }
   return Object.freeze({ kind: 'windows-handle-capture-v1',
@@ -266,10 +311,11 @@ function createWindowsFilesystemCapture(options = {}) {
     renameTreeNoReplace: (source, destination) => invoke('rename-tree-no-replace', source, undefined, MAX_BYTES, undefined, { destination: requestTarget(destination) }),
     inspectOwnedTarget: absolute => invoke('inspect-owned-target', absolute, undefined, 0),
     removeOwnedTarget: (absolute, parentIdentity, targetIdentity) => invoke('remove-owned-target', absolute, undefined, 0, undefined, { parentIdentity: validateOwnedIdentity(parentIdentity, false), targetIdentity: validateOwnedIdentity(targetIdentity, true) }),
+    removeOwnedEmptyDirectory: (absolute, parentIdentity, targetIdentity) => invoke('remove-owned-empty-directory', absolute, undefined, 0, undefined, { parentIdentity: validateOwnedIdentity(parentIdentity, false), targetIdentity: validateOwnedIdentity(targetIdentity, true) }),
     assertRecordParent: absolute => invoke('assert-record-parent', absolute, undefined, 0),
     publishRecordExclusive: (absolute, bytes) => invoke('publish-record-exclusive', absolute, undefined, MAX_RECORD_BYTES, bytes),
     recoverRecordPublication: absolute => invoke('recover-record-publication', absolute, undefined, 0),
     helper: helperBinding, powershell: powershellBinding, captureFileBytes: (root, components, maxBytes) => invoke('read', root, components, maxBytes), captureFile: (root, components, maxBytes) => invoke('hash', root, components, maxBytes), captureTree: (root, components, maxBytes) => invoke('tree', root, components, maxBytes) })
 }
 function createWindowsFilesystemMutations(options = {}) { return createWindowsFilesystemCapture(options) }
-module.exports = { WindowsFilesystemError, parseCapture, parseRecordResult, parseTransactionResult, createWindowsFilesystemCapture, createWindowsFilesystemMutations }
+module.exports = { WindowsFilesystemError, invocationDiagnostics, parseCapture, parseRecordResult, parseTransactionResult, createWindowsFilesystemCapture, createWindowsFilesystemMutations }

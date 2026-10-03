@@ -140,7 +140,7 @@ test('activation signer and supervisor bind the exact Windows sandbox identity',
   assert.notEqual(runtime.providerRuntimeIdentityHash(changed), signed)
 })
 
-test('Windows sandbox identity is installed and verified in the native CODEX_HOME', t => {
+test('Windows sandbox identity rejects legacy cap_sid-only state', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-cap-sid-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const activationRoot = path.join(root, 'activation')
@@ -155,13 +155,12 @@ test('Windows sandbox identity is installed and verified in the native CODEX_HOM
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')
   Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
   try {
-    const binding = activation.installWindowsSandboxIdentity(root, activationRoot)
-    const expected = activation.windowsSandboxIdentityPath(activationRoot)
-    assert.equal(expected, path.join(activationRoot, 'n', 'cap_sid'))
-    assert.equal(binding.path, expected)
-    assert.equal(fs.existsSync(expected), true)
-    assert.equal(fs.existsSync(path.join(activationRoot, 'cap_sid')), false)
-    assert.deepEqual(activation.verifyWindowsSandboxIdentity(activationRoot, binding), binding)
+    // A legacy restricted-token SID file is not the elevated sandbox setup.
+    // The real native preflight covers installation and reopening of genuine
+    // Windows setup state; this fixture must fail before any ACL mutation.
+    assert.throws(() => activation.installWindowsSandboxIdentity(root, activationRoot),
+      /codex-windows-sandbox-marker-parent-missing/)
+    assert.equal(fs.existsSync(path.join(activationRoot, 'n', '.sandbox', 'setup_marker.json')), false)
   } finally {
     Object.defineProperty(process, 'platform', platform)
   }

@@ -15,12 +15,17 @@ const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 
 const CLI = process.env.AUTOPROMPT_GROK_TEST_CLI
-const skip = process.platform !== 'linux' || !CLI || !fs.existsSync(CLI) || !fs.existsSync('/usr/bin/bwrap')
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+const skip = !CLI || !fs.existsSync(CLI)
+// Windows prepares its AppContainer resource lease before the separately
+// bounded Job startup. Allow both production phases plus the model turn;
+// the POSIX fixture keeps its existing shorter execution bound.
+const launchTimeoutMs = process.platform === 'win32' ? 300000 : 90000
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+function exactCommand(prefix, values) { return withChallenge(nodeCommand(`process.stdout.write(${JSON.stringify(`${prefix}:${values.marker}`)})`), values.challenge) }
 
 function chunk(id, delta, finish, usage = true) {
   return { id, object: 'chat.completion.chunk', created: 1, model: 'fixture/grok', choices: [{ index: 0, delta, finish_reason: finish }], ...(usage ? { usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, prompt_tokens_details: { cached_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 0 } } } : {}) }
@@ -61,9 +66,9 @@ async function modelService(calls, options = {}) {
   return { calls, requests, url: `http://127.0.0.1:${server.address().port}/v1`, finalHeld, releaseFinal, holdNext: () => { hold = true }, close: () => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve) }) }
 }
 function fixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-closed-capability-'))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'grok-closed-capability-')))
   const target = path.join(root, 'target'), controller = path.join(root, 'controller'), nativeRoot = path.join(controller, 'native')
-  for (const directory of [target, controller, nativeRoot]) fs.mkdirSync(directory, { mode: 0o700 })
+  for (const directory of [target, controller, nativeRoot]) privateDirectory(directory)
   const challenge = process.env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE || crypto.randomBytes(32).toString('base64url')
   if (!/^[A-Za-z0-9_-]{43}$/.test(challenge)) throw new Error('Grok closed-canary challenge is invalid')
   const activationId = process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID || 'grok-closed-native-canary'
@@ -80,13 +85,100 @@ function ownershipRegistry(f) {
   const root = process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT
   if (!root) return path.join(f.controller, 'processes.json')
   if (!path.isAbsolute(root) || process.env.AUTOPROMPT_CLOSED_CANARY_PROVIDER !== 'grok' || process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID !== f.record.activationId || process.env.AUTOPROMPT_CLOSED_CANARY_GENERATION !== String(f.record.generation)) throw new Error('Grok closed-canary ownership registration is invalid')
-  const stat = fs.statSync(root); if (!stat.isDirectory() || stat.mode & 0o077) throw new Error('Grok closed-canary ownership root is not private')
-  const directory = path.join(root, `grok-${crypto.randomUUID()}`); fs.mkdirSync(directory, { mode: 0o700 })
+  const privateRoot = privateDirectory(root), stat = fs.statSync(privateRoot); if (!stat.isDirectory() || (process.platform !== 'win32' && stat.mode & 0o077)) throw new Error('Grok closed-canary ownership root is not private')
+  const directory = privateDirectory(path.join(privateRoot, `grok-${crypto.randomUUID()}`))
   const registryPath = path.join(directory, 'processes.json')
   fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'grok', activationId: f.record.activationId, generation: f.record.generation, challenge: f.challenge, registryPath }), { flag: 'wx', mode: 0o600 })
   return registryPath
 }
 function scratchFor(f, record = f.record) { return path.join(f.nativeRoot, 'grok', native.sha256(record.sessionId), native.sha256(record.reservationId), 'scratch') }
+const GROK_PROXY_DIAGNOSTIC_MAX_SESSIONS = 8
+const GROK_PROXY_DIAGNOSTIC_MAX_FILE_BYTES = 64 * 1024
+const GROK_PROXY_DIAGNOSTIC_SLICE_BYTES = 2048
+function samePhysicalPath(left, right) {
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
+}
+function physicalSingleLinkRegular(file, maximum) {
+  const item = fs.lstatSync(file, { bigint: true })
+  if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1n || item.size > BigInt(maximum)) return null
+  const resolved = fs.realpathSync.native(file)
+  if (!samePhysicalPath(resolved, path.join(fs.realpathSync.native(path.dirname(file)), path.basename(file)))) return null
+  return { item, size: Number(item.size) }
+}
+function redactGrokDiagnostic(value) {
+  return String(value)
+    .replace(/local-test-secret/gu, '<redacted>')
+    .replace(/\b((?:OPENROUTER|GROK|XAI|OPENAI)_API_KEY|AUTOPROMPT_GROK_[A-Z0-9_]*TOKEN)\s*([=:])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/giu, '$1$2<redacted>')
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+\/-]{12,}/gu, '$1 <redacted>')
+}
+function boundedGrokModelToolMessages(service) {
+  const found = []
+  for (const request of Array.isArray(service?.requests) ? service.requests : []) {
+    const messages = request?.body?.messages
+    if (!Array.isArray(messages)) continue
+    for (const message of messages) {
+      if (message?.role !== 'tool') continue
+      let content
+      try { content = typeof message.content === 'string' ? message.content : JSON.stringify(message.content) } catch { content = '<unserializable>' }
+      found.push({ content: redactGrokDiagnostic(content).slice(0, 512) })
+    }
+  }
+  return found.slice(-8)
+}
+function boundedGrokProxyFile(file, parser) {
+  try {
+    const checked = physicalSingleLinkRegular(file, GROK_PROXY_DIAGNOSTIC_MAX_FILE_BYTES)
+    if (!checked) return { status: 'unavailable' }
+    const bytes = fs.readFileSync(file)
+    const after = physicalSingleLinkRegular(file, GROK_PROXY_DIAGNOSTIC_MAX_FILE_BYTES)
+    if (!after || after.item.dev !== checked.item.dev || after.item.ino !== checked.item.ino || after.item.size !== checked.item.size) return { status: 'changed' }
+    return parser(bytes, checked.size)
+  } catch { return { status: 'pending' } }
+}
+function boundedGrokProxyDiagnostic(runner) {
+  const root = runner?.controlRoot
+  if (typeof root !== 'string') return []
+  let entries
+  try { entries = fs.readdirSync(root, { withFileTypes: true }) } catch { return [] }
+  const sessions = entries.filter(entry => entry.isDirectory() && /^[a-f0-9]{32}$/u.test(entry.name))
+  if (sessions.length > GROK_PROXY_DIAGNOSTIC_MAX_SESSIONS) return [{ status: 'directory-limit', count: sessions.length }]
+  return sessions.map(entry => {
+    const directory = path.join(root, entry.name)
+    try {
+      const item = fs.lstatSync(directory, { bigint: true })
+      if (!item.isDirectory() || item.isSymbolicLink()) return { status: 'invalid-directory' }
+    } catch { return { status: 'pending' } }
+    const status = boundedGrokProxyFile(path.join(directory, 'status.json'), bytes => {
+      const value = JSON.parse(bytes.toString('utf8'))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return { status: 'invalid' }
+      return { code: value.code || null, signal: value.signal || null,
+        proxyError: value.error && typeof value.error === 'object' ? { code: value.error.code || null, message: redactGrokDiagnostic(String(value.error.message || '')).slice(0, 512) } : null }
+    })
+    const stderr = boundedGrokProxyFile(path.join(directory, 'stderr.log'), (bytes, size) => {
+      const head = bytes.subarray(0, Math.min(bytes.length, GROK_PROXY_DIAGNOSTIC_SLICE_BYTES))
+      const tail = bytes.subarray(Math.max(0, bytes.length - GROK_PROXY_DIAGNOSTIC_SLICE_BYTES))
+      return { bytes: size, head: redactGrokDiagnostic(head.toString('utf8')), tail: redactGrokDiagnostic(tail.toString('utf8')) }
+    })
+    return { status, stderr }
+  })
+}
+test('Grok fixture proxy diagnostics are bounded, physical, and redact fixture credentials', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-proxy-diagnostic-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const session = path.join(root, 'a'.repeat(32)); fs.mkdirSync(session)
+  fs.writeFileSync(path.join(session, 'status.json'), JSON.stringify({ code: 'CHILD_RUNTIME_FAILURE', error: { code: 'FAILED', message: 'OPENROUTER_API_KEY=local-test-secret' } }))
+  fs.writeFileSync(path.join(session, 'stderr.log'), 'before local-test-secret\nAUTOPROMPT_GROK_RELAY_TOKEN=runtime-token-value\nafter\n')
+  fs.linkSync(path.join(session, 'stderr.log'), path.join(session, 'stderr-copy.log'))
+  assert.equal(boundedGrokProxyDiagnostic({ controlRoot: root })[0].stderr.status, 'unavailable')
+  fs.unlinkSync(path.join(session, 'stderr-copy.log'))
+  const diagnostic = boundedGrokProxyDiagnostic({ controlRoot: root })
+  assert.equal(diagnostic.length, 1)
+  assert.equal(JSON.stringify(diagnostic).includes('local-test-secret'), false)
+  assert.equal(JSON.stringify(diagnostic).includes('runtime-token-value'), false)
+  assert.equal(diagnostic[0].stderr.bytes > 0, true)
+  for (let index = 1; index <= GROK_PROXY_DIAGNOSTIC_MAX_SESSIONS; index++) fs.mkdirSync(path.join(root, index.toString(16).padStart(32, '0')))
+  assert.deepEqual(boundedGrokProxyDiagnostic({ controlRoot: root }), [{ status: 'directory-limit', count: GROK_PROXY_DIAGNOSTIC_MAX_SESSIONS + 1 }])
+})
 function sibling(f, name) { const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: name }; return { ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) } }
 function receipts(f, result) {
   const found = []; const visit = directory => { for (const item of fs.readdirSync(directory, { withFileTypes: true })) { const file = path.join(directory, item.name); if (item.isDirectory()) visit(file); else if (item.name === 'policy.json') try { const state = boundary.loadBoundary(file, result.toolBoundaryEvidence.policySha256); found.push(...boundary.readReceipts(state)) } catch {} } }
@@ -96,19 +188,98 @@ async function scenario(t, setup) {
   const f = fixture(), read = path.join(f.target, 'input.txt'), secret = path.join(f.controller, 'private.txt'), marker = `grok-native-capability-${crypto.randomUUID()}`
   fs.writeFileSync(read, `${marker}\n`, { mode: 0o600 }); fs.writeFileSync(secret, 'PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE', { mode: 0o600 }); fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', { mode: 0o600 })
   const calls = typeof setup?.calls === 'function' ? setup.calls({ ...f, read, secret, marker, scratch: scratchFor(f) }) : Array.isArray(setup?.calls) ? setup.calls : []
-  const service = await modelService(calls, { holdFinal: setup?.holdFinal === true, includeThought: setup?.includeThought === true }), binding = native.probeExecutable({ provider: 'grok', executable: CLI })
-  const processAdapter = createPosixProcessAdapter(), owner = new ProcessOwner({ adapter: processAdapter, registryPath: ownershipRegistry(f), pollMs: 10, startupTimeoutMs: 10000 })
-  const proxy = path.join(f.controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+  const service = await modelService(calls, { holdFinal: setup?.holdFinal === true, includeThought: setup?.includeThought === true })
+  // Startup can fail before the full owner cleanup is registered (for example
+  // an ACL audit). Retire the already-listening model server in that case so
+  // a failed probe cannot keep the test process alive until the CI job limit.
+  let ownerCleanupRegistered = false
+  t.after(async () => { if (!ownerCleanupRegistered) await service.close() })
+  const binding = native.probeExecutable({ provider: 'grok', executable: CLI })
+  const registryPath = ownershipRegistry(f), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
+  const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'grok-closed-native-canary', pollMs: 10 })
   const adapter = new HarnessExecAdapter({ provider: 'grok', runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: { model: 'fixture/grok', environment: { GROK_BASE_URL: service.url } }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-test-secret' }, rolePrompt: () => 'Use only controller-owned tools and return exactly one JSON object.', outputSchemaResolver: () => f.schema })
-  const run = async (overrides = {}) => { const record = { ...f.record, ...overrides }; record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { PATH: process.env.PATH }); record.signal = overrides.signal || AbortSignal.timeout(90000); record.onUsageDelta = () => ({ continue: true }); return adapter.launch(record) }
-  t.after(async () => { try { await owner.cancelAll({ reason: 'Grok capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } } })
+  let fixtureClosing = false
+  const activeLaunches = new Set(), launchControllers = new Set()
+  const launch = async (overrides = {}) => {
+    const record = { ...f.record, ...overrides }
+    record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
+    record.onUsageDelta = () => ({ continue: true })
+    try { return await adapter.launch(record) } catch (error) {
+      t.diagnostic(JSON.stringify({ grokNativeFailure: {
+        code: error?.code || null,
+        message: redactGrokDiagnostic(String(error?.message || error)).slice(0, 512),
+        reconciliation: error?.code === 'TOOL_RECEIPT_INVALID' && error?.details && typeof error.details === 'object' ? error.details : null,
+        modelToolMessages: boundedGrokModelToolMessages(service),
+        proxy: boundedGrokProxyDiagnostic(runner),
+      } }))
+      throw error
+    }
+  }
+  const run = (overrides = {}) => {
+    if (fixtureClosing) return Promise.reject(new Error('Grok fixture is closing'))
+    const controller = new AbortController()
+    launchControllers.add(controller)
+    const signals = [controller.signal, overrides.signal || AbortSignal.timeout(launchTimeoutMs)]
+    const operation = launch({ ...overrides, signal: AbortSignal.any(signals) })
+    activeLaunches.add(operation)
+    operation.finally(() => { activeLaunches.delete(operation); launchControllers.delete(controller) }).catch(() => {})
+    return operation
+  }
+  t.after(async () => {
+    fixtureClosing = true
+    for (const controller of launchControllers) controller.abort()
+    await Promise.allSettled([...activeLaunches])
+    await cleanupNativeFixture(f, 'grok', { stop: async () => {
+      await owner.cancelAll({ reason: 'Grok capability cleanup', graceMs: 0, killMs: 2000, waitForPending: true })
+      await owner.assertDrained()
+    }, close: () => service.close() })
+  })
+  ownerCleanupRegistered = true
   return { ...f, read, secret, marker, calls, service, binding, processAdapter, owner, runner, adapter, run }
 }
 function good(result) { assert.equal(result.ok, true); assert.match(result.contextId, /^[A-Za-z0-9_.:-]{1,256}$/); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/) }
 
-const capabilityOptions = { skip, timeout: 120000 }
-const capability = (name, body) => test(`grok closed native capability: ${name}`, capabilityOptions, body)
+const capabilityOptions = { skip, timeout: process.platform === 'win32' ? 420000 : 120000 }
+async function withWindowsLaunchDiagnostics(t, body) {
+  if (process.platform !== 'win32') return body(t)
+  // A cancelled prelaunch has no proxy stderr yet. Record the real preparation
+  // boundaries without copying arguments, environment values, or credentials.
+  const started = Date.now(), replacements = []
+  let records = 0
+  const report = (stage, phase, began, error) => {
+    if (++records > 64) return
+    t.diagnostic(JSON.stringify({ grokLaunchStage: stage, phase, elapsedMs: Date.now() - started,
+      ...(began === undefined ? {} : { durationMs: Date.now() - began }),
+      ...(error ? { code: typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'ERROR' } : {}) }))
+  }
+  const wrap = (target, name, stage) => {
+    const original = target[name]
+    assert.equal(typeof original, 'function')
+    target[name] = function (...args) {
+      const began = Date.now(); report(stage, 'started')
+      const done = value => { report(stage, 'completed', began); return value }
+      const failed = error => { report(stage, 'failed', began, error); throw error }
+      try {
+        const value = Reflect.apply(original, this, args)
+        return value && typeof value.then === 'function' ? value.then(done, failed) : done(value)
+      } catch (error) { return failed(error) }
+    }
+    replacements.push(() => { target[name] = original })
+  }
+  try {
+    const launch = require('../../scripts/harness-v2-bridge/grok/windows-launch.cjs')
+    wrap(launch, 'prepareSession', 'session')
+    wrap(launch, 'prepareLaunch', 'launch-resource')
+    wrap(require('../../agents/codex/workflow/windows-helper-deployment.js'), 'stageWindowsHelperDeployment', 'helper-deployment')
+    wrap(require('../../agents/codex/workflow/windows-appcontainer-resources.js'), 'prepareWindowsAppContainerResources', 'appcontainer-resources')
+    wrap(ProcessOwner.prototype, 'launch', 'owned-process')
+    return await body(t)
+  } finally {
+    for (const restore of replacements.reverse()) restore()
+  }
+}
+const capability = (name, body) => test(`grok closed native capability: ${name}`, capabilityOptions, t => withWindowsLaunchDiagnostics(t, body))
 
 capability('all six owned tools enforce write/private/network isolation and scratch witness', async t => {
   let contacted = false
@@ -124,8 +295,8 @@ capability('all six owned tools enforce write/private/network isolation and scra
         { id: 'search', name: 'use_tool', args: { tool_name: 'autoprompt_owned__search', tool_input: { path: values.target, text: values.marker, maxResults: 10 } } },
         { id: 'write', name: 'use_tool', args: { tool_name: 'autoprompt_owned__write', tool_input: { path: output, content: 'before' } } },
         { id: 'edit', name: 'use_tool', args: { tool_name: 'autoprompt_owned__edit', tool_input: { path: output, oldText: 'before', newText: 'after' } } },
-        { id: 'bash-exact', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: `printf 'exact:%s\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(values.marker)} ${quote(values.challenge)}`, cwd: values.target, timeoutMs: 30000 } } },
-        { id: 'bash-denied', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: `if (printf forbidden > ${quote(values.read)}) 2>/dev/null; then exit 18; fi; if (cat ${quote(values.secret)}) 2>/dev/null; then exit 20; fi; if (echo >/dev/tcp/127.0.0.1/${listener.address().port}) 2>/dev/null; then exit 21; fi`, cwd: values.target, timeoutMs: 30000 } } },
+        { id: 'bash-exact', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: exactCommand('exact', values), cwd: values.target, timeoutMs: 30000 } } },
+        { id: 'bash-denied', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: nodeCommand(`const fs=require('node:fs'),net=require('node:net'); try { fs.writeFileSync(${JSON.stringify(values.read)}, 'forbidden'); process.exit(18) } catch {} try { fs.readFileSync(${JSON.stringify(values.secret)}); process.exit(20) } catch {} const s=net.connect(${listener.address().port}, '127.0.0.1'); s.on('connect',()=>process.exit(21)); s.on('error',()=>process.exit(0)); setTimeout(()=>process.exit(0),700)`), cwd: values.target, timeoutMs: 30000 } } },
       ]
     } })
     const result = await f.run({ assignment: { model: 'fixture/grok', effort: 'high' } }); good(result)
@@ -137,17 +308,21 @@ capability('all six owned tools enforce write/private/network isolation and scra
 
 capability('private and ambient configuration are absent from actual model requests', async t => {
   const f = await scenario(t, { calls: [] })
-  fs.mkdirSync(path.join(f.target, '.grok'), { mode: 0o700 }); fs.writeFileSync(path.join(f.target, '.grok', 'config'), 'AMBIENT_GROK_CONFIG_MUST_NOT_LOAD')
+  privateDirectory(path.join(f.target, '.grok')); fs.writeFileSync(path.join(f.target, '.grok', 'config'), 'AMBIENT_GROK_CONFIG_MUST_NOT_LOAD')
   good(await f.run({}))
   const wire = JSON.stringify(f.service.requests)
   for (const sentinel of ['AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', 'AMBIENT_GROK_CONFIG_MUST_NOT_LOAD', 'PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE']) assert.equal(wire.includes(sentinel), false, sentinel)
 })
 
 capability('native event stream stays correlated to one context', async t => {
-  const f = await scenario(t, { holdFinal: true, includeThought: true, calls: values => [{ id: 'event-tool', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: `printf 'event-tool:%s\nCLOSED_CANARY_CHALLENGE:%s\n' ${quote(values.marker)} ${quote(values.challenge)}`, cwd: values.target, timeoutMs: 30000 } } }] }), events = [], identified = [], observedTools = []
+  const f = await scenario(t, { holdFinal: true, includeThought: true, calls: values => [{ id: 'event-tool', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: exactCommand('event-tool', values), cwd: values.target, timeoutMs: 30000 } } }] }), events = [], identified = [], observedTools = []
   let settled = false
   const pending = f.run({ onEvent: event => events.push(event), onSessionIdentified: id => identified.push(id), onToolCallObserved: event => observedTools.push(event) }).then(value => { settled = true; return value })
-  await Promise.race([f.service.finalHeld, wait(90000).then(() => { throw new Error('Grok never held the post-tool final response') })])
+  let heldTimer
+  try {
+    await Promise.race([f.service.finalHeld, pending.then(() => { throw new Error('Grok completed before holding the final response') }),
+      new Promise((_, reject) => { heldTimer = setTimeout(() => reject(new Error('Grok never held the post-tool final response')), launchTimeoutMs) })])
+  } finally { clearTimeout(heldTimer) }
   for (let index = 0; index < 200 && !events.some(event => event.event === 'host_tool_request' && event.source === 'host-relay'); index++) await wait(100)
   const observed = events.find(event => event.event === 'host_tool_request' && event.source === 'host-relay')
   assert.ok(observed, JSON.stringify(events)); assert.equal(f.service.requests.length, 2); assert.equal(observed.contextState, 'unbound'); assert.equal(Object.hasOwn(observed, 'sessionId'), false); assert.equal(settled, false)
@@ -158,7 +333,7 @@ capability('native event stream stays correlated to one context', async t => {
 })
 
 capability('exact output bytes are committed in the controller receipt', async t => {
-  const f = await scenario(t, { calls: values => [{ id: 'bash-exact', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: `printf 'exact:%s\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(values.marker)} ${quote(values.challenge)}`, cwd: values.target, timeoutMs: 30000 } } }] })
+  const f = await scenario(t, { calls: values => [{ id: 'bash-exact', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: exactCommand('exact', values), cwd: values.target, timeoutMs: 30000 } } }] })
   const result = await f.run({}); good(result)
   const bash = receipts(f, result).find(item => item.tool === 'bash'); assert.ok(bash)
   assert.equal(bash.outputSha256, native.sha256(`exact:${f.marker}\nCLOSED_CANARY_CHALLENGE:${f.challenge}\n`)); assert.equal(bash.status, 'completed')
@@ -175,8 +350,8 @@ capability('resume reuses only its bound target context', async t => {
   const f = await scenario(t, { calls: [] })
   const first = await f.run({ assignment: { model: 'fixture/grok', effort: 'high' } }); good(first)
   const resumed = await f.run({ reservationId: crypto.randomUUID(), continuationId: first.contextId, assignment: { model: 'fixture/grok', effort: 'high' } }); good(resumed); assert.equal(resumed.contextId, first.contextId)
-  const foreign = path.join(f.root, 'foreign'); fs.mkdirSync(foreign, { mode: 0o700 })
-  await assert.rejects(f.adapter.launch({ ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId, assignment: { model: 'fixture/grok', effort: 'high' }, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(f.processAdapter, crypto.randomUUID(), { PATH: process.env.PATH }), signal: AbortSignal.timeout(30000) }), error => ['SESSION_ID_MISMATCH', 'CONTINUATION_NOT_FOUND', 'CONTINUATION_INVALID'].includes(error.code))
+  const foreign = privateDirectory(path.join(f.root, 'foreign')), foreignReservation = crypto.randomUUID()
+  await assert.rejects(f.adapter.launch({ ...f.record, reservationId: foreignReservation, continuationId: first.contextId, assignment: { model: 'fixture/grok', effort: 'high' }, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(f.processAdapter, foreignReservation, nativeEnvironment()), signal: AbortSignal.timeout(30000) }), error => ['SESSION_ID_MISMATCH', 'CONTINUATION_NOT_FOUND', 'CONTINUATION_INVALID'].includes(error.code))
 })
 
 capability('hostile native tool topology is denied before an owned controller call', async t => {
@@ -186,28 +361,28 @@ capability('hostile native tool topology is denied before an owned controller ca
 })
 
 capability('held child cancels while a fast sibling remains alive and drained', async t => {
-  const held = await scenario(t, { calls: [] }); held.service.holdNext(); const abort = new AbortController(), pending = held.run({ signal: abort.signal })
+  const held = await scenario(t, { calls: [] }); held.service.holdNext(); const abort = new AbortController(), pending = held.run({ signal: abort.signal }); pending.catch(() => {})
   for (let index = 0; index < 300 && held.service.requests.length === 0; index++) await wait(50)
   assert.ok(held.service.requests.length > 0)
   const fast = await scenario(t, { calls: [] }); good(await fast.run({})); abort.abort(); await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); assert.deepEqual(held.owner.ownershipIdentities(), [])
 })
 
 capability('checker sees frozen candidate but writes only authenticated scratch', async t => {
-  const checkerFixture = await scenario(t, { calls: values => [{ id: 'checker', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: `cat ${quote(path.join(values.root, 'frozen', 'candidate.txt'))}; printf checked > ${quote(path.join(values.root, 'checker-scratch', 'checker.txt'))}`, cwd: path.join(values.root, 'checker-scratch'), timeoutMs: 30000 } } }] })
-  const frozen = path.join(checkerFixture.root, 'frozen'), scratch = path.join(checkerFixture.root, 'checker-scratch'); fs.mkdirSync(frozen, { mode: 0o700 }); fs.mkdirSync(scratch, { mode: 0o700 }); for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(scratch, name), { mode: 0o700 })
+  const checkerFixture = await scenario(t, { calls: values => [{ id: 'checker', name: 'use_tool', args: { tool_name: 'autoprompt_owned__bash', tool_input: { command: `${readCommand(path.join(values.root, 'frozen', 'candidate.txt'))} && ${nodeCommand(`const fs=require('node:fs'); fs.writeFileSync(${JSON.stringify(path.join(values.root, 'checker-scratch', 'checker.txt'))}, 'checked'); try { fs.writeFileSync(${JSON.stringify(path.join(values.root, 'frozen', 'candidate.txt'))}, 'wrong'); process.exit(19) } catch {}`)}`, cwd: path.join(values.root, 'checker-scratch'), timeoutMs: 30000 } } }] })
+  const frozen = privateDirectory(path.join(checkerFixture.root, 'frozen')), scratch = privateDirectory(path.join(checkerFixture.root, 'checker-scratch')); for (const name of ['tmp', 'output', 'cache']) privateDirectory(path.join(scratch, name))
   const candidate = path.join(frozen, 'candidate.txt'); fs.writeFileSync(candidate, `${checkerFixture.marker}\n`)
   const checker = { schemaVersion: 1, capability: native.sha256('grok-closed-checker'), runId: 'grok-closed-checker', checkerId: 'grok-closed-native', candidateHash: native.sha256(`${checkerFixture.marker}\n`), frozenCandidateRoot: frozen, writableScratchRoot: scratch, temporaryRoot: path.join(scratch, 'tmp'), outputRoot: path.join(scratch, 'output'), cacheRoot: path.join(scratch, 'cache') }
   const record = { ...checkerFixture.record, logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: scratch, canonicalTargetPath: frozen, candidateHash: checker.candidateHash, checkerScratchBoundary: checker, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } }
   const adapter = new HarnessExecAdapter({ provider: 'grok', runner: checkerFixture.runner, nativeRoot: checkerFixture.nativeRoot, executableBinding: checkerFixture.binding, targetPath: scratch, connection: { model: 'fixture/grok', environment: { GROK_BASE_URL: checkerFixture.service.url } }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-test-secret' }, rolePrompt: () => 'Use only controller checker tools.', outputSchemaResolver: () => checkerFixture.schema, checkerScratchVerifier: () => checker })
-  record.environment = prepareProcessLaunchEnvironment(checkerFixture.processAdapter, record.reservationId, { PATH: process.env.PATH }); record.signal = AbortSignal.timeout(90000); record.onUsageDelta = () => ({ continue: true })
+  record.environment = prepareProcessLaunchEnvironment(checkerFixture.processAdapter, record.reservationId, nativeEnvironment()); record.signal = AbortSignal.timeout(launchTimeoutMs); record.onUsageDelta = () => ({ continue: true })
   good(await adapter.launch(record)); assert.equal(fs.readFileSync(candidate, 'utf8'), `${checkerFixture.marker}\n`); assert.equal(fs.readFileSync(path.join(scratch, 'checker.txt'), 'utf8'), 'checked')
 })
 
 capability('crash recovery drains the durable owned child', async t => {
-  const crashed = await scenario(t, { calls: [] }); crashed.service.holdNext(); const pending = crashed.run({})
+  const crashed = await scenario(t, { calls: [] }); crashed.service.holdNext(); const pending = crashed.run({}); pending.catch(() => {})
   for (let index = 0; index < 300 && crashed.service.requests.length === 0; index++) await wait(50)
   assert.equal(crashed.owner.ownershipIdentities().length, 1)
-  const recovered = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: crashed.owner.registryPath, pollMs: 10 })
+  const recovered = new ProcessOwner({ adapter: nativeProcessAdapter(crashed.owner.registryPath, path.dirname(crashed.owner.registryPath)), registryPath: crashed.owner.registryPath, pollMs: 10 })
   await recovered.cancelAll({ reason: 'simulated Grok controller crash', graceMs: 0, killMs: 2000, waitForPending: true })
   await assert.rejects(pending, error => ['CHILD_CANCELLED', 'CHILD_RUNTIME_FAILURE', 'PROCESS_DRAIN_TIMEOUT'].includes(error.code) || /durable terminal status|controller child/i.test(error.message)); assert.deepEqual(recovered.ownershipIdentities(), [])
 })

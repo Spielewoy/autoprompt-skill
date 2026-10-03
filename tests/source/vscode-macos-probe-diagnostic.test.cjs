@@ -1,0 +1,26 @@
+'use strict'
+
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const test = require('node:test')
+const { logs } = require('../helpers/vscode-macos-probe-diagnostic.cjs')
+
+test('macOS VS Code diagnostic collects the actual main, renderer, and extension-host log layout', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-diagnostic-logs-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const first = path.join(root, 'logs', '20260924T010101', 'window1', 'exthost')
+  const second = path.join(root, 'logs', '20260924T020202', 'window1', 'exthost')
+  for (const directory of [first, second]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+  fs.writeFileSync(path.join(root, 'logs', '20260924T010101', 'main.log'), 'old-main')
+  fs.writeFileSync(path.join(root, 'logs', '20260924T020202', 'main.log'), 'new-main')
+  fs.writeFileSync(path.join(root, 'logs', '20260924T020202', 'window1', 'renderer.log'), 'new-renderer')
+  fs.writeFileSync(path.join(second, 'exthost.log'), 'new-exthost')
+  const collected = logs(root)
+  assert.equal(collected[0].name, '20260924T020202')
+  assert.equal(collected[0].main, 'new-main')
+  assert.equal(collected[0].renderer, 'new-renderer')
+  assert.equal(collected[0].extensionHost, 'new-exthost')
+  assert.equal(collected[1].main, 'old-main')
+})

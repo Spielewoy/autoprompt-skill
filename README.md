@@ -62,6 +62,8 @@ autoprompt
 - [Node.js 20+](https://nodejs.org/en/download)
 - [Python 3.11+](https://www.python.org/downloads/) available as `python3` or `python`, with [PyYAML](https://pypi.org/project/PyYAML/)
 - [Bash 4.3+](https://www.gnu.org/software/bash/) on macOS or Linux
+- Windows native provider commands use the installed provider runtime plus the platform sandbox and owned-process controls; WSL and a hypervisor are not required for native paths
+- Native Windows Codex additionally requires an administrator-run Autoprompt controller and an initialized official Codex Windows sandbox. Setting Codex `windows.sandbox="elevated"` selects that sandbox mode; it does not elevate the Autoprompt controller.
 - [Git](https://git-scm.com/downloads) only for the GitHub checkout method
 
 ### Support
@@ -81,6 +83,25 @@ autoprompt
 | Working | [Grok Build](https://docs.x.ai/build/overview) | 1.0.13 | `grok` |
 
 These versions passed Linux runs. Model and platform availability varies by provider.
+
+Native Windows execution uses AppContainer isolation and Windows Job process
+ownership, with Node 20 or 24 on x64 or ARM64. Native macOS execution uses the
+system sandbox and owned-process controls. Windows command tools include the
+bundled Bash/MSYS/Node runtime; native paths do not require WSL or a VM.
+
+The ten non-Codex providers can run their local capability checks on Linux,
+Windows, and macOS. All eleven checks must pass for the installed runtime before
+a mission starts; missing, failed, or skipped checks block activation. Codex uses
+its separate canonical validation route. On Windows, that route creates a fresh
+offline account and an own-SID Windows Filtering Platform policy for each
+activation. Their activation-bound lease is retained for resume. Permanent
+cleanup removes the account and policy only after owned Jobs drain; uncertain
+verification or cleanup fails closed and retains recovery records. The Linux
+version table above does not
+certify every provider/platform combination. Installer success and
+`doctor --strict` are prerequisite checks; `local-canary-required` means native
+validation is still pending. See [configured Linux runtimes](docs/lima-runtime.md)
+when a native path is unavailable.
 
 See [support and audit notes](docs/faq/which-coding-agents-are-supported.md).
 
@@ -240,4 +261,4 @@ Community: [Contributors](docs/CONTRIBUTORS.md), [Contributing](docs/CONTRIBUTIN
 
 ### Contributors
 
-[johnatag](https://github.com/johnatag) · [rollingdice](https://github.com/rollingdice) · [AincradBot](https://github.com/AincradBot) · [lunar-me](https://github.com/lunar-me) · [fatinghenji](https://github.com/fatinghenji) · [c8dhjp4tyv-bit](https://github.com/c8dhjp4tyv-bit) · [Alexis-Fiolleau-LaPoste-BGPN](https://github.com/Alexis-Fiolleau-LaPoste-BGPN)
+[johnatag](https://github.com/johnatag) · [rollingdice](https://github.com/rollingdice) · [AincradBot](https://github.com/AincradBot) · [lunar-me](https://github.com/lunar-me) · [fatinghenji](https://github.com/fatinghenji) · [c8dhjp4tyv-bit](https://github.com/c8dhjp4tyv-bit) · [Alexis-Fiolleau-LaPoste-BGPN](https://github.com/Alexis-Fiolleau-LaPoste-BGPN) · [Oscar-Williams](https://github.com/Oscar-Williams)

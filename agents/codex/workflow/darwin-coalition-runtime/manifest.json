@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "kind": "autoprompt-darwin-coalition-runtime",
+  "helperCSourceSha256": "f39cad4f28634514e35d6eb54713e00bc20e81b1526db889732def113cb3c533",
+  "minimumMacOS": "13.5",
+  "architectures": {
+    "x64": {
+      "file": "coalition-helper-x64",
+      "sha256": "fe03fb153b07772ae0b557832f21d3324accd43c60546cabafe0d2db0c0a3a56",
+      "size": 17728
+    },
+    "arm64": {
+      "file": "coalition-helper-arm64",
+      "sha256": "d60bbb7be0825df0d60eb92891a31814e5a57831e256bf2cb3ea913f842e33aa",
+      "size": 34536
+    }
+  },
+  "provenance": {
+    "sourceRepository": "https://github.com/Spielewoy/autoprompt-skill",
+    "sourceCommit": "aed6982a83655088ef419723db084b92d6e1f660",
+    "buildWorkflow": "https://github.com/Spielewoy/autoprompt-skill/actions/runs/35922609646",
+    "artifacts": {
+      "x64": {
+        "artifactId": 10777009668,
+        "sha256": "01df2fd22c6df89bf4ad78e2ffa47c330bdb23cb36802da85ca0ad5f60a37165"
+      },
+      "arm64": {
+        "artifactId": 10778141326,
+        "sha256": "8fe672d0b75a3410ab0f296776859e6fae6e4ebc7161278708453e156495d7a5"
+      }
+    }
+  }
+}

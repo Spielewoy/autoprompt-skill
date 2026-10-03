@@ -14,6 +14,65 @@ const http = require('node:http')
 const ROOT = path.resolve(__dirname, '..', '..')
 const CLI = path.join(ROOT, 'bin', 'autoprompt.cjs')
 const HOST_CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
+
+function copyHostWindowsSandboxState(destination) {
+  const files = [
+    ['cap_sid'],
+    ['.sandbox', 'setup_marker.json'],
+    ['.sandbox-secrets', 'sandbox_users.json'],
+  ]
+  for (const parts of files) {
+    const source = path.join(HOST_CODEX_HOME, ...parts)
+    const sourceStat = fs.lstatSync(source)
+    assert.equal(sourceStat.isFile() && !sourceStat.isSymbolicLink(), true,
+      `real Windows Codex sandbox state must be a regular host provider file: ${parts.join('/')}`)
+    const target = path.join(destination, ...parts)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.copyFileSync(source, target)
+  }
+}
+
+function cleanupRevokedWindowsPreflight(context, prepared, t) {
+  if (process.platform !== 'win32' || !prepared) {
+    fs.rmSync(context.sandbox, { recursive: true, force: true })
+    return
+  }
+  try {
+    const latest = JSON.parse(fs.readFileSync(prepared.recordPath, 'utf8'))
+    assert.equal(latest.status, 'revoked')
+    const setup = latest.activationBoundary.sandboxIdentity.setupState
+    const parents = [path.dirname(setup.marker.path), path.dirname(setup.users.path)]
+    const parentIdentities = parents.map(parent => {
+      const stat = fs.lstatSync(parent, { bigint: true })
+      assert.equal(stat.isDirectory() && !stat.isSymbolicLink(), true)
+      return { parent, device: String(stat.dev), inode: String(stat.ino) }
+    })
+    for (const binding of [setup.marker, setup.users]) {
+      const stat = fs.lstatSync(binding.path, { bigint: true })
+      assert.equal(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n, true)
+      assert.equal(String(stat.dev), binding.identity.device)
+      assert.equal(String(stat.ino), binding.identity.inode)
+      assert.equal(sha256(binding.path), binding.sha256)
+    }
+    for (const target of [setup.marker.path, setup.users.path, ...parents]) {
+      safeRunRoot.ensureWindowsPrivateAcl(target)
+    }
+    for (const binding of [setup.marker, setup.users]) {
+      const stat = fs.lstatSync(binding.path, { bigint: true })
+      assert.equal(String(stat.dev), binding.identity.device)
+      assert.equal(String(stat.ino), binding.identity.inode)
+      assert.equal(sha256(binding.path), binding.sha256)
+    }
+    for (const binding of parentIdentities) {
+      const stat = fs.lstatSync(binding.parent, { bigint: true })
+      assert.equal(String(stat.dev), binding.device)
+      assert.equal(String(stat.ino), binding.inode)
+    }
+    fs.rmSync(context.sandbox, { recursive: true, force: true })
+  } catch (error) {
+    t.diagnostic(`retained Windows Codex sandbox state after cleanup refusal: ${error.code || error.message}`)
+  }
+}
 const CODEX_RUNTIME = require('../../agents/manifests/codex-runtime.json')
 const activation = require('../../scripts/codex-configure.cjs')
 const { sealedProfileOverrides } = require('../../agents/codex/workflow/codex-agent-profile.js')
@@ -47,7 +106,7 @@ let installedTemplateSandbox = ''
 
 function ensureInstalledTemplate() {
   if (installedTemplate) return installedTemplate
-  installedTemplateSandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt real codex install '))
+  installedTemplateSandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt real codex install ')))
   installedTemplate = path.join(installedTemplateSandbox, 'codex home')
   const home = path.join(installedTemplateSandbox, 'user home')
   fs.mkdirSync(installedTemplate)
@@ -59,6 +118,19 @@ function ensureInstalledTemplate() {
     env: { ...process.env, HOME: home, USERPROFILE: home },
   })
   assert.equal(install.status, 0, `${install.stdout || ''}\n${install.stderr || ''}`)
+  if (process.platform === 'darwin') {
+    // The real Darwin lock witness requires the user-owned runtime closure.
+    // Keep this fixture on the same explicit setup path as an installed root;
+    // do not fall back to an ambient interpreter or bypass closure validation.
+    const pythonProbe = childProcess.spawnSync('python3', ['-I', '-S', '-c', 'import os,sys;print(os.path.realpath(sys.executable))'], {
+      encoding: 'utf8', env: { ...process.env, PATH: process.env.PATH || '/usr/bin:/bin' }, shell: false,
+    })
+    assert.equal(pythonProbe.status, 0, pythonProbe.stderr)
+    const python = String(pythonProbe.stdout || '').trim()
+    assert.ok(path.isAbsolute(python) && fs.statSync(python).isFile(), 'Darwin preflight requires one physical Python runtime')
+    const runtimeSetup = require('../../scripts/darwin-runtime-setup.cjs')
+    runtimeSetup.setup({ provider: 'codex', root: installedTemplate, python, packageRoot: ROOT })
+  }
   const roles = fs.readdirSync(path.join(
     installedTemplate, '.autoprompt-private', 'bundles', CODEX_RUNTIME.payloadGeneration,
     'skills', 'autoprompt', 'agents-runtime',
@@ -114,12 +186,22 @@ function makeCleanInstall() {
   fs.writeFileSync(hook, localSafety.MANAGED_HOOK, { mode: 0o755 })
   const template = ensureInstalledTemplate()
   fs.cpSync(template, root, { recursive: true, force: true })
+  if (process.platform === 'darwin') {
+    // cpSync creates destination directories using the caller's umask, even
+    // when their source is 0700. Preserve the setup's private directory modes
+    // in this disposable copy before exercising the unchanged runtime audit.
+    for (const relative of ['.autoprompt-private', '.autoprompt-private/darwin-runtime']) {
+      const source = fs.lstatSync(path.join(template, relative))
+      const destination = path.join(root, relative)
+      const copied = fs.lstatSync(destination)
+      assert.ok(source.isDirectory() && !source.isSymbolicLink() &&
+        copied.isDirectory() && !copied.isSymbolicLink())
+      assert.equal(source.mode & 0o777, 0o700)
+      fs.chmodSync(destination, source.mode & 0o777)
+    }
+  }
   if (process.platform === 'win32') {
-    const sandboxIdentity = path.join(HOST_CODEX_HOME, 'cap_sid')
-    const sandboxIdentityStat = fs.lstatSync(sandboxIdentity)
-    assert.equal(sandboxIdentityStat.isFile() && !sandboxIdentityStat.isSymbolicLink(), true,
-      'real Windows Codex sandbox identity must be a regular host provider file')
-    fs.copyFileSync(sandboxIdentity, path.join(root, 'cap_sid'))
+    copyHostWindowsSandboxState(root)
   }
   const receiptPath = path.join(root, '.autoprompt-install-receipt.json')
   const hashesPath = path.join(root, '.autoprompt-install-hashes.json')
@@ -330,7 +412,7 @@ test('parser exposes canonical activation plus the explicit Codex compatibility 
   })
   assert.equal(staleAlias.status, 1)
   assert.match(staleAlias.stderr, /PROVIDER_UNSUPPORTED.*compatibility-alias-telemetry-path-unregistered/)
-  assert.throws(() => parseArgs(['activate', 'codex', 'fix it']), /requires `--`/)
+  assert.deepEqual(parseArgs(['activate', 'codex', 'fix it']).missionArgs, ['fix it'])
   assert.deepEqual(
     parseArgs(['activate', 'codex', '--', '  leading ', '', 'trailing  ']).missionArgs,
     ['  leading ', '', 'trailing  '],
@@ -390,7 +472,7 @@ test('Codex doctor prerequisites reject a missing Windows sandbox identity', {
 }, t => {
   const root = fs.mkdtempSync(path.join(os.homedir(), '.autoprompt-doctor-prerequisite-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  fs.copyFileSync(path.join(HOST_CODEX_HOME, 'cap_sid'), path.join(root, 'cap_sid'))
+  copyHostWindowsSandboxState(root)
   const env = {
     ...process.env,
     AUTOPROMPT_INSTALL_ROOT: root,
@@ -432,7 +514,7 @@ test('ordinary Codex discovery is identical before, during, and after private ac
   const bareRoot = path.join(context.sandbox, 'bare codex home')
   fs.mkdirSync(bareRoot)
   if (process.platform === 'win32') {
-    fs.copyFileSync(path.join(HOST_CODEX_HOME, 'cap_sid'), path.join(bareRoot, 'cap_sid'))
+    copyHostWindowsSandboxState(bareRoot)
   }
   const bareEnvironment = {
     ...context.env,
@@ -536,6 +618,7 @@ test('sealed profile argv preserves policy and refuses changed or escaping autho
   fs.writeFileSync(path.join(root, relative), 'name = "ap-worker"\n')
   const source = [
     'sandbox_mode = "workspace-write"', 'web_search = "disabled"',
+    '[windows]', 'sandbox = "elevated"',
     '[shell_environment_policy]', 'inherit = "core"',
     'ignore_default_excludes = false', 'exclude = ["*KEY*", "*TOKEN*"]',
     'set = { GIT_ALLOW_PROTOCOL = "file" }',
@@ -544,6 +627,7 @@ test('sealed profile argv preserves policy and refuses changed or escaping autho
   fs.writeFileSync(file, source)
   const expected = sha256(file)
   const args = sealedProfileOverrides(file, expected)
+  assert.ok(args.includes('windows.sandbox="elevated"'))
   assert.ok(args.includes('shell_environment_policy.exclude=["*KEY*", "*TOKEN*"]'))
   assert.ok(args.includes(`agents.ap-worker.config_file=${JSON.stringify(path.join(root, relative))}`))
   assert.ok(Object.isFrozen(args))
@@ -744,6 +828,20 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
       assert.equal(record.activationBoundary.sandboxIdentity.sha256,
         sha256(record.activationBoundary.sandboxIdentity.path))
       assert.match(record.activationBoundary.sandboxIdentity.sourceSha256, /^[a-f0-9]{64}$/)
+      assert.equal(record.activationBoundary.sandboxIdentity.setupState.kind,
+        'windows-elevated-sandbox-state-v1')
+      for (const state of ['marker', 'users']) {
+        const binding = record.activationBoundary.sandboxIdentity.setupState[state]
+        assert.equal(binding.sha256, sha256(binding.path))
+        assert.match(binding.sourceSha256, /^[a-f0-9]{64}$/)
+        assert.equal(path.relative(nativeHome, binding.path).startsWith('..'), false)
+      }
+      const helper = record.activationBoundary.sandboxIdentity.publicHelperClosure
+      assert.equal(helper.kind, 'windows-codex-public-helper-v1')
+      assert.equal(fs.readdirSync(helper.directory.path).length, 1)
+      assert.equal(helper.file.sha256, sha256(helper.file.path))
+      assert.equal(helper.source.sha256, sha256(helper.source.path))
+      assert.equal(helper.file.sha256, helper.source.sha256)
     } else {
       assert.equal(record.activationBoundary.sandboxIdentity, null)
     }
@@ -751,6 +849,9 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
     assert.match(profile, /^sandbox_mode = "workspace-write"$/m)
     assert.match(profile, /^web_search = "disabled"$/m)
     assert.match(profile, /^\[sandbox_workspace_write\]\nnetwork_access = false$/m)
+    if (process.platform === 'win32') {
+      assert.match(profile, /^\[windows\]\nsandbox = "elevated"$/m)
+    }
     assert.match(profile, /^\[shell_environment_policy\]$/m)
     for (const feature of [
       'apps', 'plugins', 'remote_plugin', 'browser_use', 'in_app_browser',
@@ -872,6 +973,8 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
   )
   let requestCount = 0
   let nativeShellResult = null
+  let advertisedShellTools = []
+  let shellTool
   let fixtureError = null
   const probeServer = http.createServer((request, response) => {
     let body = ''
@@ -884,6 +987,15 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
         assert.equal(request.headers.authorization, 'Bearer synthetic-model-transport-key')
         const input = JSON.parse(body)
         requestCount += 1
+        if (requestCount === 1) {
+          advertisedShellTools = [...(input.tools || []), ...(input.input || [])
+            .filter(item => item.type === 'additional_tools').flatMap(item => item.tools || [])]
+            .flatMap(tool => tool.type === 'namespace' ? tool.tools : [tool])
+            .map(tool => tool.name)
+          shellTool = advertisedShellTools.includes('shell_command') ? 'shell_command' : 'exec_command'
+          assert.ok(advertisedShellTools.includes(shellTool),
+            `native diagnostic must advertise its shell tool before dispatch: ${JSON.stringify(advertisedShellTools)}`)
+        }
         assert.ok(requestCount <= 2, 'one shell call and one terminal response only')
         if (requestCount === 2) {
           nativeShellResult = input.input.find(item => item.type === 'function_call_output' &&
@@ -892,7 +1004,9 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
         }
         const item = requestCount === 1
           ? { type: 'function_call', id: 'shell-environment-probe', call_id: 'environment-probe',
-              name: 'shell_command', arguments: JSON.stringify({ command, timeout_ms: 10000 }) }
+              name: shellTool, arguments: JSON.stringify(shellTool === 'exec_command'
+                ? { cmd: command, yield_time_ms: 10000, workdir: context.target }
+                : { command, timeout_ms: 10000 }) }
           : { type: 'message', role: 'assistant', id: 'environment-complete',
               content: [{ type: 'output_text', text: 'Environment probe complete.' }] }
         const id = `environment-response-${requestCount}`
@@ -969,7 +1083,7 @@ test('clean-home activation isolates skills, versions physical roles, binds one 
   assert.equal(requestCount, 2)
   const commands = sandboxEnvironment.stdout.trim().split('\n').map(line => JSON.parse(line))
     .filter(event => event.type === 'item.completed' && event.item.type === 'command_execution')
-  assert.equal(commands.length, 1, `expected one native shell execution: ${sandboxEnvironment.stdout}`)
+  assert.equal(commands.length, 1, `expected one native shell execution: ${sandboxEnvironment.stdout}\n${JSON.stringify({ nativeShellResult, advertisedShellTools })}`)
   assert.equal(commands[0].item.exit_code, 0,
     `native shell failed: ${JSON.stringify(nativeShellResult)}\n${commands[0].item.aggregated_output}`)
   const sandboxObserved = JSON.parse(commands[0].item.aggregated_output.trim())
@@ -1163,6 +1277,66 @@ test('local conformance trust fails closed on forged scope and bound-state drift
   }
 })
 
+test('Codex local conformance accepts only the exact Darwin coalition probe shape', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-darwin-conformance-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const targetPath = path.join(root, 'target')
+  fs.mkdirSync(targetPath)
+  const registryPath = path.join(root, 'process-registry-1.json')
+  fs.writeFileSync(registryPath, '{"schemaVersion":1}\n', { mode: 0o600 })
+  const target = { realpath: targetPath }
+  const targetKey = crypto.createHash('sha256').update(activation.stableJsonV1(target)).digest('hex')
+  const probeBody = {
+    schemaVersion: 1,
+    kind: 'owned-process-conformance',
+    adapterKind: 'darwin-launchd-coalition',
+    targetKey,
+    ownershipId: 'darwin-conformance-owner',
+    groupIdentity: 'darwin-conformance-group',
+    terminalStatus: 'DONE',
+    drained: true,
+  }
+  const record = {
+    activationRoot: root,
+    target,
+    localConformance: {
+      schemaVersion: 1,
+      processProbe: {
+        ...probeBody,
+        probeHash: crypto.createHash('sha256').update(activation.stableJsonV1(probeBody)).digest('hex'),
+      },
+      processRegistry: { path: registryPath, sha256: sha256(registryPath) },
+    },
+  }
+  assert.equal(activation.validateOwnedProcessConformanceEvidence(record), record.localConformance)
+
+  const resealProbe = probe => {
+    const body = { ...probe }
+    delete body.probeHash
+    probe.probeHash = crypto.createHash('sha256').update(activation.stableJsonV1(body)).digest('hex')
+  }
+  const reject = (mutate, { reseal = true } = {}) => {
+    const candidate = structuredClone(record)
+    mutate(candidate.localConformance.processProbe)
+    if (reseal) resealProbe(candidate.localConformance.processProbe)
+    assert.throws(() => activation.validateOwnedProcessConformanceEvidence(candidate),
+      /local-conformance-process-evidence-invalid/)
+  }
+  reject(probe => { probe.adapterKind = 'darwin-process-group' })
+  reject(probe => { probe.adapterKind = 'darwin-launchd-coalition-extra' })
+  reject(probe => { probe.drained = false })
+  reject(probe => { probe.probeHash = '0'.repeat(64) }, { reseal: false })
+
+  const registryBytes = fs.readFileSync(registryPath)
+  try {
+    fs.appendFileSync(registryPath, ' ')
+    assert.throws(() => activation.validateOwnedProcessConformanceEvidence(record),
+      /local-conformance-process-evidence-drift/)
+  } finally {
+    fs.writeFileSync(registryPath, registryBytes, { mode: 0o600 })
+  }
+})
+
 test('bound Codex runtime environment survives a poisoned ambient PATH across activation reopening', t => {
   const context = makeCleanInstall()
   t.after(() => fs.rmSync(context.sandbox, { recursive: true, force: true }))
@@ -1261,8 +1435,9 @@ test('real Codex dynamic preflight accepts the isolated qualified activation wit
   skip: process.env.AUTOPROMPT_REAL_CODEX_PREFLIGHT !== '1',
 }, t => {
   const context = makeCleanInstall()
-  t.after(() => fs.rmSync(context.sandbox, { recursive: true, force: true }))
-  const prepared = activation.prepareActivation({
+  let prepared = null
+  t.after(() => cleanupRevokedWindowsPreflight(context, prepared, t))
+  prepared = activation.prepareActivation({
     env: context.env,
     missionArgs: ['real Codex dynamic preflight only'],
     target: context.target,
@@ -1308,10 +1483,11 @@ test('real Codex preflight keeps native probe state private under permissive cal
         target: context.target,
       })
       assert.equal(process.umask(), callerUmask, 'native preflight must restore the caller umask')
-      assert.doesNotThrow(() => safeRunRoot.auditPrivatePermissions(
-        prepared.activationRoot,
-        { recurse: true, allowedOwnerReadableFiles: [path.join(prepared.activationRoot, 'installation_id')] },
-      ))
+      // Reopening performs the platform activation audit, including the exact
+      // authenticated read/execute-only conformance helpers on macOS.
+      const inventory = activation.inventoryIsolation({ env: context.env })
+      assert.deepEqual(inventory.malformedActivations, [])
+      assert.deepEqual(inventory.activeActivations, [prepared.activationId])
       const nativeState = fs.readdirSync(prepared.activationRoot)
         .filter(name => /^goals_\d+\.sqlite(?:-.+)?$/.test(name))
       assert.ok(nativeState.length > 0, 'actual Codex probe must create its native goals state')

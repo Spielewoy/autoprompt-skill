@@ -14,14 +14,31 @@ const { createRequestQuota } = require('./harness-v2-request-quota.cjs')
 const { createQuotaRelay, isQuotaRelayCloseAbort } = require('./harness-v2-quota-relay.cjs')
 const { quotaConnection } = require('./harness-v2-quota-connection.cjs')
 const routeDecision = require('../agents/codex/workflow/route-decision.js')
-const { createUnixRelay } = require('./harness-v2-bridge/grok/unix-relay.cjs')
+const { createUnixRelay, createWindowsRelayPath } = require('./harness-v2-bridge/grok/unix-relay.cjs')
 const { createHostMcpRelay } = require('./harness-v2-bridge/grok/host-mcp-relay.cjs')
 const { createSandboxLaunch } = require('./harness-v2-bridge/grok/sandbox-launch.cjs')
 const { sseCalls, strictSse, validateToolCall, nativeRequestIdentity } = require('./harness-v2-bridge/grok/model-proxy.cjs')
+const vscodeEventChannel = require('./harness-v2-bridge/vscode/event-channel.cjs')
 const { fail, descriptor, readBound, sha256, privateDirectory, writePrivate } = native
 const integer = value => Number.isSafeInteger(value) && value >= 0
 const object = value => value && typeof value === 'object' && !Array.isArray(value)
 const identity = value => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,256}$/.test(value)
+const GROK_RECEIPT_DIAGNOSTIC_MAX_TOOLS = 16
+function grokReceiptDiagnosticToolName(value) {
+  if (typeof value !== 'string' || !value.startsWith('autoprompt_owned__')) return 'invalid'
+  const name = value.slice('autoprompt_owned__'.length)
+  return /^[a-z][a-z0-9_-]{0,63}$/u.test(name) ? name : 'invalid'
+}
+function grokReceiptReconciliationDiagnostic(issued, receipts, projected) {
+  return {
+    issuedCount: issued.length,
+    receiptCount: receipts.length,
+    projectedCount: projected instanceof Map ? projected.size : 0,
+    issuedTools: issued.slice(0, GROK_RECEIPT_DIAGNOSTIC_MAX_TOOLS).map(call => grokReceiptDiagnosticToolName(call?.target)),
+    receiptTools: receipts.slice(0, GROK_RECEIPT_DIAGNOSTIC_MAX_TOOLS).map(receipt =>
+      typeof receipt?.tool === 'string' && /^[a-z][a-z0-9_-]{0,63}$/u.test(receipt.tool) ? receipt.tool : 'invalid'),
+  }
+}
 function nativeTerminationDetails(result) {
   const hasExitCode = Object.prototype.hasOwnProperty.call(result || {}, 'exitCode')
   const hasStatus = Object.prototype.hasOwnProperty.call(result || {}, 'status')
@@ -62,6 +79,93 @@ function claudeStructuredOutputEnforcement(event) {
 // zero-tool launch. Keep every other provider on the existing canonical wire
 // until it has an equally enforceable zero-tool projection.
 const ROUTE_ADVISORY_PROVIDERS = new Set(['claude', 'opencode', 'kilo'])
+
+function vscodeEventEndpoint(launchRoot, alias, record) {
+  const key = sha256(JSON.stringify([record.sessionId, record.reservationId]))
+  if (process.platform === 'win32') return `\\\\.\\pipe\\autoprompt-vscode-${crypto.randomBytes(32).toString('hex')}`
+  if (process.platform === 'darwin') {
+    if (!alias?.userDataDir) fail('VSCODE_EVENT_CHANNEL_INVALID', 'Darwin VS Code event channel requires the authenticated IPC alias')
+    const parent = path.join(alias.userDataDir, 't')
+    vscodeEventChannel.ensurePrivateDirectory(parent)
+    return path.join(parent, 'autoprompt-events.sock')
+  }
+  if (typeof process.getuid !== 'function') fail('VSCODE_EVENT_CHANNEL_INVALID', 'VS Code event channel cannot bind a private POSIX root')
+  const root = path.join('/tmp', `ap-vscode-events-${process.getuid()}`)
+  privateDirectory(root)
+  return path.join(root, `${key}.sock`)
+}
+
+function strictChild(parent, candidate, label) {
+  if (typeof parent !== 'string' || typeof candidate !== 'string') fail('OPENCODE_ALIAS_INVALID', `${label} is missing`)
+  const relative = path.relative(parent, candidate)
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || relative.includes('\0')) {
+    fail('OPENCODE_ALIAS_INVALID', `${label} escaped its authenticated parent`)
+  }
+  return relative
+}
+function projectOpenCodeWindowsAlias(alias, sessionRoot, launchRoot, env) {
+  if (process.platform !== 'win32' || !alias || typeof alias.aliasPath !== 'string' || !env || typeof env !== 'object') {
+    fail('OPENCODE_ALIAS_INVALID', 'OpenCode Windows launch alias is invalid')
+  }
+  const launchRelative = strictChild(sessionRoot, launchRoot, 'OpenCode launch root')
+  if (!/^[a-f0-9]{64}$/u.test(launchRelative)) fail('OPENCODE_ALIAS_INVALID', 'OpenCode launch root is not its exact reservation leaf')
+  // Reopen the sealed alias before using any descendant. Its identity and
+  // target are validated against the durable journal, not just by a current
+  // pathname realpath comparison below.
+  alias.assertReady()
+  const deep = {
+    home: path.join(launchRoot, 'home'),
+    config: path.join(launchRoot, 'home', 'config'),
+    cache: path.join(launchRoot, 'home', 'cache'),
+    temporary: path.join(launchRoot, 'home', 'tmp'),
+    configFile: path.join(launchRoot, 'home', 'opencode.json'),
+    configDir: path.join(launchRoot, 'home', 'native-config'),
+    data: path.join(sessionRoot, 'data'),
+    state: path.join(sessionRoot, 'state'),
+  }
+  // Native createLaunch made the dispatch-private home tree before this
+  // projection. Its persistent OpenCode state is physical under sessionRoot;
+  // make those roots before addressing them through the short alias too.
+  privateDirectory(deep.data)
+  privateDirectory(deep.state)
+  privateDirectory(deep.configDir)
+  let aliasRoot, sessionPhysical
+  try {
+    aliasRoot = fs.realpathSync.native(alias.aliasPath)
+    sessionPhysical = fs.realpathSync.native(sessionRoot)
+  } catch { fail('OPENCODE_ALIAS_INVALID', 'OpenCode launch alias cannot be resolved') }
+  if (aliasRoot.toLowerCase() !== sessionPhysical.toLowerCase()) fail('OPENCODE_ALIAS_INVALID', 'OpenCode launch alias changed its physical session target')
+  const shortRoot = alias.aliasPath
+  const projected = {
+    home: path.join(shortRoot, launchRelative, 'home'),
+    config: path.join(shortRoot, launchRelative, 'home', 'config'),
+    cache: path.join(shortRoot, launchRelative, 'home', 'cache'),
+    temporary: path.join(shortRoot, launchRelative, 'home', 'tmp'),
+    configFile: path.join(shortRoot, launchRelative, 'home', 'opencode.json'),
+    configDir: path.join(shortRoot, launchRelative, 'home', 'native-config'),
+    data: path.join(shortRoot, 'data'),
+    state: path.join(shortRoot, 'state'),
+  }
+  for (const name of Object.keys(deep)) {
+    let resolved
+    try { resolved = fs.realpathSync.native(projected[name]) } catch { fail('OPENCODE_ALIAS_INVALID', `OpenCode projected ${name} is unavailable`) }
+    const expected = fs.realpathSync.native(deep[name])
+    if (resolved.toLowerCase() !== expected.toLowerCase()) fail('OPENCODE_ALIAS_INVALID', `OpenCode projected ${name} changed physical target`)
+  }
+  // This is a closed fixed-key replacement after native.createLaunch has
+  // written its canonical physical files. Never spread a caller environment.
+  env.HOME = projected.home
+  env.USERPROFILE = projected.home
+  env.XDG_CONFIG_HOME = projected.config
+  env.XDG_CACHE_HOME = projected.cache
+  env.XDG_DATA_HOME = projected.data
+  env.XDG_STATE_HOME = projected.state
+  env.TMPDIR = projected.temporary
+  env.TMP = projected.temporary
+  env.TEMP = projected.temporary
+  env.OPENCODE_CONFIG = projected.configFile
+  env.OPENCODE_CONFIG_DIR = projected.configDir
+}
 
 // Route analysis is advisory only.  Its native request must not carry the
 // large worker/checker topology contract or any executable tool definitions:
@@ -349,6 +453,7 @@ class HarnessEventStream {
     this.claudeStructuredOutputSchema = record.claudeStructuredOutputSchema || null
     this.claudeStructuredOutputPending = null; this.claudeStructuredOutput = null
     this.claudeStructuredOutputCalls = new Set()
+    this.claudeHeartbeatCounters = new Map()
     this.deepseekStructuredOutputSchema = record.deepseekStructuredOutputSchema || null
     this.deepseekStructuredOutputPending = null; this.deepseekStructuredOutput = null
     this.pendingToolObservations = []
@@ -712,7 +817,10 @@ class HarnessEventStream {
     if (this.provider !== 'grok' || !Array.isArray(calls)) fail('TOOL_RECEIPT_INVALID', 'Grok issued-call ledger is invalid')
     const receipts = boundary.readReceipts(this.record.toolBoundary)
     const issued = calls.filter(call => call.name === 'use_tool')
-    if (issued.length !== receipts.length) fail('TOOL_RECEIPT_INVALID', 'Grok issued calls differ from controller-owned executions')
+    if (issued.length !== receipts.length) {
+      fail('TOOL_RECEIPT_INVALID', 'Grok issued calls differ from controller-owned executions',
+        grokReceiptReconciliationDiagnostic(issued, receipts, this.grokProjectedReceipts))
+    }
     const receiptsByHash = new Map(receipts.map(receipt => [receipt.hash, receipt]))
     const usedReceipts = new Set()
     for (const call of issued) {
@@ -731,7 +839,14 @@ class HarnessEventStream {
     this.grokReceiptHashes = receipts.map(receipt => receipt.hash)
   }
   claude(e, raw) {
-    if (e.parent_tool_use_id) fail('ROLE_POLICY_DENIED', 'Native subagent execution is forbidden')
+    if (e.parent_tool_use_id) {
+      // Claude CLI emits a bounded heartbeat while an already-admitted
+      // controller MCP call is running. It is transport liveness only: it
+      // never starts, settles, or accounts a tool call. Every other nested
+      // event remains forbidden as native delegation.
+      if (this.claudeHeartbeat(e)) return
+      fail('ROLE_POLICY_DENIED', 'Native subagent execution is forbidden')
+    }
     if (e.session_id) this.session(e.session_id, e, raw)
     if (e.type === 'system' && e.subtype === 'init') { this.session(e.session_id, e, raw); return }
     if (e.type === 'system' && e.subtype === 'status' && (e.status === 'requesting' || e.status === null)) return
@@ -850,6 +965,26 @@ class HarnessEventStream {
       return
     }
     fail('TRANSPORT_INVALID', `Unsupported Claude event: ${e.type}/${e.subtype || ''}`)
+  }
+  claudeHeartbeat(e) {
+    if (e.type !== 'tool_progress' || e.heartbeat !== true || typeof e.parent_tool_use_id !== 'string' ||
+        !identity(e.tool_use_id) || typeof e.tool_name !== 'string' ||
+        !Number.isSafeInteger(e.elapsed_time_seconds) || e.elapsed_time_seconds < 0 || e.elapsed_time_seconds > 3600 ||
+        !identity(e.session_id) || typeof e.uuid !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(e.uuid)) return false
+    const allowed = new Set(['type', 'tool_use_id', 'tool_name', 'parent_tool_use_id', 'elapsed_time_seconds', 'heartbeat', 'session_id', 'uuid'])
+    if (Object.keys(e).some(key => !allowed.has(key))) return false
+    if (this.sessionId !== e.session_id) return false
+    const active = this.activeTools.get(e.parent_tool_use_id)
+    const controlledName = this.receiptVerifier ? controlled.decodeToolName(this.provider, e.tool_name) : null
+    if (!this.receiptVerifier || !active || !active.ownedName || active.ownedName !== controlledName || active.name !== e.tool_name) return false
+    const prefix = `${e.parent_tool_use_id}-heartbeat-`
+    if (!e.tool_use_id.startsWith(prefix)) return false
+    const suffix = e.tool_use_id.slice(prefix.length), counter = Number(suffix)
+    if (!Number.isSafeInteger(counter) || counter < 0 || counter > 99 || String(counter) !== suffix) return false
+    const previous = this.claudeHeartbeatCounters.get(e.parent_tool_use_id)
+    if (previous === undefined ? counter !== 0 : counter !== previous + 1) return false
+    this.claudeHeartbeatCounters.set(e.parent_tool_use_id, counter)
+    return true
   }
   claudeStream(event) {
     if (!object(event) || typeof event.type !== 'string') fail('TRANSPORT_INVALID', 'Claude stream event has no type')
@@ -1219,6 +1354,115 @@ class HarnessExecAdapter {
     if (!options.runner?.run || !options.runner?.stop || !options.nativeRoot || !options.executableBinding || !(options.connection || options.config) || typeof options.rolePrompt !== 'function' || typeof options.outputSchemaResolver !== 'function') fail('PROVIDER_UNSUPPORTED', 'Native transport requires an owned runner, binding, configuration, role prompt, and schema resolver')
     Object.assign(this, options); this.connection = options.connection || options.config
   }
+  async recoverResources(options = {}) {
+    if (this.provider === 'grok' && process.platform === 'win32') {
+      const root = path.join(this.nativeRoot, 'grok'), result = { cleaned: 0, retained: [] }
+      if (!fs.existsSync(root)) return result
+      const { auditPrivatePermissions } = require('../agents/codex/workflow/safe-run-root.js')
+      const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) &&
+        Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
+      const readPhysicalFile = (file, maximumBytes) => {
+        let descriptor
+        try {
+          const named = fs.lstatSync(file, { bigint: true })
+          if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n || named.size < 1n || named.size > BigInt(maximumBytes)) return null
+          descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+          const opened = fs.fstatSync(descriptor, { bigint: true })
+          if (['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].some(key => opened[key] !== named[key])) return null
+          const bytes = fs.readFileSync(descriptor), after = fs.fstatSync(descriptor, { bigint: true }), current = fs.lstatSync(file, { bigint: true })
+          if (bytes.length !== Number(opened.size) || ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].some(key => after[key] !== opened[key] || current[key] !== opened[key])) return null
+          return bytes
+        } catch { return null } finally { if (descriptor !== undefined) fs.closeSync(descriptor) }
+      }
+      const restoredResourceJournal = journalPath => {
+        const journalBytes = readPhysicalFile(journalPath, 8 * 1024 * 1024), receiptBytes = readPhysicalFile(`${journalPath}.restored`, 4096)
+        if (!journalBytes || !receiptBytes) return false
+        let journal, receipt
+        try { journal = JSON.parse(journalBytes.toString('utf8')); receipt = JSON.parse(receiptBytes.toString('utf8')) } catch { return false }
+        const leaseId = path.basename(journalPath, '.resources.json')
+        if (!exact(journal, ['schemaVersion', 'leaseId', 'plan', 'sha256']) || journal.schemaVersion !== 1 || journal.leaseId !== leaseId ||
+            journal.sha256 !== sha256(JSON.stringify({ schemaVersion: 1, leaseId, plan: journal.plan }))) return false
+        try { require('../agents/codex/workflow/windows-appcontainer-resources.js').validatePlan(journal.plan, { profileName: `Autoprompt_${leaseId}` }) } catch { return false }
+        if (!exact(receipt, ['schemaVersion', 'leaseId', 'profileSid', 'result']) || receipt.schemaVersion !== 1 || receipt.leaseId !== leaseId ||
+            receipt.profileSid !== journal.plan.profileSid || !exact(receipt.result, ['restored', 'newEntries', 'deletedEntries']) ||
+            Object.values(receipt.result).some(value => !Number.isSafeInteger(value) || value < 0) ||
+            receipt.result.restored > 16384 || receipt.result.deletedEntries > 16384 || receipt.result.newEntries > 32768 ||
+            receipt.result.restored + receipt.result.newEntries > 32768 ||
+            receipt.result.restored + receipt.result.deletedEntries !== journal.plan.entries.length) return false
+        return true
+      }
+      const physicalDirectory = directory => { privateDirectory(directory); auditPrivatePermissions(directory, { recurse: false }) }
+      physicalDirectory(root)
+      const directories = parent => fs.readdirSync(parent, { withFileTypes: true }).filter(entry => /^[a-f0-9]{64}$/u.test(entry.name)).map(entry => {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery directory is not physical')
+        const directory = path.join(parent, entry.name); physicalDirectory(directory); return directory
+      })
+      let count = 0
+      for (const context of directories(root)) for (const reservation of directories(context)) {
+        const controlRoot = path.join(reservation, 'broker-control')
+        if (!fs.existsSync(controlRoot)) continue
+        physicalDirectory(controlRoot)
+        const names = fs.readdirSync(controlRoot), brokerLeaseIds = new Set(names.map(name => /^grok-broker-([a-f0-9]{32})\.json$/u.exec(name)?.[1]).filter(Boolean))
+        for (const name of names.filter(name => /^grok-broker-[a-f0-9]{32}\.json$/u.test(name))) {
+          if (++count > 4096) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery journal discovery exceeded its bound')
+          const brokerRequestPath = path.join(controlRoot, name)
+          try {
+            await require('./harness-v2-bridge/grok/windows-sandbox.cjs').recoverDiscoveredWindowsGrokSandbox({
+              controlRoot, brokerRequestPath, processOwner: this.runner.processOwner, targetKey: this.runner.targetKey,
+            })
+            result.cleaned++
+          } catch (error) {
+            if (!['PROCESS_IDENTITY_INVALID', 'PROCESS_DRAIN_TIMEOUT', 'OWNERSHIP_RECOVERY_PENDING', 'OWNERSHIP_RECOVERY_FATAL'].includes(error.code)) throw error
+            result.retained.push({ brokerRequestPath, code: error.code })
+          }
+        }
+        for (const name of names.filter(name => /^[a-f0-9]{32}\.resources\.json$/u.test(name))) {
+          const leaseId = name.slice(0, 32), journalPath = path.join(controlRoot, name)
+          if (brokerLeaseIds.has(leaseId) || restoredResourceJournal(journalPath)) continue
+          if (++count > 4096) fail('GROK_WINDOWS_SANDBOX_RECOVERY_INVALID', 'Grok recovery journal discovery exceeded its bound')
+          result.retained.push({ journalPath, code: 'GROK_WINDOWS_RESOURCE_ORPHANED' })
+        }
+      }
+      if (options.requireDrained && result.retained.length) fail('PROCESS_DRAIN_TIMEOUT', 'Grok resources still require exact process-drain authority', result)
+      return result
+    }
+    const aliasProvider = this.provider === 'vscode' ? 'vscode'
+      : this.provider === 'opencode' && process.platform === 'win32' ? 'opencode' : null
+    if (!aliasProvider || !['darwin', 'win32'].includes(process.platform)) return { cleaned: 0, retained: [] }
+    if (!this.ipcRecoveryPromise) {
+      this.ipcRecoveryPromise = (async () => {
+        const root = path.join(this.nativeRoot, aliasProvider), result = { cleaned: 0, retained: [] }
+        if (!fs.existsSync(root)) return result
+        privateDirectory(root)
+        const hashDirectories = parent => fs.readdirSync(parent, { withFileTypes: true }).filter(entry => /^[a-f0-9]{64}$/.test(entry.name)).map(entry => {
+          if (!entry.isDirectory() || entry.isSymbolicLink()) fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC discovery encountered a linked or non-directory reservation')
+          const directory = path.join(parent, entry.name); privateDirectory(directory); return directory
+        })
+        let count = 0
+        for (const context of hashDirectories(root)) for (const reservation of hashDirectories(context)) {
+          const journalPath = path.join(reservation, aliasProvider === 'vscode' ? 'vscode-ipc-alias.json' : 'opencode-launch-alias.json')
+          if (!fs.existsSync(journalPath)) continue
+          try {
+            const recovered = await require('./harness-v2-vscode-ipc-alias.cjs').recover({ journalPath, provider: aliasProvider, processOwner: this.runner.processOwner })
+            if (!recovered.alreadyCleaned) { result.cleaned++; count++ }
+          } catch (error) {
+            if (!['VSCODE_IPC_ALIAS_STATE_INVALID', 'PROCESS_IDENTITY_INVALID', 'PROCESS_DRAIN_TIMEOUT', 'OWNERSHIP_RECOVERY_PENDING', 'OWNERSHIP_RECOVERY_FATAL'].includes(error.code)) throw error
+            // A concurrent live sibling or an unresolved pre-crash reservation
+            // retains its alias. Fresh absence is never deletion authority.
+            result.retained.push({ journalPath, code: error.code })
+            count++
+          }
+          if (count > 4096) fail('VSCODE_IPC_ALIAS_UNSAFE', 'VS Code IPC outstanding journal discovery exceeded its bound')
+        }
+        return result
+      })()
+    }
+    const pending = this.ipcRecoveryPromise
+    let result
+    try { result = await pending } finally { if (this.ipcRecoveryPromise === pending) this.ipcRecoveryPromise = null }
+    if (options.requireDrained && result.retained.length) fail('PROCESS_DRAIN_TIMEOUT', 'VS Code IPC aliases still require exact process-drain authority', result)
+    return result
+  }
   async launch(record) {
     // Capture the primitive once so the native configuration and host-only
     // compaction projection cannot diverge across asynchronous launch work.
@@ -1250,16 +1494,70 @@ class HarnessExecAdapter {
     if (!controlled.PROVIDERS.includes(this.provider) || !(this.runner instanceof core.OwnedCodexProxyRunner)) {
       fail('NATIVE_EXECUTION_BOUNDARY_UNAVAILABLE', 'Native execution requires the owned process runner and a controlled tool projection')
     }
+    await this.recoverResources()
     const sandbox = await boundary.probeCommandSandbox()
     if (!sandbox.supported) fail('NATIVE_EXECUTION_BOUNDARY_UNAVAILABLE', 'The controller command sandbox is unavailable', sandbox)
     const targetPath = path.resolve(record.workingDirectory || record.cwd || this.targetPath)
     const readOnly = execution.sandboxMode === 'read-only'
     const sessionRoot = contextRoot(this.nativeRoot, this.provider, record, targetPath)
     const launchRoot = path.join(sessionRoot, sha256(record.reservationId))
+    // The Windows Grok AppContainer contract requires its two root leaves to
+    // receive protected controller DACLs at first creation.  Do this before
+    // any generic private-directory call can recursively create either leaf
+    // with inherited permissions; resumed roots are audited, never relabeled.
+    let grokWindowsSession = null
+    if (this.provider === 'grok' && process.platform === 'win32') {
+      grokWindowsSession = await require('./harness-v2-bridge/grok/windows-launch.cjs').prepareSession({
+        sessionRoot, launchRoot, grokExecutable: native.executableRuntimePath(binding), nodeExecutable: process.execPath,
+      })
+    }
+    let grokDarwinSession = null
+    if (this.provider === 'grok' && process.platform === 'darwin') {
+      privateDirectory(path.dirname(sessionRoot))
+      grokDarwinSession = await require('./harness-v2-bridge/grok/darwin-launch.cjs').prepareSession({
+        sessionRoot, launchRoot, grokExecutable: native.executableRuntimePath(binding),
+        nodeExecutable: fs.realpathSync.native(this.runner.boundNode?.path || process.execPath),
+      })
+      if (this.runner.boundNode && grokDarwinSession.nodeExecutableSha256 !== this.runner.boundNode.sha256) {
+        fail('GROK_DARWIN_LAUNCH_IDENTITY_CHANGED', 'Private Grok worker Node differs from its controller binding')
+      }
+    }
+    const grokPlatformSession = grokWindowsSession || grokDarwinSession
+    if (this.provider === 'vscode' && process.platform === 'win32') {
+      const created = privateDirectory(launchRoot)
+      const privacy = require('../agents/codex/workflow/safe-run-root.js')
+      if (created) privacy.ensureWindowsPrivateAcl(launchRoot)
+      privacy.auditPrivatePermissions(launchRoot, { recurse: false })
+    }
+    if (this.provider === 'opencode' && process.platform === 'win32') {
+      // The alias journal parent and its physical session target both require
+      // protected DACLs. Establish them only for leaves created by this
+      // dispatch; a reused root may carry live lease ACEs and is audited, not
+      // relabeled.
+      const privacy = require('../agents/codex/workflow/safe-run-root.js')
+      const sessionCreated = privateDirectory(sessionRoot)
+      if (sessionCreated) privacy.ensureWindowsPrivateAcl(sessionRoot)
+      const launchCreated = privateDirectory(launchRoot)
+      if (launchCreated) privacy.ensureWindowsPrivateAcl(launchRoot)
+      privacy.auditPrivatePermissions(sessionRoot, {
+        recurse: false,
+        additionalPaths: [launchRoot],
+        requiredProtectedPaths: [sessionRoot, launchRoot],
+      })
+    }
     const cwd = path.join(sessionRoot, 'cwd'); privateDirectory(cwd)
     const checkerScratch = record.checkerScratchBoundary ? this.checkerScratchVerifier?.(record) : null
     if (record.checkerScratchBoundary && !checkerScratch) fail('CHECKER_SCRATCH_BOUNDARY_INVALID', 'Native checker scratch boundary is not authenticated')
-    const scratchPath = checkerScratch ? targetPath : path.join(launchRoot, 'scratch'); privateDirectory(scratchPath)
+    const scratchPath = checkerScratch ? targetPath : path.join(launchRoot, 'scratch')
+    const scratchExisted = fs.existsSync(scratchPath)
+    privateDirectory(scratchPath)
+    if (process.platform === 'win32' && !checkerScratch) {
+      // Only newly allocated controller scratch may be relabeled. A resumed
+      // directory must already satisfy the native private-owner contract.
+      if (!scratchExisted) require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(scratchPath)
+      require('../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
+        .assertRecordParent(path.join(scratchPath, 'scratch-parent-check'))
+    }
     const candidatePath = checkerScratch ? path.resolve(checkerScratch.frozenCandidateRoot) : targetPath
     if (checkerScratch && path.resolve(checkerScratch.writableScratchRoot) !== scratchPath) fail('CHECKER_SCRATCH_BOUNDARY_INVALID', 'Native checker scratch differs from its authenticated working directory')
     if (record.logicalRole === 'independent-checker' && (!readOnly || execution.canDispatch !== false ||
@@ -1269,11 +1567,16 @@ class HarnessExecAdapter {
     }
     const toolRoot = path.join(launchRoot, 'tool-control')
     privateDirectory(toolRoot)
-    const toolBoundary = boundary.prepareBoundary({ provider: this.provider, root: toolRoot,
-      policy: { sessionId: record.sessionId, reservationId: record.reservationId, readOnly, toolFree: record.providerToolCallLimit === 0,
+    const darwinCommandOwner = process.platform === 'darwin'
+      ? { manifestRoot: require('./harness-v2-command-owner-discovery.cjs').createDiscoveryRoot(this.nativeRoot, { provider: this.provider, activationId: record.activationId, generation: record.generation }), providerPrivateOwnershipRoot: this.nativeRoot }
+      : undefined
+    const toolBoundary = boundary.prepareBoundary({ provider: this.provider, root: toolRoot, darwinCommandOwner,
+      policy: { activationId: record.activationId, generation: record.generation, sessionId: record.sessionId, reservationId: record.reservationId, readOnly, toolFree: record.providerToolCallLimit === 0,
         targetPath: candidatePath, scratchPath, readableRoots: [candidatePath, scratchPath],
         writableRoots: readOnly ? [scratchPath] : [candidatePath, scratchPath],
         nestedDispatch: false, commandBoundary: true, externalWrites: false } })
+    if (toolBoundary.darwinCommandOwner) require('./harness-v2-command-owner-discovery.cjs').registerCanaryDiscovery(
+      toolBoundary.policyPath, toolBoundary.policySha256, toolBoundary.darwinCommandOwner)
     const schema = core.codexProviderCanonicalOutputSchema(record, JSON.parse(readBound(this.outputSchemaResolver(record))))
     const outcomeProjection = nativeOutcomeDescriptionProjection(record, schema)
     const routeProjection = routeAdvisoryProjection(record, schema, this.provider)
@@ -1313,10 +1616,24 @@ class HarnessExecAdapter {
     const stream = new HarnessEventStream(this.provider, { ...record, ...(quotaEnabled ? { onUsageDelta: undefined } : {}), readOnly, commandBoundary, toolFree: Boolean(routeProjection), toolBoundary, grokStructuredOutputRequired: this.provider === 'grok', ...(this.provider === 'claude' ? { claudeStructuredOutputSchema: wireSchema } : {}), ...(this.provider === 'deepseek' ? { deepseekStructuredOutputSchema: wireSchema } : {}), onSessionIdentified: (id, evidence) => { persistContext(this.nativeRoot, sessionRoot, this.provider, record, targetPath, id); record.onSessionIdentified?.(id, evidence) } })
     let streamError, stopPromise, runnerStarted = false, grokIssuedHistory = []
     let primaryNativeFailure = null, closingAfterNativeResult = false
+    let vscodeCompletionSeen = false, vscodeCompletionStop = null, vscodeCompletionPromise = null, vscodeCompletionDrainPromise = null, runnerSettled = false
+    let opencodeTools = null, opencodeToolsClose = null, opencodeToolTransport
+    const closeOpenCodeTools = () => {
+      if (!opencodeTools) return Promise.resolve()
+      if (!opencodeToolsClose) {
+        try { opencodeToolsClose = Promise.resolve(opencodeTools.close()) }
+        catch (error) { opencodeToolsClose = Promise.reject(error) }
+        opencodeToolsClose.catch(() => {})
+      }
+      return opencodeToolsClose
+    }
     const stop = error => {
       if (closingAfterNativeResult && relayCleanupAbort(error)) return
       if (streamError) return
       streamError = error
+      // These tools live in the controller, outside the provider Job. Abort
+      // their owned commands before asking the provider owner to drain.
+      void closeOpenCodeTools()
       if (!runnerStarted) return
       stopPromise = Promise.resolve().then(() => this.runner.stop({ sessionId: processSessionId, reason: error.code || 'CHILD_RUNTIME_FAILURE', terminalStatus: 'FAILED' }))
       stopPromise.catch(() => {})
@@ -1325,7 +1642,7 @@ class HarnessExecAdapter {
     const abort = () => stop(new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted'))
     if (signal?.aborted) throw new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted before launch')
     signal?.addEventListener('abort', abort, { once: true })
-    let result
+    let result, vscodeIpcAlias = null, vscodeReservationEntered = false, opencodeLaunchAlias = null, opencodeReservationEntered = false, vscodeEvents = null, vscodeEventsDrained = false
     try {
       if (quotaEnabled) {
         const projection = quotaConnection(this.provider, this.connection, record.assignment?.model)
@@ -1345,7 +1662,55 @@ class HarnessExecAdapter {
               ? Math.min(4096, record.providerTokenLimit)
               : undefined
         : undefined
-      spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), sessionRoot, cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
+      if (this.provider === 'vscode' && ['darwin', 'win32'].includes(process.platform)) {
+        const home = path.join(launchRoot, 'home')
+        const created = privateDirectory(path.join(home, 'user-data'))
+        if (created && process.platform === 'win32') require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(path.join(home, 'user-data'))
+        vscodeIpcAlias = await require('./harness-v2-vscode-ipc-alias.cjs').prepare({
+          journalPath: path.join(launchRoot, 'vscode-ipc-alias.json'),
+          targetPath: path.join(home, 'user-data'),
+          binding: { sessionId: processSessionId, reservationId: record.reservationId, targetKey: this.runner.targetKey },
+          processOwner: this.runner.processOwner,
+        })
+      }
+      if (this.provider === 'opencode' && process.platform === 'win32') {
+        // The target remains the canonical persistent session tree. This
+        // short alias projects only the provider child's path-sensitive
+        // HOME/XDG/TMP values after native.createLaunch has written them.
+        opencodeLaunchAlias = await require('./harness-v2-vscode-ipc-alias.cjs').prepare({
+          provider: 'opencode',
+          journalPath: path.join(launchRoot, 'opencode-launch-alias.json'),
+          targetPath: sessionRoot,
+          binding: { sessionId: processSessionId, reservationId: record.reservationId, targetKey: this.runner.targetKey },
+          processOwner: this.runner.processOwner,
+        })
+      }
+      if (this.provider === 'opencode' && process.platform === 'win32' && !routeProjection) {
+        opencodeTools = require('./harness-v2-tool-http.cjs').createServer({
+          boundary: toolBoundary, onFailure: stop,
+        })
+        opencodeToolTransport = await opencodeTools.listen()
+      }
+      if (this.provider === 'vscode') {
+        const descriptor = vscodeEventChannel.descriptor({ endpoint: vscodeEventEndpoint(launchRoot, vscodeIpcAlias, record), sessionId: record.sessionId, reservationId: record.reservationId })
+        vscodeEvents = vscodeEventChannel.createServer({ descriptor, allowAliasParent: process.platform === 'darwin',
+          onEvent: raw => { try { stream.push(raw) } catch (error) { stop(error); throw error } },
+          onFailure: error => stop(error),
+        })
+        await vscodeEvents.ready()
+        vscodeCompletionPromise = vscodeEvents.completion.then(() => {
+          vscodeCompletionSeen = true
+        }).catch(error => {
+          if (!streamError) stop(error)
+          throw error
+        })
+        // The stop path records the authoritative failure; this observer
+        // prevents an early channel rejection from becoming unhandled while
+        // the owned runner is draining.
+        vscodeCompletionPromise.catch(() => {})
+      }
+      spec = native.createLaunch({ provider: this.provider, executable: native.executableRuntimePath(binding), home: path.join(launchRoot, 'home'), ...(vscodeIpcAlias ? { vscodeUserDataDir: vscodeIpcAlias.userDataDir } : {}), ...(vscodeEvents ? { vscodeEventChannel: vscodeEvents.descriptor } : {}), sessionRoot, ...(grokPlatformSession ? { grokRuntimeProjection: grokPlatformSession.config.runtimeProjection } : {}), cwd, targetPath: candidatePath, readOnly, commandBoundary, toolBoundary, ...(opencodeToolTransport ? { opencodeToolTransport } : {}), toolFree: Boolean(routeProjection), prompt, input, continuationId: record.continuationId, connection: projectedConnection, credentials: this.credentialEnvironment, providerConnectionIdentity: this.connection, environment: record.environment, model: record.assignment?.model, effort: this.provider === 'grok' ? grokAssignedEffort : record.assignment?.effort, issuedCalls: preexistingIssuedCalls, proxyToken, maxTokens: nativeMaxTokens, outputSchema: ['claude', 'deepseek', 'grok', 'prime', 'omp'].includes(this.provider) || this.provider === 'vscode' && this.connection?.supportsStructuredOutput === true ? wireSchema : undefined, maxCompletionTokens: this.provider === 'grok' && Number.isSafeInteger(record.providerTokenLimit) && record.providerTokenLimit > 0 ? Math.min(4096, record.providerTokenLimit) : undefined })
+      if (opencodeLaunchAlias) projectOpenCodeWindowsAlias(opencodeLaunchAlias, sessionRoot, launchRoot, spec.env)
       if (requiredResponseFormat && boundary.canonicalJson(spec.requiredResponseFormat) !== boundary.canonicalJson(requiredResponseFormat)) fail('PROVIDER_UNSUPPORTED', 'Pi native schema differs from its owned provider boundary')
       // Native configuration isolation discards inherited control-looking fields.
       // Recreate the owner's reservation marker from its trusted adapter only
@@ -1354,7 +1719,7 @@ class HarnessExecAdapter {
         this.runner.processOwner.adapter, record.reservationId, spec.env)
       const prepareLaunch = this.provider !== 'grok' ? undefined : async ({ sessionRoot: relayRoot }) => {
         const config = spec.grok
-        const socketPath = path.join(relayRoot, 'grok-relay.sock')
+        const socketPath = process.platform === 'win32' ? createWindowsRelayPath() : path.join(relayRoot, 'grok-relay.sock')
         const hostMcp = createHostMcpRelay({ boundary: toolBoundary })
         const allowed = Object.fromEntries(Object.entries(config.allowedMcpTools).map(([name, tool]) => [name, input => boundary.validateArguments(tool, input)]))
         let history = [...preexistingIssuedCalls]
@@ -1432,6 +1797,30 @@ class HarnessExecAdapter {
           // therefore receives only this reservation-private working directory;
           // every task operation remains host-owned behind the authenticated MCP
           // relay and is never directly mounted in the native namespace.
+          if (grokPlatformSession) {
+            const platformLauncher = grokWindowsSession
+              ? require('./harness-v2-bridge/grok/windows-launch.cjs')
+              : require('./harness-v2-bridge/grok/darwin-launch.cjs')
+            const resource = await platformLauncher.prepareLaunch({
+              session: grokPlatformSession, sessionRoot, launchRoot, config: { ...config, issuedCalls: history }, spec,
+              pipe: { socketPath: relayConnectPath }, processOwner: this.runner.processOwner,
+              binding: { sessionId: processSessionId, reservationId: record.reservationId, targetKey: this.runner.targetKey },
+            })
+            return { ...resource, cleanup: async () => {
+              let resourceFailure
+              try { await resource.cleanup() } catch (error) { resourceFailure = error }
+              // Closing private communications cannot restore ACLs or release
+              // retained recovery resources. Always close them even when the
+              // owner cannot yet issue the required drain receipt.
+              const closed = await Promise.allSettled([relay.close(), hostMcp.close()])
+              const failures = closed.filter(item => item.status === 'rejected').map(item => item.reason)
+              if (resourceFailure) {
+                if (failures.length) Object.defineProperty(resourceFailure, 'relayCleanupFailure', { value: new AggregateError(failures, 'Grok host relay cleanup failed') })
+                throw resourceFailure
+              }
+              if (failures.length) throw new AggregateError(failures, 'Grok host relay cleanup failed')
+            } }
+          }
           const nativeCwd = path.join(launchRoot, 'grok-cwd')
           privateDirectory(nativeCwd)
           const launch = createSandboxLaunch({ root: launchRoot, sessionHome: config.sessionHome, grokExecutable: config.executable,
@@ -1449,18 +1838,78 @@ class HarnessExecAdapter {
       // owned child can flush exact usage and tool receipts while draining.
       // Keep validating those events; stop() preserves the first failure, and
       // the error below prevents any terminal result from being accepted.
+      if (streamError) throw streamError
       if (signal?.aborted) throw new native.HarnessError('CHILD_CANCELLED', 'Native execution was aborted during launch preparation')
       runnerStarted = true
       const invocation = spec.executable ? null : native.executableInvocation(binding, spec.argv)
-      result = await this.runner.run({ ...spec, ...(this.provider === 'grok' ? { prepareLaunch } : {}), executable: spec.executable || invocation.executable, argv: spec.executable ? spec.argv : invocation.argv, sessionId: processSessionId, reservationId: record.reservationId, onTransportActivity: record.onTransportActivity, onStdoutLine: line => { try { if (this.provider === 'vscode') { const marker = line.indexOf('AUTOPROMPT_EVENT '); if (marker < 0) return; line = line.slice(marker + 'AUTOPROMPT_EVENT '.length) } stream.push(line) } catch (error) { stop(error) } } })
+      if (vscodeIpcAlias) {
+        // Mark before entering the runner: even a rejected launch can leave a
+        // pending physical spawn that only the exact ProcessOwner can drain.
+        vscodeIpcAlias.markReservationEntered()
+        vscodeReservationEntered = true
+      }
+      if (opencodeLaunchAlias) {
+        // Like the VS Code alias, enter before runner admission because a
+        // rejected spawn can already have a pending owned child.
+        opencodeLaunchAlias.assertReady()
+        opencodeLaunchAlias.markReservationEntered()
+        opencodeReservationEntered = true
+      }
+      const drainAfterVscodeCompletion = async () => {
+        // The channel completion is only a drain trigger after the transport
+        // has itself accepted the terminal result; a bare channel close must
+        // never manufacture a successful native outcome.
+        if (!runnerStarted || runnerSettled || !vscodeCompletionSeen || streamError || vscodeCompletionStop) return
+        if (!stream.terminal) throw new native.HarnessError('CHILD_RESULT_MISSING', 'VS Code event channel completed before its authenticated terminal result')
+        vscodeCompletionDrainPromise ||= (async () => {
+          const stopped = await this.runner.stop({ sessionId: processSessionId, reason: 'VSCODE_EVENT_CHANNEL_COMPLETE', terminalStatus: 'DONE' })
+          // Natural completion can remove the runner session before this
+          // callback resumes. Its actual run result remains authoritative.
+          if (stopped?.alreadyTerminal === true && stopped.drained === true) return
+          const terminal = stopped?.terminal
+          const rootExit = terminal?.rootExit
+          const observedFailure = rootExit &&
+            ((rootExit.code !== undefined && rootExit.code !== 0) ||
+             (rootExit.signal !== undefined && rootExit.signal !== null))
+          if (stopped?.drained !== true || typeof stopped.ownershipId !== 'string' || !stopped.ownershipId ||
+              typeof stopped.groupIdentity !== 'string' || !stopped.groupIdentity ||
+              typeof stopped.reservationId !== 'string' || stopped.reservationId !== record.reservationId ||
+              stopped.ownershipId !== terminal?.ownershipId || stopped.groupIdentity !== terminal?.groupIdentity ||
+              terminal?.sessionId !== processSessionId || terminal.status !== 'DONE' || observedFailure) {
+            throw new native.HarnessError('PROCESS_DRAIN_TIMEOUT', 'VS Code completion did not return its exact DONE owner receipt')
+          }
+          vscodeCompletionStop = stopped
+        })()
+        await vscodeCompletionDrainPromise
+      }
+      if (vscodeCompletionPromise) {
+        vscodeCompletionPromise.then(async () => {
+          // Give a naturally exiting runner one scheduling turn to win the
+          // race. A completion frame is a drain trigger only while the owner
+          // is still live; it must not replace an already terminal failure.
+          await new Promise(resolve => setImmediate(resolve))
+          if (!runnerSettled) await drainAfterVscodeCompletion()
+        }).catch(error => stop(error))
+      }
+      try {
+        result = await this.runner.run({ ...spec, ...((vscodeIpcAlias || opencodeLaunchAlias) ? { launchBindingHash: (vscodeIpcAlias || opencodeLaunchAlias).launchBindingHash } : {}), ...(this.provider === 'grok' ? { prepareLaunch } : {}), executable: spec.executable || invocation.executable, argv: spec.executable ? spec.argv : invocation.argv, sessionId: processSessionId, reservationId: record.reservationId, onTransportActivity: record.onTransportActivity, onStdoutLine: line => { try { if (this.provider === 'vscode') return; stream.push(line) } catch (error) { stop(error) } } })
+      } finally { runnerSettled = true }
+      if (vscodeCompletionDrainPromise) await vscodeCompletionDrainPromise
+      vscodeEventsDrained = result?.drained === true
       if (!streamError && this.provider === 'grok') stream.grokReconcileIssuedCalls(grokIssuedHistory)
       const completedOwnedNativeResult = result?.processOwned === true && result.exactArgv === true && result.drained === true
       let termination = null
       if (completedOwnedNativeResult) {
         try { termination = nativeTerminationDetails(result) } catch (error) { primaryNativeFailure = error }
       }
+      const expectedVscodeCompletionStop = this.provider === 'vscode' && vscodeCompletionSeen &&
+        vscodeCompletionStop?.terminal?.status === 'DONE' && result?.signal === 'OWNED_STOP' &&
+        (!result?.observedTermination || result.observedTermination.exitCode === 0 && result.observedTermination.signal === null)
+      if (vscodeEvents && (termination?.exitCode === 0 && termination?.signal === null && !result?.aborted || expectedVscodeCompletionStop)) {
+        vscodeEvents.assertComplete()
+      }
       const nativeExitUnsuccessful = Boolean(primaryNativeFailure) ||
-        termination?.exitCode !== 0 || termination?.signal !== null || result?.aborted
+        termination?.exitCode !== 0 || (termination?.signal !== null && !expectedVscodeCompletionStop) || result?.aborted
       // A clean native result may still have an admitted provider request that
       // has no exact receipt. Its close abort must remain a conservative
       // accounting failure. Only an already-terminal process failure can
@@ -1473,15 +1922,51 @@ class HarnessExecAdapter {
       }
     } catch (error) { stop(error) } finally {
       signal?.removeEventListener('abort', abort)
+      try { await closeOpenCodeTools() } catch (error) {
+        if (!streamError) stop(error)
+        else { try { Object.defineProperty(streamError, 'opencodeToolCleanupFailure', { value: error, enumerable: false, configurable: true }) } catch {} }
+      }
       if (quotaRelay) {
         try { await quotaRelay.close() } catch (error) {
           if (!(closingAfterNativeResult && relayCleanupAbort(error))) stop(error)
         }
       }
+      try { await boundary.drainDarwinCommandOwner(toolBoundary) } catch (error) { stop(error) }
     }
-    if (stopPromise) {
-      const stopped = await stopPromise
-      if (stopped?.drained !== true) fail('PROCESS_DRAIN_TIMEOUT', 'Native cancellation did not drain its owned process group')
+    try {
+      if (stopPromise) {
+        const stopped = await stopPromise
+        if (stopped?.drained !== true) fail('PROCESS_DRAIN_TIMEOUT', 'Native cancellation did not drain its owned process group')
+        vscodeEventsDrained = true
+      }
+    } finally {
+      // The Darwin socket lives below the authenticated short alias. Close and
+      // identity-check it before releasing that alias to avoid a cleanup path
+      // resolving through an already-retired link.
+      if (vscodeEvents && (!runnerStarted || vscodeEventsDrained)) {
+        try { await vscodeEvents.close() } catch (error) {
+          if (!streamError) streamError = error
+          else { try { Object.defineProperty(streamError, 'vscodeEventChannelCleanupFailure', { value: error, enumerable: false, configurable: true }) } catch {} }
+        }
+      } else if (vscodeEvents) vscodeEvents.retain()
+      if (vscodeIpcAlias) {
+        try {
+          if (vscodeReservationEntered) await vscodeIpcAlias.release()
+          else await vscodeIpcAlias.abortBeforeReservation()
+        } catch (error) {
+          if (!streamError) streamError = error
+          else { try { Object.defineProperty(streamError, 'ipcAliasCleanupFailure', { value: error, enumerable: false, configurable: true }) } catch {} }
+        }
+      }
+      if (opencodeLaunchAlias) {
+        try {
+          if (opencodeReservationEntered) await opencodeLaunchAlias.release()
+          else await opencodeLaunchAlias.abortBeforeReservation()
+        } catch (error) {
+          if (!streamError) streamError = error
+          else { try { Object.defineProperty(streamError, 'opencodeAliasCleanupFailure', { value: error, enumerable: false, configurable: true }) } catch {} }
+        }
+      }
     }
     // A real relay/accounting or drain failure remains authoritative.  Only
     // the private relay's expected shutdown abort yields to the already-known
@@ -1491,7 +1976,10 @@ class HarnessExecAdapter {
     if (primaryNativeFailure) throw primaryNativeFailure
     controlled.assertStopped(toolBoundary)
     const termination = nativeTerminationDetails(result)
-    if (termination.exitCode !== 0 || termination.signal !== null || result.aborted) fail('CHILD_RUNTIME_FAILURE', 'Native child exited unsuccessfully', termination)
+    const expectedVscodeCompletionStop = this.provider === 'vscode' && vscodeCompletionSeen &&
+      vscodeCompletionStop?.terminal?.status === 'DONE' && result?.signal === 'OWNED_STOP' &&
+      (!result?.observedTermination || result.observedTermination.exitCode === 0 && result.observedTermination.signal === null)
+    if (termination.exitCode !== 0 || (termination.signal !== null && !expectedVscodeCompletionStop) || result.aborted) fail('CHILD_RUNTIME_FAILURE', 'Native child exited unsuccessfully', termination)
     const parsed = stream.finish()
     if (quotaRelay) {
       const authoritative = quotaRelay.snapshot().cumulative

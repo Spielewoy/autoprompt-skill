@@ -9,7 +9,7 @@ const cp = require('node:child_process')
 // tools, native event encoding, session storage and cancellation remain the SUT.
 async function modelService(provider, tool, options = {}) {
   const requests = [], errors = []
-  let completed = 0, toolRequested = false, delayConsumed = false
+  let completed = 0, toolRequested = false, delayConsumed = false, holdConsumed = false, heldFirstMessage = false, releaseHeldFirstMessage = null
   const server = http.createServer(async (req, res) => {
     try {
       let body = ''
@@ -40,8 +40,35 @@ async function modelService(provider, tool, options = {}) {
         delayConsumed = true
         await new Promise(resolve => setTimeout(resolve, options.delayMessagesMs))
       }
+      // Hold before assigning a tool response: an aborted first conversation
+      // must not consume the command intended for the independent live sibling.
+      if (options.holdFirstMessage && !holdConsumed) {
+        holdConsumed = true
+        await new Promise(resolve => {
+          let settled = false
+          const release = () => {
+            if (settled) return
+            settled = true
+            heldFirstMessage = false
+            releaseHeldFirstMessage = null
+            res.off('close', release)
+            resolve()
+          }
+          heldFirstMessage = true
+          releaseHeldFirstMessage = release
+          res.once('close', release)
+        })
+        if (res.destroyed) return
+      }
       const advertised = (value.tools || []).some(item => (item.name || item.function?.name) === tool.name)
-      const first = !options.noTool && !toolRequested && (advertised || options.forceFirstTool === true)
+      // Concurrent Claude conversations must each receive their own command.
+      // Their returned assistant history, rather than a shared endpoint flag,
+      // distinguishes the initial request from its tool-result continuation.
+      const requestedInConversation = provider === 'claude' && options.toolPerConversation === true
+        ? Array.isArray(value.messages) && value.messages.some(message => message?.role === 'assistant' &&
+          Array.isArray(message.content) && message.content.some(block => block?.type === 'tool_use' && block.id === 'fixture-native-read' && block.name === tool.name))
+        : toolRequested
+      const first = !options.noTool && !requestedInConversation && (advertised || options.forceFirstTool === true)
       if (first) toolRequested = true
       const structuredTool = (value.tools || []).find(item => {
         const name = item.name || item.function?.name
@@ -137,8 +164,13 @@ async function modelService(provider, tool, options = {}) {
   })
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   return { url: `http://127.0.0.1:${server.address().port}`, requests, errors, tool,
+    get firstMessageHeld() { return heldFirstMessage },
     get completed() { return completed },
-    close: () => new Promise(resolve => { server.closeAllConnections(); server.close(resolve) }) }
+    close: () => new Promise(resolve => {
+      releaseHeldFirstMessage?.()
+      server.closeAllConnections()
+      server.close(resolve)
+    }) }
 }
 
 function runNative(executable, launch, options = {}) {

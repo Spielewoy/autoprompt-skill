@@ -39,7 +39,7 @@ function physicalPython() {
 }
 
 function fixture(t) {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-darwin-wrapper-')))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-darwin-wrapper-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const helper = path.join(root, 'helper.py')
   fs.copyFileSync(sourceHelper, helper)
@@ -62,9 +62,9 @@ const python = physicalPython()
 const linuxExercise = process.platform === 'linux' && Boolean(python)
 
 test('Darwin runtime closure manifest binds an exact controller-owned Python/helper set', t => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-runtime-closure-')))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-runtime-closure-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const interpreter = fs.realpathSync(python || process.execPath)
+  const interpreter = fs.realpathSync.native(python || process.execPath)
   const copiedHelper = path.join(root, 'helper.py')
   fs.copyFileSync(sourceHelper, copiedHelper)
   fs.chmodSync(copiedHelper, 0o600)
@@ -86,7 +86,7 @@ test('Darwin runtime closure manifest binds an exact controller-owned Python/hel
 })
 
 for (const platform of ['darwin', 'win32']) test(`${platform} runtime-state hash dispatch accepts only an exact typed capture result`, t => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-runtime-dispatch-')))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'darwin-runtime-dispatch-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const target = path.join(root, 'target')
   fs.mkdirSync(target, { mode: 0o700 })
@@ -95,8 +95,9 @@ for (const platform of ['darwin', 'win32']) test(`${platform} runtime-state hash
     `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} })`,
     `const fs=require('node:fs'), r=require(${JSON.stringify(runtimePath)})`,
     `const target=${JSON.stringify(target)}`,
-    "const shim=Object.create(fs), s=fs.lstatSync(target), root={type:'directory',path:'',stat:{dev:String(s.dev),ino:String(s.ino),mode:s.mode,nlink:s.nlink,size:s.size,mtimeNs:'0',ctimeNs:'0'}}; shim.darwinCapture={captureFile:()=>({hash:'a'.repeat(64),bytes:0,entries:[]}),captureTree:(value)=>{if(value!==target)throw Error('wrong path');return {hash:'b'.repeat(64),bytes:0,entries:[root]}}}",
+    "const shim=Object.create(fs), s=fs.lstatSync(target,{bigint:process.platform==='win32'}), root={type:'directory',path:'',stat:{dev:String(s.dev),ino:String(s.ino),mode:Number(s.mode),nlink:Number(s.nlink),size:Number(s.size),mtimeNs:'0',ctimeNs:'0'}}; shim.darwinCapture={captureFile:()=>({hash:'a'.repeat(64),bytes:0,entries:[]}),captureTree:(value)=>{if(value!==target)throw Error('wrong path');return {hash:'b'.repeat(64),bytes:0,entries:[root]}}}",
     "if(r.hashFileStrict(target,shim)!=='a'.repeat(64)||r.hashDirectoryStateStrict(target,shim)!=='b'.repeat(64))process.exit(2)",
+    "root.stat.ino=String(BigInt(root.stat.ino)+1n);try{r.hashDirectoryStateStrict(target,shim);process.exit(5)}catch(error){if(error.code!=='PREIMAGE_UNSAFE')process.exit(6)}",
     "shim.darwinCapture.captureTree=()=>({hash:'bad',bytes:0,entries:[]});try{r.hashDirectoryStateStrict(target,shim);process.exit(3)}catch(error){if(error.code!=='PREIMAGE_UNSAFE')process.exit(4)}",
   ].join(';').replaceAll('darwinCapture', platform === 'darwin' ? 'darwinCapture' : 'windowsCapture')
   const result = childProcess.spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', timeout: 10000 })

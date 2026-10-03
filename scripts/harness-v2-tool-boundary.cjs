@@ -7,11 +7,10 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const cp = require('node:child_process')
 const { readBound, writePrivate, privateDirectory, sha256 } = require('../agents/reasonix/workflow/native.js')
+const { windowsControllerEnvironment } = require('../agents/codex/workflow/safe-run-root.js')
+const { BoundaryError, OUTPUT_LIMIT, TOOLS, validateArguments } = require('./harness-v2-bridge/grok/tool-schema.cjs')
 const PROVIDERS = new Set(['claude', 'opencode', 'kilo', 'prime', 'omp', 'deepseek', 'vscode', 'reasonix', 'hermes', 'grok'])
-const OUTPUT_LIMIT = 1024 * 1024
-class BoundaryError extends Error {
-  constructor(code, message) { super(message); this.name = 'BoundaryError'; this.code = code }
-}
+const MAX_POLICY_BYTES = 4 * OUTPUT_LIMIT
 function fail(code, message) { throw new BoundaryError(code, message) }
 function canonicalJson(value) {
   const order = item => Array.isArray(item) ? item.map(order) : item && typeof item === 'object'
@@ -55,15 +54,48 @@ function ownedDirectory(file) {
   return root
 }
 function validatePolicy(input) {
-  const allowed = new Set(['schemaVersion', 'provider', 'activationId', 'sessionId', 'reservationId', 'readOnly',
-    'targetPath', 'scratchPath', 'readableRoots', 'writableRoots', 'nestedDispatch', 'commandBoundary', 'externalWrites', 'toolFree'])
+  const allowed = new Set(['schemaVersion', 'provider', 'activationId', 'generation', 'sessionId', 'reservationId', 'readOnly',
+    'targetPath', 'scratchPath', 'readableRoots', 'writableRoots', 'nestedDispatch', 'commandBoundary', 'externalWrites', 'toolFree', 'darwinCommandOwner', 'windowsControllerNode', 'windowsControllerProfile'])
   if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !allowed.has(key)) ||
       !PROVIDERS.has(input.provider) || typeof input.readOnly !== 'boolean' || input.nestedDispatch !== false ||
       input.commandBoundary !== true || input.externalWrites !== false ||
       (input.toolFree !== undefined && typeof input.toolFree !== 'boolean') ||
       (input.schemaVersion !== undefined && input.schemaVersion !== 1)) fail('TOOL_POLICY_INVALID', 'Invalid controller tool policy')
+  if (input.darwinCommandOwner !== undefined) {
+    const owner = input.darwinCommandOwner
+    if (!owner || typeof owner !== 'object' || Array.isArray(owner) ||
+        Object.keys(owner).sort().join(',') !== 'controlRoot,manifestRoot,nodeExecutable,providerPrivateOwnershipRoot,registryPath,schemaVersion,stateRoot' ||
+        owner.schemaVersion !== 1 || ['manifestRoot', 'providerPrivateOwnershipRoot', 'stateRoot', 'registryPath', 'controlRoot'].some(key => typeof owner[key] !== 'string' || !path.isAbsolute(owner[key]) || owner[key].includes('\0'))) {
+      fail('TOOL_POLICY_INVALID', 'Invalid Darwin command ownership descriptor')
+    }
+    if (!owner.nodeExecutable || Object.keys(owner.nodeExecutable).sort().join(',') !== 'path,sha256' ||
+        typeof owner.nodeExecutable.path !== 'string' || !path.isAbsolute(owner.nodeExecutable.path) || owner.nodeExecutable.path.includes('\0') ||
+        !/^[a-f0-9]{64}$/.test(owner.nodeExecutable.sha256 || '')) fail('TOOL_POLICY_INVALID', 'Invalid Darwin controller Node binding')
+  }
+  if (input.windowsControllerNode !== undefined) {
+    if (process.platform !== 'win32') fail('TOOL_POLICY_INVALID', 'Windows controller Node binding is not valid on this platform')
+    const node = input.windowsControllerNode
+    if (!node || typeof node !== 'object' || Array.isArray(node) || Object.keys(node).sort().join(',') !== 'path,sha256' ||
+        typeof node.path !== 'string' || !path.isAbsolute(node.path) || node.path.includes('\0') || !/^[a-f0-9]{64}$/.test(node.sha256 || '')) {
+      fail('TOOL_POLICY_INVALID', 'Invalid Windows controller Node binding')
+    }
+  }
+  if (input.windowsControllerProfile !== undefined) {
+    if (process.platform !== 'win32') fail('TOOL_POLICY_INVALID', 'Windows controller profile binding is not valid on this platform')
+    const profile = input.windowsControllerProfile
+    if (!profile || typeof profile !== 'object' || Array.isArray(profile) || Object.keys(profile).sort().join(',') !== 'localAppData,profileHome,roamingAppData' ||
+        ![profile.profileHome, profile.localAppData, profile.roamingAppData].every(value => typeof value === 'string' && /^[A-Za-z]:\\/u.test(value) && !value.includes('\0') && value.length <= 32768)) {
+      fail('TOOL_POLICY_INVALID', 'Invalid Windows controller profile binding')
+    }
+    const home = path.win32.resolve(profile.profileHome), local = path.win32.resolve(profile.localAppData), roaming = path.win32.resolve(profile.roamingAppData)
+    if (local.toLowerCase() !== path.win32.join(home, 'AppData', 'Local').toLowerCase() ||
+        roaming.toLowerCase() !== path.win32.join(home, 'AppData', 'Roaming').toLowerCase()) {
+      fail('TOOL_POLICY_INVALID', 'Inconsistent Windows controller profile binding')
+    }
+  }
   for (const key of ['activationId', 'sessionId', 'reservationId']) if (input[key] !== undefined &&
       (typeof input[key] !== 'string' || !input[key] || input[key].length > 512 || input[key].includes('\0'))) fail('TOOL_POLICY_INVALID', 'Invalid tool policy identity')
+  if (input.generation !== undefined && (!Number.isSafeInteger(input.generation) || input.generation < 1)) fail('TOOL_POLICY_INVALID', 'Invalid tool policy generation')
   const targetPath = directory(input.targetPath)
   const scratchPath = input.scratchPath ? directory(input.scratchPath) : null
   if (scratchPath && (within(targetPath, scratchPath) || within(scratchPath, targetPath))) fail('TOOL_POLICY_INVALID', 'Checker scratch must be physically disjoint from the candidate')
@@ -79,29 +111,6 @@ function validatePolicy(input) {
     fail('TOOL_POLICY_INVALID', 'Tool roots expand beyond their controller assignment')
   }
   return { ...input, schemaVersion: 1, targetPath, ...(scratchPath ? { scratchPath } : {}), readableRoots, writableRoots }
-}
-function schema(properties, required) { return { type: 'object', properties, required, additionalProperties: false } }
-const text = { type: 'string' }, integer = { type: 'integer', minimum: 1 }
-const TOOLS = Object.freeze([
-  { name: 'read', description: 'Read a bounded text range from an assigned physical file.', inputSchema: schema({ path: text, startLine: integer, lineCount: { ...integer, maximum: 5000 } }, ['path']) },
-  { name: 'list', description: 'List an assigned directory without following links.', inputSchema: schema({ path: text }, ['path']) },
-  { name: 'search', description: 'Find literal text in assigned files; no regular-expression execution.', inputSchema: schema({ path: text, text, maxResults: { ...integer, maximum: 200 } }, ['path', 'text']) },
-  { name: 'write', description: 'Atomically write an explicitly authorized task or checker scratch file.', inputSchema: schema({ path: text, content: text }, ['path', 'content']) },
-  { name: 'edit', description: 'Replace exact text in an authorized file. Ambiguous matches fail.', inputSchema: schema({ path: text, oldText: text, newText: text, replaceAll: { type: 'boolean' } }, ['path', 'oldText', 'newText']) },
-  { name: 'bash', description: 'Run a foreground command in the assigned OS sandbox with no outbound network or host credentials.', inputSchema: schema({ command: text, cwd: text, timeoutMs: { ...integer, maximum: 300000 } }, ['command']) },
-])
-function validateArguments(name, args) {
-  const tool = TOOLS.find(item => item.name === name)
-  if (!tool) fail('TOOL_DENIED', 'The controller does not expose that tool')
-  if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).some(key => !Object.hasOwn(tool.inputSchema.properties, key)) ||
-      tool.inputSchema.required.some(key => !Object.hasOwn(args, key))) fail('TOOL_ARGUMENTS_INVALID', 'Tool arguments do not match the fixed schema')
-  for (const [key, value] of Object.entries(args)) {
-    const spec = tool.inputSchema.properties[key]
-    if ((spec.type === 'string' && (typeof value !== 'string' || value.includes('\0') || Buffer.byteLength(value) > 4 * OUTPUT_LIMIT)) ||
-        (spec.type === 'boolean' && typeof value !== 'boolean') ||
-        (spec.type === 'integer' && (!Number.isSafeInteger(value) || value < spec.minimum || value > (spec.maximum || Number.MAX_SAFE_INTEGER)))) fail('TOOL_ARGUMENTS_INVALID', `Invalid ${key} argument`)
-  }
-  return tool
 }
 function authorize(policy, file, write = false) {
   const absolute = physical(path.isAbsolute(file) ? file : path.resolve(policy.targetPath, file), { missingLeaf: write })
@@ -135,7 +144,7 @@ function safeEnvironment() {
     return { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2),
       PATH: [path.dirname(process.execPath), path.join(systemRoot, 'System32')].join(path.delimiter),
       ComSpec: path.join(systemRoot, 'System32', 'cmd.exe'), PATHEXT: '.COM;.EXE;.BAT;.CMD', LOCALAPPDATA: process.env.LOCALAPPDATA || '',
-      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: 'NUL', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0',
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ALLOW_PROTOCOL: '', GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_COUNT: '3', GIT_CONFIG_KEY_0: 'push.default', GIT_CONFIG_VALUE_0: 'nothing',
       GIT_CONFIG_KEY_1: 'credential.helper', GIT_CONFIG_VALUE_1: '', GIT_CONFIG_KEY_2: 'core.sshCommand', GIT_CONFIG_VALUE_2: 'cmd /d /c exit 1' }
   }
@@ -198,6 +207,17 @@ async function command(policy, args, options = {}) {
     throw error
   }
   if (process.platform === 'win32') return require('../agents/codex/workflow/windows-appcontainer-command.js').runWindowsAppContainerCommand(policy, { ...args, cwd }, options)
+  if (process.platform === 'darwin') {
+    const owner = policy.darwinCommandOwner
+    if (!owner || typeof policy.activationId !== 'string' || !Number.isSafeInteger(policy.generation)) fail('TOOL_POLICY_INVALID', 'Darwin commands require registered activation-bound ownership')
+    const backend = require('./darwin-command-sandbox.cjs').createDarwinCommandSandbox({
+      controlRoot: owner.stateRoot, ownershipControlRoot: owner.controlRoot, registryPath: owner.registryPath,
+      providerPrivateOwnershipRoot: owner.providerPrivateOwnershipRoot,
+      activationId: policy.activationId, generationId: policy.generation,
+      nodeExecutable: owner.nodeExecutable,
+    })
+    return backend.command(policy, { ...args, cwd }, options)
+  }
   const argv = [...sandboxArguments(policy, cwd), '-c', args.command]
   const start = Date.now()
   return new Promise((resolve, reject) => {
@@ -283,25 +303,132 @@ async function executeTool(rawPolicy, name, args, options = {}) {
   if (Buffer.byteLength(output) > OUTPUT_LIMIT) fail('TOOL_OUTPUT_LIMIT', 'Tool output exceeds its bounded response size')
   return { tool: name, status: 'completed', exitCode: 0, output, outputSha256: sha256(output), ...details }
 }
-function prepareBoundary({ provider, root, policy }) {
+function windowsControllerNodeBinding() {
+  if (process.release?.name !== 'node' || process.versions?.bun || process.versions?.electron) fail('TOOL_POLICY_INVALID', 'Windows tool policy must be minted by the outer Node controller')
+  const nodePath = physical(process.execPath), item = fs.lstatSync(nodePath)
+  if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1 || item.size < 1 || item.size > 512 * 1024 * 1024) fail('TOOL_POLICY_INVALID', 'Windows controller Node is not a bounded physical executable')
+  return Object.freeze({ path: nodePath, sha256: sha256(fs.readFileSync(nodePath)) })
+}
+function windowsControllerProfileBinding() {
+  const environment = windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR)
+  return Object.freeze({ profileHome: environment.USERPROFILE, localAppData: environment.LOCALAPPDATA, roamingAppData: environment.APPDATA })
+}
+function prepareBoundary({ provider, root, policy, darwinCommandOwner }) {
+  if (policy?.windowsControllerNode !== undefined || policy?.windowsControllerProfile !== undefined) fail('TOOL_POLICY_INVALID', 'Windows controller bindings are minted only by the outer controller')
   const parent = ownedDirectory(root)
-  const normalized = validatePolicy({ ...policy, provider })
+  let normalized = validatePolicy({ ...policy, provider })
+  if (process.platform === 'win32') normalized = validatePolicy({ ...normalized, windowsControllerNode: windowsControllerNodeBinding(),
+    ...(['prime', 'omp'].includes(provider) ? { windowsControllerProfile: windowsControllerProfileBinding() } : {}) })
   if ([...normalized.readableRoots, ...normalized.writableRoots].some(task => within(task, parent) || within(parent, task))) fail('TOOL_POLICY_INVALID', 'Controller state must be disjoint from all task roots')
   const directory = path.join(parent, `tools-${crypto.randomUUID()}`)
   fs.mkdirSync(directory, { mode: 0o700 })
+  if (process.platform === 'win32') require('../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(directory)
   const policyPath = path.join(directory, 'policy.json'), receiptPath = path.join(directory, 'receipts.jsonl')
+  let registeredCommandOwner = null
+  if (darwinCommandOwner !== undefined) {
+    if (process.platform !== 'darwin' || !darwinCommandOwner || typeof darwinCommandOwner !== 'object' || Array.isArray(darwinCommandOwner) ||
+        Object.keys(darwinCommandOwner).sort().join(',') !== 'manifestRoot,providerPrivateOwnershipRoot' ||
+        typeof normalized.activationId !== 'string' || !Number.isSafeInteger(normalized.generation) || normalized.generation < 1) fail('TOOL_POLICY_INVALID', 'Darwin command ownership requires an activation-bound policy')
+    const { STATE_CHILD } = require('./harness-v2-command-owner-discovery.cjs')
+    const nodePath = physical(process.execPath), nodeItem = fs.lstatSync(nodePath)
+    if (!nodeItem.isFile() || nodeItem.isSymbolicLink()) fail('TOOL_POLICY_INVALID', 'Darwin controller Node is not a physical executable')
+    const owner = { schemaVersion: 1, manifestRoot: darwinCommandOwner.manifestRoot, providerPrivateOwnershipRoot: darwinCommandOwner.providerPrivateOwnershipRoot,
+      stateRoot: path.join(directory, STATE_CHILD), registryPath: path.join(directory, STATE_CHILD, 'processes.json'), controlRoot: path.join(directory, STATE_CHILD, 'process-control'),
+      nodeExecutable: { path: nodePath, sha256: sha256(fs.readFileSync(nodePath)) } }
+    if (!ownedDirectory(owner.providerPrivateOwnershipRoot) || !within(owner.providerPrivateOwnershipRoot, directory)) fail('TOOL_POLICY_INVALID', 'Darwin command ownership root does not contain policy state')
+    normalized = validatePolicy({ ...normalized, darwinCommandOwner: owner })
+  }
   const bytes = canonicalJson(normalized), policySha256 = sha256(bytes)
   writePrivate(policyPath, bytes); writePrivate(receiptPath, '')
-  return { root: directory, policy: normalized, policyPath, policySha256, receiptPath,
-    serverSpec: { command: process.execPath, args: [path.join(__dirname, 'harness-v2-tool-server.cjs'), '--policy', policyPath, '--sha256', policySha256],
+  if (normalized.darwinCommandOwner) {
+    const discovery = require('./harness-v2-command-owner-discovery.cjs')
+    registeredCommandOwner = discovery.register(policyPath, policySha256, normalized.darwinCommandOwner.manifestRoot, { provider: normalized.provider, activationId: normalized.activationId, generation: normalized.generation })
+    for (const key of ['stateRoot', 'registryPath', 'controlRoot']) if (registeredCommandOwner[key] !== normalized.darwinCommandOwner[key]) fail('TOOL_POLICY_INVALID', 'Darwin command ownership descriptor differs from its registered policy')
+  }
+  return { root: directory, policy: normalized, policyPath, policySha256, receiptPath, ...(registeredCommandOwner ? { darwinCommandOwner: normalized.darwinCommandOwner } : {}),
+    serverSpec: { command: normalized.darwinCommandOwner?.nodeExecutable.path || (process.platform === 'win32' ? normalized.windowsControllerNode.path : process.execPath), args: [path.join(__dirname, 'harness-v2-tool-server.cjs'), '--policy', policyPath, '--sha256', policySha256],
       env: { ...safeEnvironment(), HOME: directory, TMPDIR: directory, ...(process.platform === 'win32' ? { TEMP: directory, TMP: directory } : {}) } } }
 }
-function loadBoundary(policyPath, policySha256) {
+async function drainDarwinCommandOwner(prepared) {
+  if (!prepared?.darwinCommandOwner) return { discovered: 0 }
+  const owner = prepared.darwinCommandOwner, policy = prepared.policy
+  const discovery = require('./harness-v2-command-owner-discovery.cjs')
+  const drained = await discovery.drainOneAuthenticated(prepared.policyPath, prepared.policySha256, owner.manifestRoot, { provider: policy.provider, activationId: policy.activationId, generation: policy.generation }, { providerPrivateOwnershipRoot: owner.providerPrivateOwnershipRoot })
+  // A normal transport has just proved this exact secondary coalition drained.
+  // Remove only its sealed canary pointer; an error above deliberately leaves
+  // it durable for crash/canary recovery.
+  discovery.unregisterCanaryDiscovery(prepared.policyPath, prepared.policySha256, owner)
+  return drained
+}
+function validateLoadedDarwinCommandOwner(policy, root) {
+  const owner = policy.darwinCommandOwner
+  if (!owner) return null
+  const { STATE_CHILD } = require('./harness-v2-command-owner-discovery.cjs')
+  const expected = { stateRoot: path.join(root, STATE_CHILD), registryPath: path.join(root, STATE_CHILD, 'processes.json'), controlRoot: path.join(root, STATE_CHILD, 'process-control') }
+  if (Object.keys(owner).sort().join(',') !== 'controlRoot,manifestRoot,nodeExecutable,providerPrivateOwnershipRoot,registryPath,schemaVersion,stateRoot' || owner.schemaVersion !== 1 ||
+      Object.keys(expected).some(key => owner[key] !== expected[key]) || !path.isAbsolute(owner.manifestRoot) || !path.isAbsolute(owner.providerPrivateOwnershipRoot) ||
+      !owner.nodeExecutable || Object.keys(owner.nodeExecutable).sort().join(',') !== 'path,sha256' || !path.isAbsolute(owner.nodeExecutable.path || '') || owner.nodeExecutable.path.includes('\0') || !/^[a-f0-9]{64}$/.test(owner.nodeExecutable.sha256 || '') ||
+      !within(owner.providerPrivateOwnershipRoot, root)) fail('TOOL_POLICY_INVALID', 'Darwin command ownership descriptor differs from its policy root')
+  return owner
+}
+// This is the only policy read permitted before a Windows Bun host binds its
+// sealed token profile. It deliberately performs no Windows filesystem capture:
+// that capture needs private compiler storage whose environment is derived from
+// the profile. Full loadBoundary below repeats every check after the bind.
+function readPreloadedPolicy(file) {
+  const before = fs.lstatSync(file)
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || !Number.isSafeInteger(before.size) || before.size < 1 || before.size > MAX_POLICY_BYTES) {
+    fail('TOOL_POLICY_INVALID', 'Tool policy is not a bounded physical file')
+  }
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+  try {
+    const opened = fs.fstatSync(fd)
+    if (!opened.isFile() || opened.nlink !== 1 || opened.ino !== before.ino || opened.dev !== before.dev ||
+        !Number.isSafeInteger(opened.size) || opened.size < 1 || opened.size > MAX_POLICY_BYTES) {
+      fail('TOOL_POLICY_INVALID', 'Tool policy changed while opening')
+    }
+    const buffer = Buffer.allocUnsafe(opened.size + 1)
+    let offset = 0
+    while (offset < buffer.length) {
+      const count = fs.readSync(fd, buffer, offset, buffer.length - offset, offset)
+      if (count === 0) break
+      offset += count
+    }
+    const after = fs.lstatSync(file)
+    if (offset !== opened.size || after.ino !== opened.ino || after.dev !== opened.dev || after.size !== opened.size ||
+        after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) {
+      fail('TOOL_POLICY_INVALID', 'Tool policy changed while reading')
+    }
+    return buffer.subarray(0, offset)
+  } finally { fs.closeSync(fd) }
+}
+function preloadBoundary(policyPath, policySha256) {
   if (!/^[a-f0-9]{64}$/.test(policySha256 || '')) fail('TOOL_POLICY_INVALID', 'Tool policy digest is invalid')
-  const root = ownedDirectory(path.dirname(physical(policyPath)))
-  const bytes = readBound(policyPath)
-  if (sha256(bytes) !== policySha256 || path.basename(policyPath) !== 'policy.json') fail('TOOL_POLICY_INVALID', 'Tool policy bytes changed')
-  return { root, policyPath, policySha256, policy: validatePolicy(JSON.parse(bytes)), receiptPath: path.join(root, 'receipts.jsonl') }
+  const canonicalPolicyPath = physical(policyPath)
+  const root = ownedDirectory(path.dirname(canonicalPolicyPath))
+  const bytes = readPreloadedPolicy(canonicalPolicyPath)
+  if (sha256(bytes) !== policySha256 || path.basename(canonicalPolicyPath) !== 'policy.json') fail('TOOL_POLICY_INVALID', 'Tool policy bytes changed')
+  let input
+  try { input = JSON.parse(bytes) } catch { fail('TOOL_POLICY_INVALID', 'Tool policy bytes do not decode') }
+  const policy = validatePolicy(input)
+  return { root, policyPath: canonicalPolicyPath, policySha256, policy }
+}
+function loadBoundary(policyPath, policySha256) {
+  const preloaded = preloadBoundary(policyPath, policySha256)
+  // Windows must re-read after its ACL-backed parent capture. Other platforms
+  // have no intervening authority check and retain the single verified read.
+  let loaded = preloaded
+  if (process.platform === 'win32') {
+    const windowsFilesystem = require('../agents/codex/workflow/windows-filesystem.js')
+    const capture = windowsFilesystem.createWindowsFilesystemCapture({
+      ...(process.versions?.bun && preloaded.policy.windowsControllerProfile
+        ? { windowsControllerProfile: preloaded.policy.windowsControllerProfile } : {}),
+    })
+    capture.assertRecordParent(preloaded.policyPath)
+    loaded = preloadBoundary(preloaded.policyPath, policySha256)
+  }
+  const darwinCommandOwner = validateLoadedDarwinCommandOwner(loaded.policy, loaded.root)
+  return { ...loaded, ...(darwinCommandOwner ? { darwinCommandOwner } : {}), receiptPath: path.join(loaded.root, 'receipts.jsonl') }
 }
 function readReceipts(boundary) {
   const current = loadBoundary(boundary.policyPath, boundary.policySha256)
@@ -332,12 +459,43 @@ function appendReceipt(boundary, name, args, result, startedAt) {
   } finally { fs.closeSync(fd) }
   return record
 }
+// Static diagnostics do not certify kernel isolation. The dynamic probe still
+// proves the actual sandbox before a transport can launch a mission.
+function assertCommandSandboxPrerequisites(options = {}) {
+  const platform = options.platform || process.platform
+  if (platform === 'linux') {
+    for (const file of ['/usr/bin/bwrap', '/bin/bash']) {
+      try {
+        if (!fs.statSync(file).isFile()) throw new Error('not a regular file')
+        fs.accessSync(file, fs.constants.X_OK)
+      } catch {
+        fail('COMMAND_SANDBOX_UNSUPPORTED', `Linux command boundary requires executable ${file}; install ${file.endsWith('bwrap') ? 'bubblewrap' : 'Bash'} before activation`)
+      }
+    }
+    return { backend: 'bubblewrap' }
+  }
+  if (platform === 'win32') {
+    const environment = require('../agents/codex/workflow/process-owner.js').normalizeWindowsChildEnvironment(options.env || process.env)
+    const systemRoot = environment.SYSTEMROOT
+    if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/i.test(systemRoot)) fail('COMMAND_SANDBOX_UNSUPPORTED', 'Windows system root is unavailable')
+    const runtime = require('../agents/codex/workflow/windows-worker-loader.js').staticAvailability()
+    if (!runtime.available) fail('COMMAND_SANDBOX_UNSUPPORTED', `The packaged Windows worker bundle is unavailable: ${runtime.code}`)
+    return { backend: 'windows-appcontainer', manifestSha256: runtime.manifestSha256, scope: runtime.scope }
+  }
+  if (platform === 'darwin') {
+    const helper = require('../agents/codex/workflow/darwin-coalition-loader.js').loadDarwinCoalitionHelper()
+    for (const executable of ['/usr/bin/sandbox-exec', '/bin/sh', '/bin/bash', '/bin/launchctl']) fs.accessSync(executable, fs.constants.X_OK)
+    return { backend: 'darwin-seatbelt-coalition', helperSha256: helper.sha256 }
+  }
+  fail('COMMAND_SANDBOX_UNSUPPORTED', 'This platform has no supported native command sandbox; use the documented Linux VM runtime')
+}
 async function probeCommandSandbox() {
   if (process.platform === 'win32') return require('../agents/codex/workflow/windows-appcontainer-probe.js').probeWindowsAppContainer()
+  if (process.platform === 'darwin') return require('./darwin-command-probe.cjs').probeDarwinCommandSandbox()
   if (process.platform !== 'linux') return { supported: false, backend: 'bubblewrap', code: 'COMMAND_SANDBOX_UNSUPPORTED' }
   const result = cp.spawnSync('/usr/bin/bwrap', ['--die-with-parent', '--unshare-net', '--unshare-pid', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--', '/bin/true'], { env: safeEnvironment(), encoding: 'utf8', timeout: 10000, shell: false })
   return { supported: !result.error && result.status === 0, backend: 'bubblewrap',
     ...(result.error || result.status !== 0 ? { code: 'COMMAND_SANDBOX_UNSUPPORTED', reason: result.error?.code || result.stderr.trim().slice(0, 1024) } : {}) }
 }
 module.exports = { BoundaryError, TOOLS, OUTPUT_LIMIT, canonicalJson, sha256, within, physical, validatePolicy, validateArguments,
-  authorize, executeTool, prepareBoundary, loadBoundary, readReceipts, appendReceipt, probeCommandSandbox, sandboxArguments, safeEnvironment }
+  authorize, executeTool, prepareBoundary, drainDarwinCommandOwner, preloadBoundary, loadBoundary, readReceipts, appendReceipt, assertCommandSandboxPrerequisites, probeCommandSandbox, sandboxArguments, safeEnvironment }

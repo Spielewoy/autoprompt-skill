@@ -292,11 +292,22 @@ function discoverPackageRuntime(name, environment, options) {
     if (platform === 'win32') {
       for (const wrapperName of [`${name}.cmd`, `${name}.ps1`]) {
         if (!regularRealFile(path.join(directory, wrapperName))) continue
-        const runtime = runtimeFromPackage(
-          path.join(directory, 'node_modules', '@openai', 'codex'),
-          { platform, arch, expectedSha256: options.expectedSha256 },
-        )
-        if (runtime) return runtime
+        const packageRoots = [path.join(directory, 'node_modules', '@openai', 'codex')]
+        // A local npm install publishes generated launchers in
+        // node_modules/.bin beside the scoped package. The launcher is only a
+        // location witness: runtimeFromPackage still binds the exact official
+        // metadata, native sibling, architecture, version and executable bytes.
+        const modulesRoot = path.dirname(directory)
+        if (path.basename(directory).toLowerCase() === '.bin' &&
+            path.basename(modulesRoot).toLowerCase() === 'node_modules') {
+          packageRoots.unshift(path.join(modulesRoot, '@openai', 'codex'))
+        }
+        for (const packageRoot of packageRoots) {
+          const runtime = runtimeFromPackage(packageRoot, {
+            platform, arch, expectedSha256: options.expectedSha256,
+          })
+          if (runtime) return runtime
+        }
       }
       continue
     }

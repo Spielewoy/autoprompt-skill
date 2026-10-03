@@ -1,0 +1,30 @@
+[
+  {
+    "path": "winsup/cygwin/cygwin.sc.in",
+    "sourceSha256": "73979b6307f35fc2c9d3c272f531fb0a4950e4913bd6d82e009a3fcd041bb781",
+    "firstLine": 45,
+    "lastLine": 65,
+    "text": "  }\n  /* The Cygwin DLL uses a section to avoid copying certain data\n     on fork.  This used to be named \".data$nocopy\".  The linker used\n     to include this between __data_start__ and __data_end__, but that\n     breaks building the cygwin dll.  Instead, we name the section\n     \".data_cygwin_nocopy\" and explicitly include it after __data_end__. */\n  .data ALIGN(__section_alignment__) :\n  {\n    __data_start__ = .;\n    *(.data)\n    *(.data2)\n    *(SORT(.data$*))\n    __data_end__ = .;\n    *(.data_cygwin_nocopy)\n  }\n  .rdata ALIGN(__section_alignment__) :\n  {\n    *(.rdata)\n    *(SORT(.rdata$*))\n    *(.rdata_cygwin_nocopy)\n    ___RUNTIME_PSEUDO_RELOC_LIST__ = .;\n"
+  },
+  {
+    "path": "winsup/cygwin/dcrt0.cc",
+    "sourceSha256": "a1f70e4c80aa113b417bfa36de2d2b2d55214d670779b019952294e1f34b6d62",
+    "firstLine": 575,
+    "lastLine": 600,
+    "text": "\n  return res;\n}\n\n#define dll_data_start &__data_start__\n#define dll_data_end &__data_end__\n#define dll_bss_start &__bss_start__\n#define dll_bss_end &__bss_end__\n\nvoid\nchild_info_fork::handle_fork ()\n{\n  cygheap_fixup_in_child (false);\n  memory_init ();\n  myself.thisproc (NULL);\n  myself->uid = cygheap->user.real_uid;\n  myself->gid = cygheap->user.real_gid;\n\n  child_copy (parent, false, silentfail (),\n\t      \"dll data\", dll_data_start, dll_data_end,\n\t      \"dll bss\", dll_bss_start, dll_bss_end,\n\t      \"user heap\", cygheap->user_heap.base, cygheap->user_heap.ptr,\n\t      NULL);\n\n  /* If my_wr_proc_pipe != NULL then it's a leftover handle from a previously\n     forked process.  Close it now or suffer confusion with the parent of our\n"
+  },
+  {
+    "path": "winsup/cygwin/dcrt0.cc",
+    "sourceSha256": "a1f70e4c80aa113b417bfa36de2d2b2d55214d670779b019952294e1f34b6d62",
+    "firstLine": 721,
+    "lastLine": 750,
+    "text": "\t    (windows_directory_length + 4) * sizeof (WCHAR));\n    }\n}\n\nvoid\ndll_crt0_0 ()\n{\n  wincap.init ();\n  GetModuleFileNameW (NULL, global_progname, NT_MAX_PATH);\n  child_proc_info = get_cygwin_startup_info ();\n  init_windows_system_directory ();\n  initial_env ();\n\n  SetErrorMode (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);\n\n  lock_process::init ();\n  user_data->impure_ptr = _impure_ptr;\n  user_data->impure_ptr_ptr = &_impure_ptr;\n\n  DuplicateHandle (GetCurrentProcess (), GetCurrentThread (),\n\t\t   GetCurrentProcess (), &hMainThread,\n\t\t   0, false, DUPLICATE_SAME_ACCESS);\n\n  NtOpenProcessToken (NtCurrentProcess (), MAXIMUM_ALLOWED, &hProcToken);\n  set_cygwin_privileges (hProcToken);\n\n  device::init ();\n  do_global_ctors (&__CTOR_LIST__, 1);\n  cygthread::init ();\n\n"
+  },
+  {
+    "path": "winsup/cygwin/fhandler/disk_file.cc",
+    "sourceSha256": "0641344bfec87065c2c0c4b5c9a7380b9db197d5e211a49d4f724eda7f80e3d5",
+    "firstLine": 2059,
+    "lastLine": 2100,
+    "text": "      if (has_acls ())\n\tset_created_file_access (dir, pc, mode & 07777);\n#if 0\n      /* FIXME: This default behaviour badly breaks interoperability.\n\t\tInspecting the content of case-sensitive directories\n\t\ton remote machines results in lots of errors like\n\t\tdisappearing diretories and files, file not found, etc. */\n\n      /* Starting with Windows 10 1803, try to create all dirs below the\n         installation root as case-sensitive.  If STATUS_NOT_SUPPORTED\n\t is returned, WSL isn't installed (unfortunately a requirement\n\t for this functionality. */\n      if (wincap.has_case_sensitive_dirs ()\n\t  && !pc.isremote () && pc.fs_is_ntfs ())\n\t{\n\t  PUNICODE_STRING new_dir = pc.get_nt_native_path ();\n\t  PUNICODE_STRING root_dir = &cygheap->installation_root;\n\n\t  if (RtlEqualUnicodePathPrefix (new_dir, root_dir, TRUE)\n\t      && new_dir->Buffer[root_dir->Length / sizeof (WCHAR)] == L'\\\\')\n\t    {\n\t      FILE_CASE_SENSITIVE_INFORMATION fcsi;\n\n\t      fcsi.Flags = FILE_CS_FLAG_CASE_SENSITIVE_DIR;\n\t      status = NtSetInformationFile (dir, &io, &fcsi, sizeof fcsi,\n\t\t\t\t\t     FileCaseSensitiveInformation);\n\t      if (!NT_SUCCESS (status))\n\t\t{\n\t\t  debug_printf (\"Setting dir case sensitivity, status %y\",\n\t\t\t\tstatus);\n\t\t  if (status == STATUS_NOT_SUPPORTED)\n\t\t    {\n\t\t      debug_printf (\"Dir case sensitivity requires WSL\");\n\t\t      wincap.disable_case_sensitive_dirs ();\n\t\t    }\n\t\t}\n\t    }\n\t}\n#endif\n      NtClose (dir);\n      res = 0;\n    }\n"
+  }
+]

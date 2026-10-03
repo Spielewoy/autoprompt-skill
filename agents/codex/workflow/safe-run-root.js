@@ -29,6 +29,10 @@ function normalizeIdentityPath(value) {
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
+function windowsAclPathKey(value) {
+  return typeof value === 'string' && path.win32.isAbsolute(value) ? path.win32.resolve(value).toLowerCase() : null
+}
+
 function pathIsInside(parent, child) {
   const relative = path.relative(path.resolve(parent), path.resolve(child))
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
@@ -147,6 +151,91 @@ function chmodPrivate(target, mode) {
 }
 
 let windowsDefaultTokenOwnerEstablished = false
+let windowsBunKnownFolders
+function windowsProfilePath(value) {
+  return typeof value === 'string' && /^[A-Za-z]:\\/u.test(value) && !value.includes('\0') && value.length <= 32768
+}
+function boundWindowsTokenProfileFolders(binding) {
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding) ||
+      Object.keys(binding).sort().join(',') !== 'localAppData,profileHome,roamingAppData' ||
+      ![binding.profileHome, binding.localAppData, binding.roamingAppData].every(windowsProfilePath)) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The bound Windows token profile is invalid')
+  }
+  const profile = path.win32.resolve(binding.profileHome)
+  const local = path.win32.resolve(binding.localAppData)
+  const roaming = path.win32.resolve(binding.roamingAppData)
+  if (normalizeIdentityPath(local) !== normalizeIdentityPath(path.win32.join(profile, 'AppData', 'Local')) ||
+      normalizeIdentityPath(roaming) !== normalizeIdentityPath(path.win32.join(profile, 'AppData', 'Roaming'))) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The bound Windows token profile folders are inconsistent')
+  }
+  return Object.freeze({ profileHome: profile, localAppData: local, roamingAppData: roaming })
+}
+function bindWindowsTokenProfileFolders(binding) {
+  if (process.platform !== 'win32' || !process.versions?.bun) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'A Windows token profile binding is valid only for the Bun native host')
+  }
+  const normalized = boundWindowsTokenProfileFolders(binding)
+  if (windowsBunKnownFolders && (normalizeIdentityPath(windowsBunKnownFolders.profileHome) !== normalizeIdentityPath(normalized.profileHome) ||
+      normalizeIdentityPath(windowsBunKnownFolders.localAppData) !== normalizeIdentityPath(normalized.localAppData) ||
+      normalizeIdentityPath(windowsBunKnownFolders.roamingAppData) !== normalizeIdentityPath(normalized.roamingAppData))) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The Windows token profile binding changed during the native host lifetime')
+  }
+  windowsBunKnownFolders = normalized
+  return normalized
+}
+function windowsTokenProfileFolders(systemRoot) {
+  if (!process.versions?.bun) {
+    let profileHome
+    try { profileHome = os.userInfo().homedir } catch (error) { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token profile root could not be resolved', { cause: error && error.code }) }
+    if (typeof profileHome !== 'string' || !/^[A-Za-z]:\\/u.test(profileHome)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token returned no usable profile root')
+    return { profileHome, localAppData: path.join(profileHome, 'AppData', 'Local'), roamingAppData: path.join(profileHome, 'AppData', 'Roaming') }
+  }
+  if (!windowsBunKnownFolders) {
+    const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    const script = [
+      "$ErrorActionPreference='Stop'",
+      '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
+      // This query bootstraps the private compiler directory itself. Emit the
+      // fixed P/Invoke in memory: Add-Type would need TEMP before we know it.
+      "$assembly=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([Reflection.AssemblyName]::new('AutopromptTokenProfile'),[Reflection.Emit.AssemblyBuilderAccess]::Run)",
+      "$module=$assembly.DefineDynamicModule('AutopromptTokenProfile')",
+      "$type=$module.DefineType('AutopromptTokenProfile',[Reflection.TypeAttributes]'Public,Sealed,Abstract')",
+      "$method=$type.DefinePInvokeMethod('GetUserProfileDirectory','userenv.dll',[Reflection.MethodAttributes]'Public,Static,PinvokeImpl',[Reflection.CallingConventions]::Standard,[bool],[Type[]]@([IntPtr],[Text.StringBuilder],[uint32].MakeByRefType()),[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)",
+      '$method.SetImplementationFlags($method.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig)',
+      '$native=$type.CreateType()',
+      '$identity=[Security.Principal.WindowsIdentity]::GetCurrent()',
+      "try {$parameters=[object[]]@($identity.Token,[Text.StringBuilder]::new(32768),[uint32]32768);$ok=$native.GetMethod('GetUserProfileDirectory').Invoke($null,$parameters);if(-not $ok -or $parameters[2] -eq 0 -or $parameters[2] -ge 32768){throw 'Token profile path unavailable'};$profile=$parameters[1].ToString()}finally{$identity.Dispose()}",
+      "$value=[ordered]@{profile=$profile;local=[IO.Path]::Combine($profile,'AppData','Local');roaming=[IO.Path]::Combine($profile,'AppData','Roaming')}",
+      '[Console]::Out.Write(($value|ConvertTo-Json -Compress))',
+    ].join(';')
+    const result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8', windowsHide: true, shell: false, timeout: 30000, maxBuffer: 65536,
+      stdio: ['ignore', 'pipe', 'pipe'], cwd: path.win32.dirname(powershell),
+      // Do not project HOME, USERPROFILE, APPDATA or LOCALAPPDATA. The fixed
+      // Read the process token explicitly. Shell known-folder helpers can
+      // expand an isolated profile from a bundled runtime's environment.
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32') },
+    })
+    if (result.error || result.signal || result.status !== 0 || result.stderr) {
+      const diagnostic = {
+        status: result.status, signal: result.signal, cause: result.error && result.error.code,
+        stderr: String(result.stderr || '').replace(/[\r\n]+/g, ' ').slice(0, 1024),
+      }
+      throw new RunRecordError('PRIVACY_UNSUPPORTED', `The current Windows token known folders could not be resolved (${JSON.stringify(diagnostic)})`, {
+        ...diagnostic,
+      })
+    }
+    let parsed
+    try { parsed = JSON.parse(result.stdout) } catch { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token known-folder helper returned invalid JSON') }
+    if (!parsed || Object.keys(parsed).sort().join(',') !== 'local,profile,roaming' ||
+        ![parsed.profile, parsed.local, parsed.roaming].every(value => typeof value === 'string' && /^[A-Za-z]:\\/u.test(value))) {
+      throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token known-folder helper returned invalid paths')
+    }
+    windowsBunKnownFolders = Object.freeze({ profileHome: parsed.profile, localAppData: parsed.local, roamingAppData: parsed.roaming })
+  }
+  return windowsBunKnownFolders
+}
+
 function ensureWindowsDefaultTokenOwner() {
   if (process.platform !== 'win32' || windowsDefaultTokenOwnerEstablished) {
     return { supported: true, mechanism: process.platform === 'win32' ? 'windows-token-owner' : 'posix-owner' }
@@ -190,40 +279,51 @@ function ensureWindowsDefaultTokenOwner() {
   ].join(' ')
   const script = [
     "$ErrorActionPreference='Stop'",
+    "[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)",
+    "[Console]::Out.WriteLine('TOKEN_OWNER_COMPILING')",
     'Add-Type -TypeDefinition $env:AUTOPROMPT_TOKEN_OWNER_SOURCE -Language CSharp',
+    "[Console]::Out.WriteLine('TOKEN_OWNER_APPLYING')",
     '[AutopromptDefaultTokenOwner]::Apply([int]$env:AUTOPROMPT_TOKEN_OWNER_PID,$env:AUTOPROMPT_TOKEN_OWNER_IMAGE)',
+    "[Console]::Out.WriteLine('TOKEN_OWNER_READY')",
   ].join(';')
   const systemRoot = process.env.SystemRoot || process.env.WINDIR
   if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the default-owner helper')
   }
   const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-token-owner-'))
+  const temporary = createWindowsCompilerDirectory('autoprompt-token-owner-')
+  // The first native PowerShell/Add-Type startup on a Windows runner can be
+  // slower than a warmed helper. Keep a finite setup bound without treating a
+  // cold compiler as proof that private ownership cannot be established.
+  const timeoutMs = 60000
   let result
   try {
     result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-      encoding: 'utf8', windowsHide: true, shell: false, timeout: 15000, maxBuffer: 1024 * 1024,
+      encoding: 'utf8', windowsHide: true, shell: false, timeout: timeoutMs, maxBuffer: 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
       cwd: path.win32.dirname(powershell),
       env: {
-        SystemRoot: systemRoot,
-        WINDIR: systemRoot,
-        SystemDrive: systemRoot.slice(0, 2),
-        PATH: path.win32.join(systemRoot, 'System32'),
-        PSModulePath: '',
-        TEMP: temporary,
-        TMP: temporary,
+        ...windowsControllerEnvironment(systemRoot, temporary),
         AUTOPROMPT_TOKEN_OWNER_SOURCE: source,
         AUTOPROMPT_TOKEN_OWNER_PID: String(process.pid),
         AUTOPROMPT_TOKEN_OWNER_IMAGE: process.execPath,
       },
     })
   } finally {
-    fs.rmSync(temporary, { recursive: true, force: true })
+    fs.rmSync(temporary, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
   if (result.error || result.signal || result.status !== 0 || result.stderr) {
-    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot establish the Windows token user as the default owner for new run-record objects', {
+    const helperPhase = String(result.stdout || '').includes('TOKEN_OWNER_APPLYING') ? 'applying'
+      : String(result.stdout || '').includes('TOKEN_OWNER_COMPILING') ? 'compiling' : 'startup'
+    const cause = result.error && typeof result.error.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(result.error.code)
+      ? result.error.code : `status ${result.status}`
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish the Windows token user as the default owner for new run-record objects (${helperPhase}: ${cause})`, {
+      stage: 'windows-default-token-owner',
+      helperPhase,
       status: result.status,
       cause: result.error && result.error.code,
+      signal: result.signal,
+      timeoutMs,
       stderr: result.stderr && result.stderr.trim(),
     })
   }
@@ -231,42 +331,117 @@ function ensureWindowsDefaultTokenOwner() {
   return { supported: true, mechanism: 'windows-token-owner' }
 }
 
+// CodeDOM creates nested source/output names below TEMP. Callers must remove
+// the returned directory after the bounded compiler operation completes.
+function createWindowsCompilerDirectory(prefix = 'autoprompt-compiler-') {
+  if (typeof prefix !== 'string' || !/^[A-Za-z0-9_-]{1,48}-$/.test(prefix)) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The Windows compiler directory prefix is invalid')
+  }
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the private compiler helper')
+  }
+  // Node's userInfo is token-backed on Windows. Bun's Node compatibility
+  // layer can instead follow the deliberately isolated HOME/USERPROFILE, so
+  // that runtime uses fixed .NET known-folder calls in a clean child.
+  const { localAppData } = windowsTokenProfileFolders(systemRoot)
+  const inspectedLocalAppData = inspectPathNoFollow(localAppData)
+  if (!inspectedLocalAppData.exists || !inspectedLocalAppData.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'The current Windows token local application data root is unavailable')
+  let temporary
+  try {
+    temporary = fs.mkdtempSync(path.join(inspectedLocalAppData.realpath, prefix))
+    applyWindowsPrivateAcl(temporary)
+    return temporary
+  } catch (error) {
+    if (temporary) { try { fs.rmSync(temporary, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) } catch {} }
+    throw error
+  }
+}
+
 function ensureWindowsPrivateAcl(target) {
   if (process.platform !== 'win32') return { supported: true, mechanism: 'posix-mode' }
   ensureWindowsDefaultTokenOwner()
-  // Environment account names need not identify the process token. Use the
-  // token's SID for both grants and ownership, including elevated sessions
-  // whose newly created objects otherwise belong to Administrators.
-  const identity = spawnSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], {
-    encoding: 'utf8', windowsHide: true,
+  return applyWindowsPrivateAcl(target)
+}
+
+function applyWindowsPrivateAcl(target) {
+  const absolute = path.resolve(target)
+  const before = fs.lstatSync(absolute)
+  if (before.isSymbolicLink() || (!before.isDirectory() && !before.isFile())) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'A private Windows DACL requires a physical file or directory')
+  }
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the private ACL helper')
+  }
+  const powershell = path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  // Callers select or claim controller-owned storage before establishment.
+  // A fresh descriptor replaces explicit foreign grants too; /grant:r would
+  // retain those grants even after inheritance was disabled. This does not
+  // change which paths those callers authorize for permission updates.
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
+    "[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)",
+    '$p=$env:AUTOPROMPT_PRIVATE_ACL_PATH',
+    "$directory=$env:AUTOPROMPT_PRIVATE_ACL_DIRECTORY -eq '1'",
+    '$attributes=[System.IO.File]::GetAttributes($p)',
+    "if(($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){throw 'Private ACL target is redirected'}",
+    "if((($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) -ne $directory){throw 'Private ACL target type changed'}",
+    '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
+    '$user=$identity.User',
+    "$system=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
+    '$inheritance=[System.Security.AccessControl.InheritanceFlags]::None',
+    'if($directory){$acl=[System.Security.AccessControl.DirectorySecurity]::new();$inheritance=[System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit}else{$acl=[System.Security.AccessControl.FileSecurity]::new()}',
+    '$acl.SetAccessRuleProtection($true,$false)',
+    '$acl.SetOwner($user)',
+    'foreach($sid in @($user,$system)){$rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,[System.Security.AccessControl.FileSystemRights]::FullControl,$inheritance,[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow);$acl.SetAccessRule($rule)}',
+    'if($directory){[System.IO.Directory]::SetAccessControl($p,$acl);$verified=[System.IO.Directory]::GetAccessControl($p)}else{[System.IO.File]::SetAccessControl($p,$acl);$verified=[System.IO.File]::GetAccessControl($p)}',
+    '$attributes=[System.IO.File]::GetAttributes($p)',
+    "if(($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or ((($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) -ne $directory)){throw 'Private ACL target changed'}",
+    '$ownerSid=$verified.GetOwner([System.Security.Principal.SecurityIdentifier]).Value',
+    '$rules=@($verified.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object {[pscustomobject]@{identity=$_.IdentityReference.Value;sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString();inherited=$_.IsInherited;rights=[int]$_.FileSystemRights;inheritanceFlags=[int]$_.InheritanceFlags;propagationFlags=[int]$_.PropagationFlags}})',
+    '$item=[pscustomobject]@{path=$p;owner=$ownerSid;ownerSid=$ownerSid;protected=$verified.AreAccessRulesProtected;rules=$rules}',
+    '[pscustomobject]@{currentName=$identity.Name;currentSid=$user.Value;items=@($item)}|ConvertTo-Json -Compress -Depth 7',
+  ].join(';')
+  const result = spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000, maxBuffer: 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'], cwd: path.win32.dirname(powershell),
+    env: {
+      ...windowsControllerEnvironment(systemRoot),
+      AUTOPROMPT_PRIVATE_ACL_PATH: absolute,
+      AUTOPROMPT_PRIVATE_ACL_DIRECTORY: before.isDirectory() ? '1' : '0',
+    },
   })
-  const row = identity.status === 0 && String(identity.stdout || '').trim().match(/^"(?:[^"\r\n]|"")+","(S-1-(?:\d+-)+\d+)"$/i)
-  if (!row) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token identity is unavailable for a private run-record DACL')
-  const account = `*${row[1]}`
-  const result = spawnSync('icacls.exe', [target, '/inheritance:r', '/grant:r', `${account}:(OI)(CI)F`, '/grant:r', '*S-1-5-18:(OI)(CI)F'], {
-    encoding: 'utf8',
-    windowsHide: true,
-  })
-  if (result.status !== 0) {
-    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish a private Windows DACL for run-record root: ${target}`, {
-      status: result.status,
+  if (result.error || result.signal || result.status !== 0 || result.stderr) {
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish an exact private Windows DACL: ${absolute}`, {
+      status: result.status, signal: result.signal, cause: result.error && result.error.code,
       stderr: result.stderr && result.stderr.trim(),
     })
   }
-  const owner = spawnSync('icacls.exe', [target, '/setowner', account], {
-    encoding: 'utf8', windowsHide: true,
-  })
-  if (owner.status !== 0) {
-    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot establish private Windows ownership for run-record root: ${target}`, {
-      status: owner.status,
-      stderr: owner.stderr && owner.stderr.trim(),
-    })
+  const after = fs.lstatSync(absolute)
+  if (after.isSymbolicLink() || before.isDirectory() !== after.isDirectory() || !sameIdentity(statIdentity(before), statIdentity(after))) {
+    throw new RunRecordError('PRIVACY_VIOLATION', `Private Windows ACL target changed during establishment: ${absolute}`)
+  }
+  let snapshot
+  try { snapshot = JSON.parse(result.stdout) } catch { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Private Windows ACL helper returned invalid JSON') }
+  validateWindowsAclSnapshot(snapshot)
+  const item = snapshot.items[0]
+  const expectedSids = new Set([snapshot.currentSid, 'S-1-5-18'])
+  if (snapshot.items.length !== 1 || item.path !== absolute || item.ownerSid !== snapshot.currentSid
+      || !Array.isArray(item.rules) || item.rules.length !== expectedSids.size
+      || item.rules.some(rule => !expectedSids.delete(rule.sid) || rule.type !== 'Allow' || rule.inherited
+        || rule.rights !== 2032127 || rule.inheritanceFlags !== (before.isDirectory() ? 3 : 0) || rule.propagationFlags !== 0)
+      || expectedSids.size !== 0) {
+    throw new RunRecordError('PRIVACY_VIOLATION', `Private Windows ACL helper did not establish the exact owner and grants: ${absolute}`)
   }
   return { supported: true, mechanism: 'windows-dacl' }
 }
 
 function windowsPowerShellEnvironment(extra = {}) {
-  const environment = { ...process.env }
+  if (process.platform !== 'win32') return { ...process.env, ...extra }
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  const environment = windowsControllerEnvironment(systemRoot, extra.TEMP || extra.TMP)
   // Codex Desktop can run Node from a bundled PowerShell host whose
   // PSModulePath points only at the bundled PowerShell modules. Passing that
   // value to Windows PowerShell prevents built-in commands such as Get-Acl
@@ -278,10 +453,31 @@ function windowsPowerShellEnvironment(extra = {}) {
   return { ...environment, ...extra }
 }
 
-function validateWindowsAclSnapshot(snapshot) {
+function windowsControllerEnvironment(systemRoot, temporary) {
+  if (typeof systemRoot !== 'string' || !/^[A-Za-z]:\\Windows$/iu.test(systemRoot)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows system root is unavailable for the controller environment')
+  const { profileHome, localAppData, roamingAppData } = windowsTokenProfileFolders(systemRoot)
+  const appDataPath = path.dirname(localAppData)
+  if (normalizeIdentityPath(appDataPath) !== normalizeIdentityPath(path.dirname(roamingAppData)) || !pathIsInside(profileHome, appDataPath)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile folders are not contained by one profile')
+  const profile = inspectPathNoFollow(profileHome), appData = inspectPathNoFollow(appDataPath), roaming = inspectPathNoFollow(roamingAppData), local = inspectPathNoFollow(localAppData)
+  if (!profile.exists || !profile.realpath || !appData.exists || !appData.realpath || !roaming.exists || !roaming.realpath || !local.exists || !local.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile folders are unavailable')
+  const tempPath = temporary || path.join(local.realpath, 'Temp'), temp = inspectPathNoFollow(tempPath)
+  if (!temp.exists || !temp.realpath) throw new RunRecordError('PRIVACY_UNSUPPORTED', `Windows controller temporary folder is unavailable (${JSON.stringify({ path: tempPath, nearestExisting: temp.nearestExisting || null })})`, {
+    path: tempPath, nearestExisting: temp.nearestExisting || null,
+  })
+  const parsed = path.win32.parse(profileHome)
+  if (!/^[A-Za-z]:\\$/u.test(parsed.root)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows token profile drive is unavailable')
+  return { SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: systemRoot.slice(0, 2), PATH: path.win32.join(systemRoot, 'System32'), PSModulePath: '', USERPROFILE: profile.realpath, HOME: profile.realpath, HOMEDRIVE: parsed.root.slice(0, 2), HOMEPATH: profileHome.slice(2), APPDATA: roaming.realpath, LOCALAPPDATA: local.realpath, TEMP: temp.realpath, TMP: temp.realpath }
+}
+
+function validateWindowsAclSnapshot(snapshot, options = {}) {
   if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.items) || !snapshot.currentName || !snapshot.currentSid) {
     throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit did not return a complete owner/rule snapshot')
   }
+  const expectedPaths = Array.isArray(options.expectedPaths) ? options.expectedPaths : null
+  const requiredProtectedPaths = Array.isArray(options.requiredProtectedPaths) ? options.requiredProtectedPaths : null
+  const seenPaths = new Set()
+  const expectedKeys = expectedPaths && new Set(expectedPaths.map(windowsAclPathKey))
+  const protectedKeys = requiredProtectedPaths && new Set(requiredProtectedPaths.map(windowsAclPathKey))
   const allowed = new Set([
     String(snapshot.currentName).toLowerCase(),
     String(snapshot.currentSid).toLowerCase(),
@@ -289,9 +485,15 @@ function validateWindowsAclSnapshot(snapshot) {
     's-1-5-18',
   ])
   for (const [index, item] of snapshot.items.entries()) {
-    // The first item is the audited run root. Its DACL must be protected;
-    // descendants may safely inherit only the allowlisted ACL from that root.
-    if (index === 0 && item.protected !== true) {
+    const itemKey = item && windowsAclPathKey(item.path)
+    if (!itemKey) {
+      throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit returned an invalid target path')
+    }
+    if (seenPaths.has(itemKey)) throw new RunRecordError('PRIVACY_UNSUPPORTED', `Windows ACL audit returned a duplicate target: ${item.path}`)
+    seenPaths.add(itemKey)
+    // Without an explicit independent-root set, preserve the original rule:
+    // the first item is protected and descendants may inherit its allowlist.
+    if ((protectedKeys ? protectedKeys.has(itemKey) : index === 0) && item.protected !== true) {
       throw new RunRecordError('PRIVACY_VIOLATION', `Private run-record path has an inherited or unprotected Windows DACL: ${item.path}`, {
         path: item.path,
         protected: item.protected === true,
@@ -310,6 +512,16 @@ function validateWindowsAclSnapshot(snapshot) {
           identity: rule.identity,
           inherited: Boolean(rule.inherited),
         })
+      }
+    }
+  }
+  if (expectedKeys) {
+    for (const [index, expectedPath] of expectedPaths.entries()) {
+      const expectedKey = windowsAclPathKey(expectedPath)
+      if (!seenPaths.has(expectedKey)) throw new RunRecordError('PRIVACY_UNSUPPORTED', `Windows ACL audit omitted a selected target: ${expectedPath}`)
+      if (index === 0 && (!snapshot.items[0] || typeof snapshot.items[0].path !== 'string'
+          || windowsAclPathKey(snapshot.items[0].path) !== expectedKey)) {
+        throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit did not return its selected root first')
       }
     }
   }
@@ -343,34 +555,102 @@ function auditPrivatePermissions(runPath, options = {}) {
     for (const privatePath of additional) visit(privatePath, false)
     return { valid: true, mechanism: 'posix-mode' }
   }
+  const inputPaths = [absolute, ...additional]
+  if (inputPaths.length > 256) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit selected too many explicit paths')
+  const inputKeys = new Set()
+  for (const inputPath of inputPaths) {
+    const key = normalizeIdentityPath(inputPath)
+    if (inputKeys.has(key)) throw new RunRecordError('PRIVACY_UNSUPPORTED', `Windows ACL audit selected a path more than once: ${inputPath}`)
+    inputKeys.add(key)
+  }
+  const requiredProtectedPaths = options.requiredProtectedPaths === undefined
+    ? [absolute]
+    : (() => {
+        if (!Array.isArray(options.requiredProtectedPaths) || options.requiredProtectedPaths.length < 1 || options.requiredProtectedPaths.length > 256) {
+          throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit requires a bounded protected-path list')
+        }
+        const resolved = options.requiredProtectedPaths.map(item => {
+          if (typeof item !== 'string' || item.includes('\0')) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit protected paths must be strings')
+          return path.resolve(item)
+        })
+        const keys = new Set()
+        for (const requiredPath of resolved) {
+          const key = normalizeIdentityPath(requiredPath)
+          if (keys.has(key) || !inputKeys.has(key)) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit protected paths must be a unique subset of its selected paths')
+          keys.add(key)
+        }
+        if (!keys.has(normalizeIdentityPath(absolute))) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit root must remain independently protected')
+        return resolved
+      })()
+  // Bind every caller-selected path around the native ACL query. PowerShell
+  // checks the ACL reached by a pathname, so accepting its snapshot after a
+  // concurrent rename would authenticate a different filesystem object.
+  const inputBindings = inputPaths.map(inputPath => {
+    const inspected = inspectPathNoFollow(inputPath, { mustBeDirectory: false })
+    return { path: inputPath, exists: inspected.exists, realpath: inspected.realpath || null, identity: inspected.identity || null }
+  })
   const script = [
-    "$ErrorActionPreference='Stop'",
+    "$ErrorActionPreference='Stop';[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process);[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=targets');[Console]::Error.Flush()",
     '$inputPaths=@($env:AUTOPROMPT_ACL_AUDIT_PATHS|ConvertFrom-Json)',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=parsed');[Console]::Error.Flush()",
     '$root=$inputPaths[0]',
     '$targets=@($root)',
     "if($env:AUTOPROMPT_ACL_AUDIT_RECURSE -eq '1'){$targets+=@(Get-ChildItem -LiteralPath $root -Force -Recurse | ForEach-Object { $_.FullName })}",
     'for($i=1;$i -lt $inputPaths.Count;$i++){if(Test-Path -LiteralPath $inputPaths[$i]){$targets+=$inputPaths[$i]}}',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=enumerated');[Console]::Error.Flush()",
     '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=identity');[Console]::Error.Flush()",
     '$items=@()',
-    'foreach($p in ($targets | Select-Object -Unique)){',
+    '$seen=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=dedupe');[Console]::Error.Flush()",
+    'foreach($p in $targets){if(!$seen.Add([string]$p)){continue}',
+    '  [Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=get-acl\');[Console]::Error.Flush()',
     '  $acl=Get-Acl -LiteralPath $p',
+    '  [Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=owner\');[Console]::Error.Flush()',
     '  $ownerSid=(New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate([System.Security.Principal.SecurityIdentifier]).Value',
+    '  [Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=rules\');[Console]::Error.Flush()',
     '  $rules=@($acl.Access | ForEach-Object {$sid=$null;try{$sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value}catch{};[pscustomobject]@{identity=$_.IdentityReference.Value;sid=$sid;type=$_.AccessControlType.ToString();inherited=$_.IsInherited;rights=$_.FileSystemRights.ToString()}})',
     '  $items+=[pscustomobject]@{path=$p;owner=$acl.Owner;ownerSid=$ownerSid;protected=$acl.AreAccessRulesProtected;rules=$rules}',
     '}',
+    '[Console]::Error.WriteLine(\'AUTOPROMPT_ACL_AUDIT_PHASE=emit\');[Console]::Error.Flush()',
+    '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
     '[pscustomobject]@{currentName=$identity.Name;currentSid=$identity.User.Value;items=$items}|ConvertTo-Json -Compress -Depth 7',
   ].join(';')
-  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8', windowsHide: true,
-    env: windowsPowerShellEnvironment({
-      AUTOPROMPT_ACL_AUDIT_PATHS: JSON.stringify([absolute, ...additional]),
-      AUTOPROMPT_ACL_AUDIT_RECURSE: recurse ? '1' : '0',
-    }),
+  const environment = windowsPowerShellEnvironment({
+    AUTOPROMPT_ACL_AUDIT_PATHS: JSON.stringify(inputPaths),
+    AUTOPROMPT_ACL_AUDIT_RECURSE: recurse ? '1' : '0',
   })
-  if (result.status !== 0) throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Cannot revalidate Windows run-record ACLs', { status: result.status, stderr: result.stderr && result.stderr.trim() })
+  const powershell = path.win32.join(environment.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const result = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+    encoding: 'utf8', windowsHide: true, timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'], env: environment,
+  })
+  for (const before of inputBindings) {
+    const after = inspectPathNoFollow(before.path, { mustBeDirectory: false })
+    if (before.exists !== after.exists || (before.exists && (!sameIdentity(before.identity, after.identity)
+        || normalizeIdentityPath(before.realpath) !== normalizeIdentityPath(after.realpath)))) {
+      throw new RunRecordError('PRIVACY_VIOLATION', `Private Windows ACL audit target changed during validation: ${before.path}`, {
+        path: before.path,
+        expected: before.identity,
+        actual: after.identity || null,
+      })
+    }
+  }
+  if (result.status !== 0) {
+    const marker = /^AUTOPROMPT_ACL_AUDIT_PHASE=(targets|parsed|enumerated|identity|dedupe|get-acl|owner|rules|emit)$/
+    const phases = [], diagnostics = []
+    for (const line of String(result.stderr || '').split(/\r?\n/)) {
+      const match = marker.exec(line)
+      if (match) phases.push(match[1]); else diagnostics.push(line)
+    }
+    const stderr = diagnostics.join('\n').trim()
+    const phase = phases.at(-1) || 'startup'
+    const status = Number.isInteger(result.status) ? String(result.status) : 'none'
+    const cause = result.error && typeof result.error.code === 'string' && /^[A-Z0-9_]{1,40}$/u.test(result.error.code) ? result.error.code : 'none'
+    throw new RunRecordError('PRIVACY_UNSUPPORTED', `Cannot revalidate Windows run-record ACLs (phase=${phase}, status=${status}, cause=${cause})`, { status: result.status, cause: result.error && result.error.code, phase, stderr })
+  }
   let snapshot
   try { snapshot = JSON.parse(result.stdout) } catch { throw new RunRecordError('PRIVACY_UNSUPPORTED', 'Windows ACL audit returned invalid JSON') }
-  return validateWindowsAclSnapshot(snapshot)
+  return validateWindowsAclSnapshot(snapshot, { expectedPaths: inputPaths, requiredProtectedPaths })
 }
 
 function ensureDirectoryNoFollow(directory, boundary) {
@@ -944,6 +1224,9 @@ module.exports = {
   assertRunRecordBoundary,
   ensureWindowsPrivateAcl,
   ensureWindowsDefaultTokenOwner,
+  createWindowsCompilerDirectory,
+  windowsControllerEnvironment,
+  bindWindowsTokenProfileFolders,
   validateWindowsAclSnapshot,
   auditPrivatePermissions,
   withOwnedLock,

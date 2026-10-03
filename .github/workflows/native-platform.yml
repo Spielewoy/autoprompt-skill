@@ -1,0 +1,1827 @@
+name: Native platform validation
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      support_stage:
+        description: 'Run only one focused all-platform development stage'
+        required: false
+        default: none
+        type: choice
+        options: [none, macos-containment, macos-exclusive-fd, macos-ipv6-loopback, macos-listener-handoff, macos-helper-build, windows-bootstrap, windows-provider-primitives, opencode, opencode-startup, opencode-public, vscode, vscode-diagnostic, hermes-macos, hermes-linux]
+      support_provider:
+        description: 'Installed provider for the focused provider stage'
+        required: false
+        default: opencode
+        type: choice
+        options: [opencode, claude, codex, deepseek, reasonix, prime, omp, kilo, grok]
+      support_primitive:
+        description: 'Select the Windows primitive stage without repeating provider installation'
+        required: false
+        default: all
+        type: choice
+        options: [all, relay, owned-relay, lease, vscode-path, hermes, codex-isolated-network]
+      support_capability:
+        description: 'Run all capabilities or a focused isolation/checker/cancellation diagnostic'
+        required: false
+        default: all
+        type: choice
+        options: [all, isolation, isolatedChecking, cancellation, modelRouting, sameContextContinuation]
+      support_arm:
+        description: 'Limit supported focused provider stages to ARM64'
+        required: false
+        default: false
+        type: boolean
+      support_single:
+        description: 'Limit focused Windows or macOS provider diagnostics to x64'
+        required: false
+        default: false
+        type: boolean
+      support_host:
+        description: 'Native host family for focused provider tests'
+        required: false
+        default: windows
+        type: choice
+        options: [windows, linux, macos]
+      windows_regressions:
+        description: 'Diagnose Windows cwd, owned proxy and packed installer on Node 20 and 24'
+        required: false
+        default: false
+        type: boolean
+      windows_regression_stage:
+        description: 'Select one stage when Windows regression diagnostics are enabled'
+        required: false
+        default: all
+        type: choice
+        options: [all, snapshot, proof, launch, worker, worker-storage, worker-proof, installer]
+      windows_regression_single:
+        description: 'Limit Windows regression diagnostics to x64 / Node 24'
+        required: false
+        default: false
+        type: boolean
+      claude_diagnostic:
+        description: 'Diagnose public native Claude activation on Windows x64 and ARM64'
+        required: false
+        default: false
+        type: boolean
+      claude_diagnostic_single:
+        description: 'Limit Claude diagnostics to Windows x64 / Node 24'
+        required: false
+        default: false
+        type: boolean
+      claude_diagnostic_stage:
+        description: 'Select public activation or focused deep-path Claude startup'
+        required: false
+        default: public
+        type: choice
+        options: [public, deep-launch]
+      msys_mapping:
+        description: 'Run the manual-only native MSYS mapping diagnostic'
+        required: false
+        default: false
+        type: boolean
+      msys_fork_memory:
+        description: 'Inspect native Windows fork address reservations without rebuilding the runtime'
+        required: false
+        default: false
+        type: boolean
+      msys_pipe_trace:
+        description: 'Run one manual-only MSYS pipe I/O trace build'
+        required: false
+        default: false
+        type: boolean
+      msys_pipe_reuse:
+        description: 'Reuse the authenticated CI46 trace build (requires msys_pipe_trace)'
+        required: false
+        default: false
+        type: boolean
+      msys_runtime:
+        description: 'Build and test the repaired MSYS candidate on x64 and ARM64 only'
+        required: false
+        default: false
+        type: boolean
+      msys_reuse_ci49:
+        description: 'Retest the exact CI49 MSYS candidate on x64 and ARM64 without rebuilding'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  platform-primitives:
+    if: ${{ (inputs.support_stage == '' || inputs.support_stage == 'none') && (github.event_name != 'workflow_dispatch' || (inputs.windows_regressions != true && inputs.claude_diagnostic != true && inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true) ) }}
+    name: Platform and installer / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.runner.os }}
+    # Native Windows storage and crash recovery add up to 30 minutes; leave room
+    # for the packed installer after the platform suite on both architectures.
+    timeout-minutes: ${{ startsWith(matrix.runner.os, 'windows-') && 120 || 90 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON((inputs.msys_runtime == true || inputs.msys_reuse_ci49 == true) && '{"include":[{"runner":{"os":"windows-latest","arch":"x64"},"node":"24.x"},{"runner":{"os":"windows-11-arm","arch":"arm64"},"node":"20.x"},{"runner":{"os":"windows-11-arm","arch":"arm64"},"node":"24.x"}]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
+    env:
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.runner.arch }}
+          cache: npm
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.runner.arch }}
+      - name: Install declared Python installer and validation dependencies
+        run: 'python -m pip install --only-binary=:all: PyYAML==6.0.3 jsonschema==4.26.0 referencing==0.37.0'
+      - name: Install and enable Linux sandbox prerequisites
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Install macOS installer shells
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'macOS')
+        shell: bash
+        run: |
+          brew install bash
+          if ! command -v pwsh >/dev/null 2>&1; then
+            brew install powershell
+          fi
+      - name: Require PowerShell
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
+        shell: pwsh
+        run: $PSVersionTable.PSVersion.ToString()
+      - run: npm ci --ignore-scripts
+      - name: Enable genuine macOS primitive tests and assert runtime limitation
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'macOS')
+        run: node tests/helpers/native-platform-ci.cjs macos-primitives
+      - name: Enable actual Windows short-name coverage
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        shell: pwsh
+        run: |
+          fsutil 8dot3name set 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify native Windows runtime bundle physical capture
+        id: runtime-physical-proof
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap scripts/windows-runtime/physical-proof/audit.test.cjs 2>&1 | Tee-Object -FilePath native-windows-runtime-physical.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-runtime/physical-proof/verify-output.cjs native-windows-runtime-physical.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native runtime bundle capture observations
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-runtime-physical-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-runtime-physical.log
+          if-no-files-found: error
+      - name: Build and verify fixed native capture executable
+        id: runtime-precompiled-proof
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test scripts/windows-runtime/precompiled-proof/verify-output.test.cjs scripts/windows-runtime/precompiled-proof/verify-acl-output.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $build = Join-Path $env:RUNNER_TEMP 'precompiled-capture'
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -File scripts/windows-runtime/precompiled-proof/build.ps1 -OutputDirectory $build 2>&1 | Tee-Object -FilePath native-windows-runtime-precompiled-build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:AUTOPROMPT_CAPTURE_BUILD = $build
+          node --test --test-reporter=tap scripts/windows-runtime/precompiled-proof/native.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $build 'native.tap')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-runtime/precompiled-proof/verify-output.cjs (Join-Path $build 'native.tap')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test --test-reporter=tap scripts/windows-runtime/precompiled-proof/acl.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $build 'acl-native.tap')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-runtime/precompiled-proof/verify-acl-output.cjs (Join-Path $build 'acl-native.tap')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve fixed native capture executable and observations
+        id: runtime-precompiled-evidence
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-runtime-precompiled-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: |
+            ${{ runner.temp }}/precompiled-capture
+            native-windows-runtime-precompiled-build.log
+          if-no-files-found: error
+      - name: Verify native Job startup during the focused MSYS run
+        id: msys-job-startup
+        if: inputs.msys_runtime == true && runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'native-job-startup.tap'
+          node --test --test-reporter=tap tests/source/windows-job-helper.test.cjs 2>&1 | Tee-Object -FilePath $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node -e "const text=require('node:fs').readFileSync(process.argv[1],'utf8');const check=require('./tests/helpers/native-platform-ci.cjs').assertNamedCase;check(text,'Windows Job bridge compiles and preserves atomic status publication on native long paths');check(text,'native Windows Job ownership survives deep durable paths and hostile home variables');" $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native Job startup results
+        if: always() && inputs.msys_runtime == true && runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-job-startup-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: ${{ runner.temp }}/native-job-startup.tap
+          if-no-files-found: error
+      - name: Record native Git metadata ACL controls before the full suite
+        id: git-acl-proof
+        if: inputs.msys_runtime != true && (runner.os == 'Windows')
+        # The identical denial/restoration test remains mandatory in the full suite.
+        continue-on-error: true
+        timeout-minutes: 12
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap --test-name-pattern='^native Windows \.git grants deny mutation and restore inheritance after owned drain$' tests/source/windows-appcontainer-git-acl.test.cjs 2>&1 | Tee-Object -FilePath native-windows-git-acl.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native Git metadata ACL observations
+        id: git-acl-evidence
+        if: inputs.msys_runtime != true && (always() && runner.os == 'Windows')
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-git-acl-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-git-acl.log
+          if-no-files-found: error
+      - name: Exercise native resource admission and recovery on large trees
+        id: resource-scale-proof
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        continue-on-error: true
+        timeout-minutes: 32
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap --test-name-pattern='^native Windows resource scale restores large trees after AppContainer mutation and refuses admission overflow$' tests/source/windows-appcontainer-resource-scale.test.cjs 2>&1 | Tee-Object -FilePath native-windows-resource-scale.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native resource scale observations
+        id: resource-scale-evidence
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-resource-scale-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-resource-scale.log
+          if-no-files-found: error
+      - name: Verify native resource identity recovery and lookup refusals
+        id: resource-identity-proof
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        continue-on-error: true
+        timeout-minutes: 17
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap --test-name-pattern='^native Windows resource identity recovery preserves moved originals and refuses ambiguous lookup failures$' tests/source/windows-appcontainer-resource-identity.test.cjs 2>&1 | Tee-Object -FilePath native-windows-resource-identity.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native resource identity observations
+        id: resource-identity-evidence
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-resource-identity-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-resource-identity.log
+          if-no-files-found: error
+      - name: Exercise native filesystem operations on large trees
+        id: filesystem-scale-proof
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        continue-on-error: true
+        timeout-minutes: 27
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap --test-name-pattern='^native Windows filesystem scale captures copies renames flushes and cleans bounded large trees$' tests/source/windows-filesystem-scale.test.cjs 2>&1 | Tee-Object -FilePath native-windows-filesystem-scale.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native filesystem scale observations
+        id: filesystem-scale-evidence
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-filesystem-scale-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-filesystem-scale.log
+          if-no-files-found: error
+      - name: Record native host NUL query sizes before sandbox launches
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        # Independent of the AppContainer launcher; mandatory again in the full suite.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap --test-name-pattern="^native Windows host NUL basic query records exact and oversized buffer results$" tests/source/windows-appcontainer-nul-capability.test.cjs 2>&1 | Tee-Object -FilePath native-windows-nul-basic.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native host NUL query observations
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-nul-basic-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: native-windows-nul-basic.log
+          if-no-files-found: error
+      - name: Record native Windows pipe compatibility before the full suite
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        # This early copy supplies prompt diagnostics. The identical test is
+        # mandatory in the full suite below and still fails the job there.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test tests/source/windows-msys-pipe.test.cjs 2>&1 | Tee-Object -FilePath native-windows-pipe.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record native Windows Node pipes and process-exit verification
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        # The same diagnostic remains mandatory in the full platform suite.
+        # Unsupported observations are explicit and do not certify functionality.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test tests/source/windows-appcontainer-node-pipes.test.cjs tests/source/windows-appcontainer-member-image.test.cjs 2>&1 | Tee-Object -FilePath native-windows-node-pipes.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record native Windows NUL access and private handle isolation
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        # Actual access observations are mandatory in the full suite as well.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test --test-reporter=tap tests/source/windows-appcontainer-nul.test.cjs tests/source/windows-appcontainer-nul-capability.test.cjs tests/source/windows-null-capability-contract.test.cjs 2>&1 | Tee-Object -FilePath native-windows-nul.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record isolated Windows capture input diagnostics
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        # This exact native case remains mandatory in the full suite below.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test --test-name-pattern="Windows terminal publication" tests/source/windows-filesystem.test.cjs 2>&1 | Tee-Object -FilePath native-windows-capture.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve early native Windows observations
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-early-${{ matrix.runner.os }}-node-${{ matrix.node }}
+          path: native-windows-*.log
+          if-no-files-found: error
+      - name: Compare isolated Windows PowerShell startup environments
+        id: powershell-startup
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test tests/source/windows-powershell-startup.test.cjs 2>&1 | Tee-Object -FilePath native-windows-powershell-startup.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve Windows PowerShell startup comparisons
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && runner.os == 'Windows')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-startup-${{ matrix.runner.os }}-node-${{ matrix.node }}
+          path: native-windows-powershell-startup.log
+          if-no-files-found: error
+      # Branch-scoped compiler investigation. Only the separate smoke proof
+      # selects its private built closure; the full platform gates are unchanged.
+      # Keep this within the existing 20-job matrix.
+      - name: Detect changes to the MSYS compiler proof
+        id: msys-proof-input
+        if: inputs.msys_reuse_ci49 != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' && matrix.runner.os == 'windows-latest' && matrix.node == '24.x'
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only HEAD^ HEAD -- .github/workflows/native-platform.yml scripts/windows-msys agents/codex/workflow/windows-appcontainer* agents/codex/workflow/windows-filesystem.ps1 tests/source/windows-bash-runtime.test.cjs tests/fixtures/windows-msys/bash-ipc.sh)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "run=$($changed.Count -gt 0 -or '${{ github.event_name }}' -eq 'workflow_dispatch')".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+      - name: Compile the isolated MSYS pipe adapter proof
+        id: msys-proof
+        if: steps.msys-proof-input.outputs.run == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test scripts/windows-msys/build-boundaries.test.cjs scripts/windows-msys/probe-built-runtime.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $patch = (Resolve-Path scripts/windows-msys/pipe-security.patch).Path
+          $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4 -CompilePosixFixture
+      - name: Verify process-local wincap placement in the compiled DLL
+        id: msys-wincap
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $dll = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof/sdk/issue27-build/stage/usr/bin/msys-2.0.dll'
+          python scripts/windows-msys/wincap-local-proof/audit-pe.py $dll --output (Join-Path $env:RUNNER_TEMP 'msys-wincap-placement.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve compiled wincap placement evidence
+        if: always() && steps.msys-wincap.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-wincap-placement
+          path: ${{ runner.temp }}/msys-wincap-placement.json
+          if-no-files-found: error
+      - name: Export the exact compiled MSYS candidate for native reuse
+        id: msys-candidate
+        if: steps.msys-proof.outcome == 'success' && steps.msys-wincap.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $export = Join-Path $env:RUNNER_TEMP 'msys-candidate-export'
+          New-Item -ItemType Directory -Path $export -ErrorAction Stop | Out-Null
+          $context = Join-Path $export 'producer-context.json'
+          node scripts/windows-msys/portable-runtime/producer-context.cjs $PWD.Path $work $context
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-msys/portable-runtime/cli.cjs export $PWD.Path $work $context (Join-Path $export 'packet') | Set-Content -LiteralPath (Join-Path $export 'producer-result.json') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Publish immutable MSYS candidate bytes and producer authority
+        if: steps.msys-candidate.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-candidate-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/msys-candidate-export
+          if-no-files-found: error
+      - name: Verify adapted descriptors and cross-profile denial natively
+        id: msys-descriptor
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $payload = Join-Path $work 'sdk/issue27-build'
+          $prepared = Join-Path $env:RUNNER_TEMP 'msys-descriptor-prepared'
+          $toolchain = Join-Path $env:RUNNER_TEMP 'msys-descriptor-toolchain'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-descriptor-proof'
+          node --test scripts/windows-msys/descriptor-proof/parser.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/windows-msys/descriptor-proof/prepare.py $PWD.Path $prepared
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test scripts/windows-msys/descriptor-proof/discovery.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/windows-msys/descriptor-proof/discover-toolchain.ps1 -WorkRoot $toolchain
+          $manifest = Join-Path $payload 'stage.sha256'
+          $digest = node -e "const fs=require('node:fs'); const p=require('./scripts/windows-msys/probe-built-runtime.cjs'); process.stdout.write(p.stagedDigest(fs.readFileSync(process.argv[1])));" $manifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-msys/descriptor-proof/run.cjs $PWD.Path $prepared (Join-Path $work 'sdk/usr/bin/bash.exe') (Join-Path $payload 'stage/usr/bin/msys-2.0.dll') $output (Join-Path $toolchain 'toolchain.json') $digest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native descriptor proof evidence
+        if: always() && steps.msys-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-descriptor-proof
+          path: |
+            ${{ runner.temp }}/msys-descriptor-prepared
+            ${{ runner.temp }}/msys-descriptor-toolchain
+            ${{ runner.temp }}/msys-descriptor-proof/artifacts
+          if-no-files-found: warn
+      - name: Exercise the built MSYS runtime in a private Bash closure
+        id: msys-smoke
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node scripts/windows-msys/probe-built-runtime.cjs (Join-Path $env:RUNNER_TEMP 'msys-compiler-proof')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compare native entropy initialization directly and through Bash
+        id: msys-entropy
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $toolchain = Join-Path $env:RUNNER_TEMP 'msys-descriptor-toolchain/toolchain.json'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-entropy-proof'
+          node --test scripts/windows-msys/entropy-proof/parser.test.cjs scripts/windows-msys/entropy-proof/probe.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $digest = (Get-FileHash -LiteralPath $toolchain -Algorithm SHA256).Hash.ToLowerInvariant()
+          node scripts/windows-msys/entropy-proof/build.cjs $PWD.Path $toolchain $digest $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-msys/entropy-proof/probe.cjs $work $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native entropy comparison evidence
+        if: always() && steps.msys-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-entropy-proof
+          path: |
+            ${{ runner.temp }}/msys-entropy-proof
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/entropy-proof.jsonl
+          if-no-files-found: warn
+      - name: Verify Bash child process and thread isolation across profiles
+        id: msys-process-security
+        if: steps.msys-proof.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $toolchain = Join-Path $env:RUNNER_TEMP 'msys-descriptor-toolchain/toolchain.json'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-process-security-proof'
+          node --test scripts/windows-msys/process-security-proof/parser.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $digest = (Get-FileHash -LiteralPath $toolchain -Algorithm SHA256).Hash.ToLowerInvariant()
+          node scripts/windows-msys/process-security-proof/run.cjs $PWD.Path $work $toolchain $digest $output
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native process and thread isolation evidence
+        if: always() && steps.msys-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-process-security-proof
+          path: ${{ runner.temp }}/msys-process-security-proof
+          if-no-files-found: warn
+      - name: Verify native POSIX IPC and cancellation with the built MSYS runtime
+        id: msys-posix
+        if: steps.msys-smoke.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          node scripts/windows-msys/probe-posix-runtime.cjs $PWD.Path $work (Join-Path $work 'sdk/issue27-build/posix-compile-fixture')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve the MSYS compiler proof and diagnostics
+        if: always() && steps.msys-proof-input.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-compiler-proof
+          path: |
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/build/*.txt
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/build/**/config.log
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/*.txt
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/*.sha256
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/built-runtime-manifest.json
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/stage
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/proof-runtime-*
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/posix-compile-fixture
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-build/posix-proof-*/results.jsonl
+          if-no-files-found: warn
+      - name: Trace failed MSYS fork initialization in a separate diagnostic build
+        id: msys-fork-trace
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (steps.msys-proof.outcome == 'success' && steps.msys-process-security.outcome == 'failure')
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'msys-compiler-proof'
+          $sdk = Join-Path $work 'sdk'
+          $payload = Join-Path $sdk 'issue27-build'
+          $trace = Join-Path $sdk 'issue27-fork-trace'
+          $normalManifest = Join-Path $env:RUNNER_TEMP 'msys-process-security-proof/native-manifest.json'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-fork-trace-proof'
+          $pythonOutput = @(& python -I -c 'import sys; print(sys.executable)' 2>&1)
+          if ($LASTEXITCODE -ne 0 -or $pythonOutput.Count -ne 1 -or $pythonOutput[0] -isnot [string]) { throw 'Cannot determine one Python executable' }
+          $pythonExe = [string]$pythonOutput[0]
+          if (-not [IO.Path]::IsPathFullyQualified($pythonExe) -or -not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) { throw 'Python identity is not an absolute executable' }
+          $nodeOutput = @(& node -p 'process.execPath' 2>&1)
+          if ($LASTEXITCODE -ne 0 -or $nodeOutput.Count -ne 1 -or $nodeOutput[0] -isnot [string]) { throw 'Cannot determine one Node executable' }
+          $nodeExe = [string]$nodeOutput[0]
+          if (-not [IO.Path]::IsPathFullyQualified($nodeExe) -or -not (Test-Path -LiteralPath $nodeExe -PathType Leaf)) { throw 'Node identity is not an absolute executable' }
+          & $nodeExe --test scripts/windows-msys/fork-init-trace/parser.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonExe -I scripts/windows-msys/fork-init-trace/generate.py (Join-Path $payload 'source') (Join-Path $PWD.Path 'scripts/windows-msys/pipe-security.patch') $trace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $nodeExe -e 'require("./agents/codex/workflow/safe-run-root.js").ensureWindowsPrivateAcl(process.argv[1])' $trace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath scripts/windows-msys/fork-init-trace/build-trace.sh -Destination (Join-Path $trace 'build-trace.sh') -ErrorAction Stop
+          $tracePatchSha = (Get-FileHash -LiteralPath (Join-Path $trace 'trace.patch') -Algorithm SHA256).Hash.ToLowerInvariant()
+          $lock = Get-Content -LiteralPath scripts/windows-msys/build-lock.json -Raw | ConvertFrom-Json
+          $savedPath = $env:PATH
+          try {
+            $env:MSYSTEM = 'MSYS'
+            $env:MSYS2_PATH_TYPE = 'strict'
+            $env:CHERE_INVOKING = '1'
+            $env:PATH = (Join-Path $sdk 'usr/bin') + ';' + (Join-Path $env:SystemRoot 'System32')
+            & (Join-Path $sdk 'usr/bin/bash.exe') --noprofile --norc /issue27-fork-trace/build-trace.sh '4' ([string]$lock.source.sourceDateEpoch) $tracePatchSha
+            if ($LASTEXITCODE -ne 0) { throw 'Separate diagnostic compile failed; preserve logs' }
+          } finally { $env:PATH = $savedPath }
+          $traceDll = Join-Path $trace 'stage/usr/bin/msys-2.0.dll'
+          $traceManifest = Join-Path $trace 'trace-manifest.json'
+          $context = [ordered]@{
+            schema = 1; workRoot = $work
+            traceDll = $traceDll; traceDllSha256 = (Get-FileHash -LiteralPath $traceDll -Algorithm SHA256).Hash.ToLowerInvariant()
+            traceManifest = $traceManifest; traceManifestSha256 = (Get-FileHash -LiteralPath $traceManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+            normalManifest = $normalManifest; normalManifestSha256 = (Get-FileHash -LiteralPath $normalManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+            python = $pythonExe; pythonSha256 = (Get-FileHash -LiteralPath $pythonExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          $contextPath = Join-Path $trace 'context.json'
+          [IO.File]::WriteAllText($contextPath, (($context | ConvertTo-Json -Depth 5) + "`n"), [Text.UTF8Encoding]::new($false))
+          $contextSha = (Get-FileHash -LiteralPath $contextPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          & $nodeExe scripts/windows-msys/fork-init-trace/run.cjs $PWD.Path $contextPath $contextSha $output $env:SystemRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve separate fork initialization trace evidence
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && steps.msys-fork-trace.outcome != 'skipped' && steps.msys-proof-input.outputs.run == 'true')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-fork-initialization-trace
+          path: |
+            ${{ runner.temp }}/msys-fork-trace-proof
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.json
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.patch
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.sh
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.txt
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/*.sha256
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/build/*.txt
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/build/**/config.log
+            ${{ runner.temp }}/msys-compiler-proof/sdk/issue27-fork-trace/stage
+          if-no-files-found: warn
+      # Compile Node separately from MSYS, within the existing matrix. Source or
+      # fixture changes rebuild it; workflow-only diagnostics reuse no binaries
+      # and do not repeat a full compile. Manual dispatch rebuilds both workers.
+      - name: Detect changes to the Node compiler proof
+        id: node-proof-input
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (github.ref == 'refs/heads/codex/issue-27-native-platform-support' && runner.os == 'Windows' && matrix.node == '20.x')
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only HEAD^ HEAD -- scripts/windows-node tests/fixtures/windows-appcontainer/node-pipe-proof.cs tests/fixtures/windows-appcontainer/node-pipe-worker.cjs tests/source/windows-appcontainer-node-pipes.test.cjs tests/helpers/windows-node-pipe-worker.cjs)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "run=$($changed.Count -gt 0 -or '${{ github.event_name }}' -eq 'workflow_dispatch')".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+      - name: Compile the isolated Node AppContainer pipe adapter
+        id: node-proof
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (steps.node-proof-input.outputs.run == 'true')
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          node --test scripts/windows-node/build-boundaries.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test scripts/windows-node/verify-native-proof.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/windows-node/build.ps1 -Architecture '${{ matrix.runner.arch }}' -WorkRoot (Join-Path $env:RUNNER_TEMP 'node-compiler-proof')
+      - name: Require exact subprocess roundtrips with the built Node worker
+        id: node-smoke
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (steps.node-proof.outcome == 'success')
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'node-compiler-proof/stage'
+          $proof = Get-Content -LiteralPath (Join-Path $stage 'provenance.json') -Raw | ConvertFrom-Json
+          $env:AUTOPROMPT_NODE_PIPE_WORKER = Join-Path $stage 'node.exe'
+          $env:AUTOPROMPT_NODE_PIPE_WORKER_SHA256 = $proof.nodeSha256
+          $env:AUTOPROMPT_NODE_PIPE_REQUIRE_SUPPORT = '1'
+          node --test --test-reporter=tap tests/source/windows-appcontainer-node-pipes.test.cjs 2>&1 | Tee-Object -FilePath (Join-Path $stage 'built-runtime-proof.txt')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-node/verify-native-proof.cjs (Join-Path $stage 'built-runtime-proof.txt') (Join-Path $stage 'provenance.json') (Join-Path $stage 'node.exe') $proof.nodeSha256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve the Node compiler output and native observations
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always() && steps.node-proof-input.outputs.run == 'true')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-node-compiler-proof-${{ matrix.runner.arch }}
+          path: |
+            ${{ runner.temp }}/node-compiler-proof/logs
+            ${{ runner.temp }}/node-compiler-proof/stage
+            ${{ runner.temp }}/node-compiler-proof/inputs/build-lock.json
+            ${{ runner.temp }}/node-compiler-proof/inputs/libuv-appcontainer-pipes.patch
+            ${{ runner.temp }}/node-compiler-proof/inputs/libuv-private-nul-capability.patch
+          if-no-files-found: warn
+      - name: Check exact MSYS child creation contracts
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Linux' && matrix.node == '24.x')
+        run: |
+          python3 scripts/windows-msys/child-security-proof/run.py
+          python3 scripts/windows-msys/anonymous-proof/run.py
+          python3 scripts/windows-msys/null-proof/run.py
+          python3 scripts/windows-msys/token-default-proof/run.py
+          python3 scripts/windows-msys/loader-lock-proof/run.py
+          python3 scripts/windows-msys/fork-init-trace/test.py
+          python3 scripts/windows-msys/wincap-local-proof/test.py
+          python3 scripts/windows-msys/wincap-local-proof/audit-pe.test.py
+          node --test scripts/windows-msys/fork-init-trace/parser.test.cjs
+          node --test scripts/windows-msys/process-security-proof/parser.test.cjs
+          node --test scripts/windows-msys/portable-runtime/portable.test.cjs scripts/windows-msys/portable-runtime/cli.test.cjs scripts/windows-msys/portable-runtime/producer-context.test.cjs
+          node --test scripts/windows-msys/portable-probe/*.test.cjs scripts/windows-msys/portable-consumer/native-writer.test.cjs scripts/windows-msys/diagnostic-smoke/diagnostic-smoke.test.cjs
+          python3 -m unittest discover -s scripts/windows-msys/portable-consumer -p 'test_*.py' -v
+      - name: Detect changes for native candidate reuse
+        id: msys-portable-input
+        if: github.ref == 'refs/heads/codex/issue-27-native-platform-support' && runner.os == 'Windows' && (matrix.runner.arch == 'arm64' || inputs.msys_reuse_ci49 == true)
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only HEAD^ HEAD -- .github/workflows/native-platform.yml scripts/windows-msys agents/codex/workflow/windows-appcontainer* agents/codex/workflow/windows-filesystem.ps1 tests/source/windows-bash-runtime.test.cjs tests/fixtures/windows-msys/bash-ipc.sh)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "run=$($changed.Count -gt 0 -or '${{ github.event_name }}' -eq 'workflow_dispatch')".ToLowerInvariant() >> $env:GITHUB_OUTPUT
+      - name: Verify exact MSYS candidate with native Node
+        id: msys-portable
+        if: steps.msys-portable-input.outputs.run == 'true' && steps.runtime-precompiled-proof.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 55
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node --test scripts/windows-msys/portable-consumer/controller-selection.test.cjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # BEGIN exact running Node identity
+          $controllerOutput = @(& node -p 'process.execPath' 2>&1)
+          $controllerStatus = $LASTEXITCODE
+          if ($controllerStatus -ne 0 -or $controllerOutput.Count -ne 1 -or $controllerOutput[0] -isnot [string]) { throw 'Cannot determine one running Node executable' }
+          $controller = [string]$controllerOutput[0]
+          if ($controller.Length -eq 0 -or $controller.Length -gt 32767 -or $controller -match '[\r\n\x00]' -or -not [IO.Path]::IsPathRooted($controller) -or -not (Test-Path -LiteralPath $controller -PathType Leaf)) { throw 'Invalid running Node executable path' }
+          $controllerHashes = @(Get-FileHash -LiteralPath $controller -Algorithm SHA256 -ErrorAction Stop)
+          if ($controllerHashes.Count -ne 1 -or $controllerHashes[0].Hash -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Cannot bind one running Node executable hash' }
+          $digest = ([string]$controllerHashes[0].Hash).ToLowerInvariant()
+          # END exact running Node identity
+          $consumerLog = Join-Path $env:RUNNER_TEMP 'msys-portable-consumer-console.log'
+          New-Item -ItemType File -Path $consumerLog -ErrorAction Stop | Out-Null
+          $reuse = @()
+          if ('${{ inputs.msys_reuse_ci49 }}' -eq 'true') { $reuse = @('--reuse-ci49') }
+          python scripts/windows-msys/portable-consumer/run.py --repo $PWD.Path --output (Join-Path $env:RUNNER_TEMP 'msys-portable-consumer') --controller $controller --controller-sha256 $digest --helper-directory (Join-Path $env:RUNNER_TEMP 'precompiled-capture') --artifact-timeout 2400 @reuse 2>&1 | Tee-Object -FilePath $consumerLog
+          $consumerStatus = $LASTEXITCODE
+          if ($consumerStatus -ne 0) { exit $consumerStatus }
+      - name: Preserve fresh native candidate execution evidence
+        id: msys-portable-evidence
+        if: always() && steps.msys-portable-input.outputs.run == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-portable-${{ matrix.runner.arch }}-node-${{ matrix.node }}
+          path: |
+            ${{ runner.temp }}/msys-portable-consumer
+            ${{ runner.temp }}/msys-portable-consumer-console.log
+          if-no-files-found: error
+      - name: Run platform tests and reject skips of this host's native cases
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
+        run: node tests/helpers/native-platform-ci.cjs platform
+      - name: Verify doctor readiness and isolated Bash and PowerShell diagnostics
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
+        run: node tests/helpers/native-platform-ci.cjs doctor
+      - name: Exercise the actual Windows Git Bash Kilo installer lifecycle
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (runner.os == 'Windows')
+        run: node tests/helpers/native-platform-ci.cjs kilo-shell
+      - name: Preserve platform and diagnostic output
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true) && (always())
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-${{ matrix.runner.os }}-node-${{ matrix.node }}
+          path: |
+            native-platform-primitives.log
+            native-platform-doctor.log
+            native-platform-kilo-shell.log
+            native-platform-snapshot.log
+          if-no-files-found: warn
+      - name: Packed installer lifecycle
+        if: (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)
+        run: node --test --test-concurrency=1 tests/source/packed-harness-v2-lifecycle.test.cjs
+      - name: Require native startup and selected compiler proofs to succeed
+        if: always() && (steps.runtime-physical-proof.outcome == 'failure' || steps.runtime-precompiled-proof.outcome == 'failure' || steps.runtime-precompiled-evidence.outcome == 'failure' || steps.git-acl-proof.outcome == 'failure' || steps.git-acl-evidence.outcome == 'failure' || steps.resource-scale-proof.outcome == 'failure' || steps.resource-scale-evidence.outcome == 'failure' || steps.resource-identity-proof.outcome == 'failure' || steps.resource-identity-evidence.outcome == 'failure' || steps.filesystem-scale-proof.outcome == 'failure' || steps.filesystem-scale-evidence.outcome == 'failure' || steps.powershell-startup.outcome == 'failure' || steps.msys-job-startup.outcome == 'failure' || steps.msys-proof.outcome == 'failure' || steps.msys-wincap.outcome == 'failure' || steps.msys-candidate.outcome == 'failure' || steps.msys-descriptor.outcome == 'failure' || steps.msys-smoke.outcome == 'failure' || steps.msys-entropy.outcome == 'failure' || steps.msys-process-security.outcome == 'failure' || steps.msys-posix.outcome == 'failure' || steps.node-proof.outcome == 'failure' || steps.node-smoke.outcome == 'failure' || steps.msys-portable.outcome == 'failure' || steps.msys-portable-evidence.outcome == 'failure')
+        run: node -e "process.exit(1)"
+
+  claude-native:
+    if: ${{ (inputs.support_stage == '' || inputs.support_stage == 'none') && (github.event_name != 'workflow_dispatch' || (inputs.msys_mapping != true && inputs.msys_pipe_trace != true && inputs.msys_fork_memory != true && (inputs.msys_runtime != true && inputs.msys_reuse_ci49 != true)) ) }}
+    name: ${{ inputs.windows_regressions == true && 'Windows regressions' || 'Actual Claude 2.1.270' }} / ${{ matrix.runner.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.runner.os }}
+    # Windows repeats the fresh process-local command canary in the direct,
+    # packed and public activation suites, including native helper startup and
+    # identity-bound worker storage. The previous suite already took 88 minutes.
+    timeout-minutes: ${{ startsWith(matrix.runner.os, 'windows-') && 120 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(((inputs.windows_regressions == true && inputs.windows_regression_single == true) || (inputs.claude_diagnostic == true && inputs.claude_diagnostic_single == true && inputs.windows_regressions != true)) && '{"runner":[{"os":"windows-latest","arch":"x64"}],"node":["24.x"]}' || (inputs.windows_regressions == true || inputs.claude_diagnostic == true) && '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}' || '{"runner":[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"},{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}],"node":["20.x","24.x"]}') }}
+    env:
+      CLAUDE_CODE_VERSION: '2.1.270'
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.runner.arch }}
+          cache: npm
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.runner.arch }}
+      - name: Install declared Python installer and validation dependencies
+        run: 'python -m pip install --only-binary=:all: PyYAML==6.0.3 jsonschema==4.26.0 referencing==0.37.0'
+      - name: Install and enable Linux sandbox prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: npm ci --ignore-scripts
+      - name: Select the runner's vendor binary
+        if: inputs.windows_regressions != true
+        run: node tests/helpers/native-platform-ci.cjs prepare
+      - name: Install exact native Claude package without lifecycle scripts
+        if: inputs.windows_regressions != true
+        shell: bash
+        run: npm install --prefix .native-claude --ignore-scripts --no-package-lock --no-audit --no-fund "${CLAUDE_NATIVE_PACKAGE}@${CLAUDE_CODE_VERSION}"
+      - name: Require native sandbox and run every Claude capability
+        if: inputs.windows_regressions != true && inputs.claude_diagnostic != true
+        run: node tests/helpers/native-platform-ci.cjs run
+      - name: Diagnose installed native Claude activation
+        if: inputs.windows_regressions != true && inputs.claude_diagnostic == true
+        env:
+          AUTOPROMPT_CLAUDE_DIAGNOSTIC_STAGE: ${{ inputs.claude_diagnostic_stage || 'public' }}
+        run: node tests/helpers/native-platform-ci.cjs diagnose-claude-selected
+      - name: Diagnose Windows cwd, owned proxy and packed installer
+        if: inputs.windows_regressions == true
+        env:
+          AUTOPROMPT_WINDOWS_REGRESSION_STAGE: ${{ inputs.windows_regression_stage || 'all' }}
+        run: node tests/helpers/native-platform-ci.cjs windows-regressions
+      - name: Preserve actual platform evidence and test output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-claude-${{ matrix.runner.os }}-node-${{ matrix.node }}
+          path: |
+            native-platform-evidence.json
+            native-platform-tests.log
+            native-platform-tests-*.log
+          if-no-files-found: warn
+
+  msys-mapping:
+    if: ${{ (inputs.support_stage == '' || inputs.support_stage == 'none') && (github.event_name == 'workflow_dispatch' && (inputs.msys_mapping == true || inputs.msys_fork_memory == true) && inputs.msys_pipe_trace != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' ) }}
+    name: ${{ inputs.msys_fork_memory == true && 'MSYS fork memory diagnostic' || 'MSYS mapping diagnostic' }} / ${{ matrix.runner.os }} / Node 24.x
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.msys_fork_memory == true && '{"runner":[{"os":"windows-latest","arch":"x64"}]}' || '{"runner":[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]}') }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - name: Download and authenticate the pinned CI38 candidate
+        if: inputs.msys_fork_memory != true
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $repository = 'Spielewoy/autoprompt-skill'
+          $repositoryId = 1337733621
+          $artifactId = 10592654730
+          $runId = 35470164986
+          $runAttempt = 1
+          $headSha = 'eff3c98c64e2c1c93aaad13887890d3c4a841844'
+          $artifactName = 'windows-msys-candidate-eff3c98c64e2c1c93aaad13887890d3c4a841844-1'
+          $archiveSha256 = 'c83582caf180266a0e104da07f08ba9ac623381f44925cb2579759dc3b3f7c57'
+          $manifestSha256 = '2fde936d1adc418b039c5d7e65d5d6dacc4469b433a69859ccd6cb12ccde84f4'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $api = "https://api.github.com/repos/$repository"
+          $run = Invoke-RestMethod -Headers $headers -Uri "$api/actions/runs/$runId" -Method Get
+          if ($run.id -ne $runId -or $run.head_sha -ne $headSha -or $run.run_attempt -ne $runAttempt -or $run.repository.full_name -ne $repository -or $run.head_repository.full_name -ne $repository) { throw 'Pinned CI38 run identity mismatch' }
+          $artifact = Invoke-RestMethod -Headers $headers -Uri "$api/actions/artifacts/$artifactId" -Method Get
+          if ($artifact.id -ne $artifactId -or $artifact.name -ne $artifactName -or $artifact.expired -or $artifact.size_in_bytes -ne 2999938 -or $artifact.digest -ne "sha256:$archiveSha256") { throw 'Pinned CI38 artifact metadata mismatch' }
+          if ($artifact.workflow_run.id -ne $runId -or $artifact.workflow_run.repository_id -ne $repositoryId -or $artifact.workflow_run.head_repository_id -ne $repositoryId -or $artifact.workflow_run.head_sha -ne $headSha) { throw 'Pinned CI38 artifact producer mismatch' }
+          $root = Join-Path $env:RUNNER_TEMP ('msys-mapping-' + '${{ matrix.runner.arch }}')
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          $output = Join-Path $env:RUNNER_TEMP 'msys-mapping-proof'
+          New-Item -ItemType Directory -Path $output -ErrorAction Stop | Out-Null
+          $archive = Join-Path $root 'candidate.zip'
+          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri "$api/actions/artifacts/$artifactId/zip" -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $archiveSha256) { throw "Pinned CI38 ZIP digest mismatch: $actualSha256" }
+          $extracted = Join-Path $root 'extracted'
+          Expand-Archive -LiteralPath $archive -DestinationPath $extracted -ErrorAction Stop
+          $packet = Join-Path $extracted 'packet'
+          $manifest = Join-Path $packet 'manifest.json'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Authenticated candidate packet manifest missing' }
+          $actualManifestSha256 = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualManifestSha256 -ne $manifestSha256) { throw "Pinned CI38 manifest digest mismatch: $actualManifestSha256" }
+          [ordered]@{
+            repository = $repository
+            repositoryId = $repositoryId
+            runId = $run.id
+            runAttempt = $run.run_attempt
+            headSha = $run.head_sha
+            artifactId = $artifact.id
+            artifactName = $artifact.name
+            artifactSize = $artifact.size_in_bytes
+            artifactDigest = $artifact.digest
+            archiveSha256 = $actualSha256
+            manifestSha256 = $actualManifestSha256
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $output 'ci38-authentication.json') -Encoding utf8
+          $toolchainRoot = Join-Path $output 'pipe-toolchain'
+          ./scripts/windows-msys/descriptor-proof/discover-toolchain.ps1 -WorkRoot $toolchainRoot
+          $toolchain = Join-Path $toolchainRoot 'toolchain.json'
+          $toolchainHash = (Get-FileHash -LiteralPath $toolchain -Algorithm SHA256).Hash.ToLowerInvariant()
+          $probe = Join-Path $output 'pipe-probe-build'
+          node scripts/windows-msys/mapping-proof/build-pipe.cjs $PWD.Path $toolchain $toolchainHash $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/windows-msys/mapping-proof/run.cjs $PWD.Path $packet $output $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native MSYS mapping diagnostic
+        if: always() && inputs.msys_fork_memory != true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-mapping-${{ matrix.runner.arch }}-node-24.x
+          path: ${{ runner.temp }}/msys-mapping-proof
+          if-no-files-found: error
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: inputs.msys_fork_memory == true
+        with:
+          python-version: '3.12'
+      - name: Observe the bundled runtime's fork memory reservations
+        if: inputs.msys_fork_memory == true
+        shell: pwsh
+        run: |
+          node scripts/windows-msys/fork-memory-diagnostic/compare.cjs $PWD.Path (Join-Path $env:RUNNER_TEMP 'msys-fork-memory')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native fork memory observations
+        if: always() && inputs.msys_fork_memory == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msys-fork-memory-${{ matrix.runner.arch }}-node-24.x
+          path: |
+            ${{ runner.temp }}/msys-fork-memory/*.json
+            ${{ runner.temp }}/msys-fork-memory/*.txt
+            ${{ runner.temp }}/msys-fork-memory/generated/*
+            ${{ runner.temp }}/msys-fork-memory/work/*.json
+            ${{ runner.temp }}/msys-fork-memory/*/*.json
+            ${{ runner.temp }}/msys-fork-memory/*/*.txt
+            ${{ runner.temp }}/msys-fork-memory/*/generated/*
+            ${{ runner.temp }}/msys-fork-memory/*/work/*.json
+          if-no-files-found: error
+
+  msys-pipe-trace:
+    if: ${{ (inputs.support_stage == '' || inputs.support_stage == 'none') && (github.event_name == 'workflow_dispatch' && inputs.msys_pipe_trace == true && inputs.msys_fork_memory != true && github.ref == 'refs/heads/codex/issue-27-native-platform-support' ) }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.x
+          architecture: x64
+      - name: Download and authenticate the pinned CI38 candidate
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $repository = 'Spielewoy/autoprompt-skill'
+          $repositoryId = 1337733621
+          $artifactId = 10592654730
+          $runId = 35470164986
+          $runAttempt = 1
+          $headSha = 'eff3c98c64e2c1c93aaad13887890d3c4a841844'
+          $artifactName = 'windows-msys-candidate-eff3c98c64e2c1c93aaad13887890d3c4a841844-1'
+          $archiveSha256 = 'c83582caf180266a0e104da07f08ba9ac623381f44925cb2579759dc3b3f7c57'
+          $manifestSha256 = '2fde936d1adc418b039c5d7e65d5d6dacc4469b433a69859ccd6cb12ccde84f4'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $api = "https://api.github.com/repos/$repository"
+          $run = Invoke-RestMethod -Headers $headers -Uri "$api/actions/runs/$runId" -Method Get
+          if ($run.id -ne $runId -or $run.head_sha -ne $headSha -or $run.run_attempt -ne $runAttempt -or $run.repository.full_name -ne $repository -or $run.head_repository.full_name -ne $repository) { throw 'Pinned CI38 run identity mismatch' }
+          $artifact = Invoke-RestMethod -Headers $headers -Uri "$api/actions/artifacts/$artifactId" -Method Get
+          if ($artifact.id -ne $artifactId -or $artifact.name -ne $artifactName -or $artifact.expired -or $artifact.size_in_bytes -ne 2999938 -or $artifact.digest -ne "sha256:$archiveSha256") { throw 'Pinned CI38 artifact metadata mismatch' }
+          if ($artifact.workflow_run.id -ne $runId -or $artifact.workflow_run.repository_id -ne $repositoryId -or $artifact.workflow_run.head_repository_id -ne $repositoryId -or $artifact.workflow_run.head_sha -ne $headSha) { throw 'Pinned CI38 artifact producer mismatch' }
+          $root = Join-Path $env:RUNNER_TEMP ('msys-pipe-trace-candidate')
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          $output = Join-Path $env:RUNNER_TEMP 'msys-mapping-proof'
+          New-Item -ItemType Directory -Path $output -ErrorAction Stop | Out-Null
+          $archive = Join-Path $root 'candidate.zip'
+          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri "$api/actions/artifacts/$artifactId/zip" -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $archiveSha256) { throw "Pinned CI38 ZIP digest mismatch: $actualSha256" }
+          $extracted = Join-Path $root 'extracted'
+          Expand-Archive -LiteralPath $archive -DestinationPath $extracted -ErrorAction Stop
+          $packet = Join-Path $extracted 'packet'
+          $manifest = Join-Path $packet 'manifest.json'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Authenticated candidate packet manifest missing' }
+          $actualManifestSha256 = (Get-FileHash -LiteralPath $manifest -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualManifestSha256 -ne $manifestSha256) { throw "Pinned CI38 manifest digest mismatch: $actualManifestSha256" }
+          [ordered]@{
+            repository = $repository
+            repositoryId = $repositoryId
+            runId = $run.id
+            runAttempt = $run.run_attempt
+            headSha = $run.head_sha
+            artifactId = $artifact.id
+            artifactName = $artifact.name
+            artifactSize = $artifact.size_in_bytes
+            artifactDigest = $artifact.digest
+            archiveSha256 = $actualSha256
+            manifestSha256 = $actualManifestSha256
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $output 'ci38-authentication.json') -Encoding utf8
+          "$packet" | Set-Content -LiteralPath (Join-Path $output 'packet-path.txt') -Encoding utf8
+      - name: Restore the authenticated CI46 diagnostic build
+        if: inputs.msys_pipe_reuse == true
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./scripts/windows-msys/pipe-io-trace/reuse-ci46.ps1 -Output (Join-Path $env:RUNNER_TEMP 'msys-mapping-proof')
+      - name: Build one isolated diagnostic MSYS runtime
+        if: inputs.msys_pipe_reuse != true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-mapping-proof'
+          $sourceRoot = Join-Path $output 'trace-source'
+          New-Item -ItemType Directory -Path $sourceRoot -ErrorAction Stop | Out-Null
+          $lock = Get-Content -LiteralPath scripts/windows-msys/build-lock.json -Raw | ConvertFrom-Json
+          $archive = Join-Path $sourceRoot 'source.tar.gz'
+          Invoke-WebRequest -UseBasicParsing -Uri $lock.source.url -OutFile $archive -TimeoutSec 300
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $lock.source.sha256) { throw 'Source archive mismatch' }
+          $source = Join-Path $sourceRoot 'pristine'
+          New-Item -ItemType Directory -Path $source -ErrorAction Stop | Out-Null
+          tar -xzf $archive --strip-components=1 -C $source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $prepared = Join-Path $output 'pipe-trace-inputs'
+          python -I scripts/windows-msys/pipe-io-trace/generate.py $source scripts/windows-msys/pipe-security.patch $prepared
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $patch = Join-Path $prepared 'combined.patch'
+          $digest = (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash.ToLowerInvariant()
+          $savedPath = $env:PATH
+          try {
+            ./scripts/windows-msys/build.ps1 -WorkRoot (Join-Path $env:RUNNER_TEMP 'msys-pipe-trace-build') -Mode proof -AdaptationPatch $patch -AdaptationSha256 $digest -Jobs 4
+          } finally { $env:PATH = $savedPath }
+      - name: Observe parent reads and child writes in the sandbox
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP 'msys-mapping-proof'
+          $packet = (Get-Content -LiteralPath (Join-Path $output 'packet-path.txt') -Raw).Trim()
+          $payload = Join-Path $env:RUNNER_TEMP 'msys-pipe-trace-build/sdk/issue27-build'
+          if ('${{ inputs.msys_pipe_reuse }}' -eq 'true') {
+            $payload = (Get-Content -LiteralPath (Join-Path $output 'reused-payload-path.txt') -Raw).Trim()
+            node scripts/windows-msys/pipe-io-trace/run.cjs $PWD.Path $packet $output $payload ci46-reuse
+          } else {
+            node scripts/windows-msys/pipe-io-trace/run.cjs $PWD.Path $packet $output $payload
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve diagnostic observations and compiler evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-pipe-io-trace
+          path: |
+            ${{ runner.temp }}/msys-mapping-proof/ci38-authentication.json
+            ${{ runner.temp }}/msys-mapping-proof/ci46-reuse.json
+            ${{ runner.temp }}/msys-mapping-proof/pipe-trace-inputs
+            ${{ runner.temp }}/msys-mapping-proof/pipe-io-diagnostic-*
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/*.txt
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/*.sha256
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/adaptation.patch
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/lock.json
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/build/*.txt
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/build/**/config.log
+            ${{ runner.temp }}/msys-pipe-trace-build/sdk/issue27-build/stage/usr/bin/msys-2.0.dll
+          if-no-files-found: error
+
+  macos-containment:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-containment'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - run: npm ci --ignore-scripts
+      - name: Exercise kernel process grouping and detached descendants
+        shell: bash
+        run: |
+          set -o pipefail
+          export AUTOPROMPT_DARWIN_COALITION_EVIDENCE="$RUNNER_TEMP/darwin-coalition-proof.json"
+          node --test --test-reporter=tap scripts/darwin-coalition-proof/coalition-proof.test.cjs 2>&1 | tee darwin-coalition-proof.log
+      - name: Exercise durable coalition ownership and kernel task counts
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          export AUTOPROMPT_DARWIN_PROCESS_EVIDENCE="$RUNNER_TEMP/darwin-launchd-process-evidence.json"
+          node --test --test-reporter=tap tests/source/darwin-launchd-process-native.test.cjs 2>&1 | tee darwin-launchd-process.log
+      - name: Exercise native command isolation and cancellation
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          export AUTOPROMPT_DARWIN_COMMAND_EVIDENCE_DIR="$RUNNER_TEMP"
+          export AUTOPROMPT_DARWIN_COMMAND_STARTUP_DIAGNOSTIC=1
+          node --test --test-reporter=tap tests/source/darwin-command-sandbox.test.cjs 2>&1 | tee darwin-command-sandbox.log
+      - name: Diagnose durable launchd listener ownership for Grok
+        if: ${{ !cancelled() }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -o pipefail
+          # macOS only accepts configured loopback aliases. This disposable
+          # runner alias is a live hostile endpoint for the exact-host test.
+          sudo -n /sbin/ifconfig lo0 alias 127.0.0.2
+          trap 'sudo -n /sbin/ifconfig lo0 -alias 127.0.0.2' EXIT
+          node --test --test-reporter=tap tests/source/darwin-launchd-socket-native.test.cjs 2>&1 | tee darwin-launchd-socket.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: coalition-${{ matrix.os }}
+          path: |
+            darwin-coalition-proof.log
+            darwin-launchd-process.log
+            darwin-command-sandbox.log
+            darwin-launchd-socket.log
+            ${{ runner.temp }}/darwin-coalition-proof.json
+            ${{ runner.temp }}/darwin-launchd-process-evidence.json
+            ${{ runner.temp }}/darwin-command-sandbox-evidence.json
+            ${{ runner.temp }}/darwin-coalition-helper
+          if-no-files-found: error
+
+  macos-exclusive-fd:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-exclusive-fd'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Test OS retention of exclusive caller-created listeners
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo -n /sbin/ifconfig lo0 alias 127.0.0.2
+          trap 'sudo -n /sbin/ifconfig lo0 -alias 127.0.0.2' EXIT
+          node --test --test-reporter=tap tests/source/darwin-launchd-exclusive-fd-native.test.cjs 2>&1 | tee darwin-launchd-exclusive-fd.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: exclusive-fd-${{ matrix.os }}
+          path: darwin-launchd-exclusive-fd.log
+          if-no-files-found: error
+
+  macos-ipv6-loopback:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-ipv6-loopback'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Test IPv6-only admission and retained listener ownership
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo -n /sbin/ifconfig lo0 alias 127.0.0.2
+          trap 'sudo -n /sbin/ifconfig lo0 -alias 127.0.0.2' EXIT
+          node --test --test-reporter=tap tests/source/darwin-launchd-ipv6-native.test.cjs 2>&1 | tee darwin-launchd-ipv6.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ipv6-loopback-${{ matrix.os }}
+          path: darwin-launchd-ipv6.log
+          if-no-files-found: error
+
+  macos-listener-handoff:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-listener-handoff'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Compile and test retained launchd listener handoff
+        timeout-minutes: 7
+        shell: bash
+        env:
+          AUTOPROMPT_DARWIN_LISTENER_HANDOFF_EVIDENCE: ${{ runner.temp }}/darwin-launchd-listener-handoff-evidence.json
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/darwin-launchd-listener-handoff-native.test.cjs 2>&1 | tee darwin-launchd-listener-handoff.log
+      - name: Verify production listener supervisor and owned generation recovery
+        timeout-minutes: 7
+        shell: bash
+        env:
+          AUTOPROMPT_DARWIN_LISTENER_PRODUCTION: '1'
+          AUTOPROMPT_DARWIN_LISTENER_HANDOFF_EVIDENCE: ${{ runner.temp }}/darwin-listener-production/evidence.json
+        run: |
+          set -o pipefail
+          mkdir -m 700 "$RUNNER_TEMP/darwin-listener-production"
+          node --test --test-reporter=tap tests/source/darwin-launchd-listener-handoff-native.test.cjs tests/source/darwin-launchd-process-native.test.cjs 2>&1 | tee darwin-listener-production.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: listener-handoff-${{ matrix.os }}
+          path: |
+            darwin-launchd-listener-handoff.log
+            ${{ runner.temp }}/darwin-launchd-listener-handoff-evidence.json
+            ${{ runner.temp }}/darwin-launchd-listener-handoff
+            darwin-listener-production.log
+            ${{ runner.temp }}/darwin-listener-production
+          if-no-files-found: error
+
+  macos-helper-build:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'macos-helper-build'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+      - name: Compile and verify the candidate helper under process churn
+        timeout-minutes: 9
+        shell: bash
+        env:
+          AUTOPROMPT_DARWIN_CANDIDATE_PATH: ${{ runner.temp }}/darwin-coalition-candidate
+          AUTOPROMPT_DARWIN_CANDIDATE_EVIDENCE: ${{ runner.temp }}/darwin-coalition-candidate-proof.json
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/darwin-coalition-churn-api.test.cjs tests/source/darwin-coalition-helper-churn.test.cjs 2>&1 | tee darwin-coalition-candidate.log
+      - name: Verify packaged native ownership and prepared duplex relay
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/darwin-launchd-process-native.test.cjs tests/source/owned-proxy-resource-lifecycle.test.cjs 2>&1 | tee darwin-packaged-ownership.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: coalition-candidate-${{ matrix.os }}
+          path: |
+            darwin-coalition-candidate.log
+            darwin-packaged-ownership.log
+            ${{ runner.temp }}/darwin-coalition-candidate
+            ${{ runner.temp }}/darwin-coalition-candidate-proof.json
+          if-no-files-found: error
+
+  windows-bootstrap:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'windows-bootstrap'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+        node: [20.x, 24.x]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+      - run: npm ci --ignore-scripts
+      - name: Verify isolated Git configuration beyond MAX_PATH
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/windows-git-bootstrap-config.test.cjs tests/source/activation-powershell-argv.test.cjs tests/source/harness-v2-windows-shim.test.cjs 2>&1 | tee windows-git-bootstrap.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: git-bootstrap-${{ matrix.os }}-${{ matrix.node }}
+          path: windows-git-bootstrap.log
+          if-no-files-found: error
+
+  windows-provider-primitives:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'windows-provider-primitives'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.support_single == true && '["windows-latest"]' || inputs.support_arm == true && '["windows-11-arm"]' || '["windows-latest","windows-11-arm"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ inputs.support_primitive == 'hermes' && 90 || 40 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+      - run: npm ci --ignore-scripts
+      - name: Verify same-container transport without host loopback authority
+        if: inputs.support_primitive == 'all' || inputs.support_primitive == 'relay'
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/windows-appcontainer-internal-loopback.test.cjs 2>&1 | tee windows-internal-loopback.log
+      - name: Verify inherited authenticated relay stdin through native AppContainer
+        if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'relay') }}
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/windows-appcontainer-relay-native.test.cjs 2>&1 | tee windows-relay-native.log
+          node --test --test-reporter=tap --test-name-pattern='native Windows named pipe' tests/source/harness-v2-grok-sandbox.test.cjs 2>&1 | tee grok-windows-relay.log
+      - name: Verify owned proxy duplex relay and resource drain receipt
+        if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'relay' || inputs.support_primitive == 'owned-relay') }}
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/owned-proxy-resource-lifecycle.test.cjs 2>&1 | tee owned-proxy-relay.log
+      - name: Verify kernel lease release after normal close and forced Job termination
+        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' && inputs.support_primitive != 'vscode-path' && inputs.support_primitive != 'codex-isolated-network' }}
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/harness-v2-windows-tool-lease-native.test.cjs 2>&1 | tee windows-tool-lease-native.log
+      - name: Verify native token profile bootstrap without inherited compiler temp
+        if: ${{ !cancelled() && inputs.support_primitive != 'hermes' && inputs.support_primitive != 'vscode-path' && inputs.support_primitive != 'codex-isolated-network' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap --test-name-pattern='native Windows token profile bootstrap' tests/source/windows-appcontainer.test.cjs 2>&1 | tee windows-token-profile.log
+      - name: Verify private VS Code short paths and junction cleanup
+        if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'vscode-path') }}
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/harness-v2-vscode-ipc-alias.test.cjs 2>&1 | tee windows-vscode-short-path.log
+      - name: Acquire pinned Codex for isolated-account network probe
+        if: inputs.support_primitive == 'codex-isolated-network'
+        run: npm install --prefix .native-provider --no-package-lock --no-audit --no-fund @openai/codex@0.148.0
+      - name: Initialize the native Windows Codex sandbox identity
+        if: inputs.support_primitive == 'codex-isolated-network'
+        timeout-minutes: 12
+        run: node tests/helpers/bootstrap-codex-native-windows.cjs
+      - name: Probe Codex sandbox with a dedicated account and kernel network block
+        if: inputs.support_primitive == 'codex-isolated-network'
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node tests/helpers/codex-windows-network-probe.cjs 2>&1 | tee codex-windows-network-probe.log
+      - name: Acquire the pinned official Hermes Windows installation
+        if: ${{ !cancelled() && (inputs.support_primitive == 'all' || inputs.support_primitive == 'hermes') }}
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          ./tests/helpers/install-hermes-windows-ci.ps1 -OutputRoot (Join-Path $env:RUNNER_TEMP 'hermes-windows-0.21.1')
+      - name: Bind generated Hermes launchers and interpreter
+        if: ${{ !cancelled() && env.AUTOPROMPT_HERMES_WINDOWS_CLI != '' }}
+        shell: bash
+        env:
+          AUTOPROMPT_HERMES_WINDOWS_EVIDENCE: ${{ runner.temp }}/hermes-windows-launcher-evidence.json
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap tests/source/hermes-windows-launcher-native.test.cjs 2>&1 | tee hermes-windows-launcher.tap
+      - name: Exercise selected native Hermes capabilities
+        if: ${{ inputs.support_primitive == 'hermes' && env.AUTOPROMPT_HERMES_WINDOWS_CLI != '' }}
+        timeout-minutes: 45
+        shell: bash
+        env:
+          AUTOPROMPT_HERMES_TEST_CLI: ${{ env.AUTOPROMPT_HERMES_WINDOWS_CLI }}
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
+          AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1'
+          AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+        run: node tests/helpers/provider-platform-ci.cjs hermes
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: provider-primitives-${{ matrix.os }}
+          path: |
+            windows-internal-loopback.log
+            codex-windows-network-probe.log
+            windows-relay-native.log
+            grok-windows-relay.log
+            owned-proxy-relay.log
+            windows-tool-lease-native.log
+            windows-token-profile.log
+            windows-vscode-short-path.log
+            hermes-windows-launcher.tap
+            native-hermes-evidence.json
+            native-hermes-tests.log
+            ${{ runner.temp }}/hermes-windows-launcher-evidence.json
+            ${{ runner.temp }}/hermes-windows-0.21.1/official-installer.log
+            ${{ runner.temp }}/hermes-public-launcher.exe
+            ${{ runner.temp }}/hermes-venv-launcher.exe
+          if-no-files-found: error
+
+  opencode:
+    if: github.event_name == 'workflow_dispatch' && (inputs.support_stage == 'opencode' || inputs.support_stage == 'opencode-startup')
+    name: Provider / ${{ inputs.support_provider }} / ${{ matrix.runner.os }} / Node 24
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.support_stage == 'opencode-startup' && '[{"os":"windows-latest","arch":"x64"}]' || inputs.support_host == 'windows' && inputs.support_arm == true && '[{"os":"windows-11-arm","arch":"arm64"}]' || inputs.support_host == 'windows' && inputs.support_single == true && '[{"os":"windows-latest","arch":"x64"}]' || inputs.support_host == 'linux' && inputs.support_arm == true && '[{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_host == 'linux' && inputs.support_single == true && '[{"os":"ubuntu-latest","arch":"x64"}]' || inputs.support_host == 'linux' && '[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_host == 'macos' && inputs.support_single == true && '[{"os":"macos-15-intel","arch":"x64"}]' || inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 60
+    env:
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+      CLAUDE_CODE_VERSION: '2.1.270'
+      SUPPORT_PROVIDER: ${{ inputs.support_stage == 'opencode-startup' && 'opencode' || inputs.support_provider }}
+      PROVIDER_PACKAGE: ${{ inputs.support_stage == 'opencode-startup' && 'opencode-ai@1.18.32' || inputs.support_provider == 'codex' && '@openai/codex@0.148.0' || inputs.support_provider == 'grok' && '@xai-official/grok@1.0.13' || inputs.support_provider == 'deepseek' && '@deepseek-ai/dsh@0.1.2-rc.1' || inputs.support_provider == 'reasonix' && 'reasonix@1.30.0' || inputs.support_provider == 'prime' && './.native-provider/prime-agent-0.7.2.tgz' || inputs.support_provider == 'kilo' && '@kilocode/cli@7.5.15' || 'opencode-ai@1.18.32' }}
+      PROVIDER_BIN: ${{ inputs.support_stage == 'opencode-startup' && 'opencode' || inputs.support_provider == 'claude' && 'claude' || inputs.support_provider == 'codex' && 'codex' || inputs.support_provider == 'grok' && 'grok' || inputs.support_provider == 'deepseek' && 'dsh' || inputs.support_provider == 'reasonix' && 'reasonix' || inputs.support_provider == 'prime' && 'prime-agent' || inputs.support_provider == 'kilo' && 'kilo' || 'opencode' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - name: Enable Linux native isolation
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: npm ci --ignore-scripts
+      - name: Install declared Codex installer Python dependencies
+        if: inputs.support_stage == 'opencode' && inputs.support_provider == 'codex'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.runner.arch }}
+      - name: Install exact Codex installer validation dependencies
+        if: inputs.support_stage == 'opencode' && inputs.support_provider == 'codex'
+        run: 'python -m pip install --only-binary=:all: PyYAML==6.0.3 jsonschema==4.26.0 referencing==0.37.0'
+      - name: Install supported Bash for the macOS Codex installer
+        if: runner.os == 'macOS' && inputs.support_stage == 'opencode' && inputs.support_provider == 'codex'
+        shell: bash
+        run: brew install bash
+      - name: Download the exact Prime release archive
+        if: inputs.support_stage != 'opencode-startup' && inputs.support_provider == 'prime'
+        run: node tests/helpers/install-provider-release-ci.cjs prime
+      - name: Install the reported official npm provider and its generated launchers
+        if: inputs.support_stage == 'opencode-startup' || (inputs.support_provider != 'omp' && inputs.support_provider != 'claude')
+        run: npm install --prefix .native-provider --no-package-lock --no-audit --no-fund ${{ env.PROVIDER_PACKAGE }}
+      - name: Install the exact native OMP release
+        if: inputs.support_stage != 'opencode-startup' && inputs.support_provider == 'omp'
+        run: node tests/helpers/install-provider-release-ci.cjs omp
+      - name: Prepare the exact native Claude package identity
+        if: inputs.support_stage == 'opencode' && inputs.support_provider == 'claude'
+        run: node tests/helpers/native-platform-ci.cjs prepare
+      - name: Install the exact native Claude package
+        if: inputs.support_stage == 'opencode' && inputs.support_provider == 'claude'
+        shell: bash
+        run: npm install --prefix .native-provider --ignore-scripts --no-package-lock --no-audit --no-fund "${CLAUDE_NATIVE_PACKAGE}@${CLAUDE_CODE_VERSION}"
+      - name: Bind the actual npm command shim on Windows
+        if: inputs.support_stage == 'opencode-startup' || (inputs.support_provider != 'omp' && inputs.support_provider != 'claude')
+        run: >-
+          node -e "const fs=require('node:fs'),path=require('node:path');
+          const suffix=process.platform==='win32'?'.cmd':'';
+          const file=fs.realpathSync.native(path.resolve('.native-provider/node_modules/.bin/'+process.env.PROVIDER_BIN+suffix));
+          if(process.platform==='win32'&&path.extname(file).toLowerCase()!=='.cmd')throw new Error('Expected the generated npm .cmd launcher');
+          fs.appendFileSync(process.env.GITHUB_ENV,'AUTOPROMPT_'+process.env.SUPPORT_PROVIDER.toUpperCase()+'_TEST_CLI='+file+'\n');"
+      - name: Bind the exact native Claude executable
+        if: inputs.support_stage == 'opencode' && inputs.support_provider == 'claude'
+        shell: bash
+        run: >-
+          node -e "const fs=require('node:fs'),path=require('node:path');
+          const packageName=process.env.CLAUDE_NATIVE_PACKAGE;
+          if(typeof packageName!=='string'||!/^@anthropic-ai\/claude-code-(?:darwin|linux|win32)-(?:x64|arm64)$/.test(packageName))throw new Error('Unexpected Claude native package binding');
+          const file=fs.realpathSync.native(path.resolve('.native-provider/node_modules',packageName,process.platform==='win32'?'claude.exe':'claude'));
+          if(!fs.statSync(file).isFile())throw new Error('Expected exact native Claude executable');
+          fs.appendFileSync(process.env.GITHUB_ENV,'AUTOPROMPT_CLAUDE_TEST_CLI='+file+'\n');"
+      - name: Require all eleven native provider capabilities
+        if: inputs.support_stage == 'opencode' && inputs.support_provider != 'codex'
+        # Preserve native failure artifacts even when a provider/test cleanup
+        # hangs; the job deadline must leave time for the always-upload step.
+        timeout-minutes: 45
+        env:
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
+        run: node tests/helpers/provider-platform-ci.cjs ${{ env.SUPPORT_PROVIDER }}
+      - name: Initialize the native Windows Codex sandbox identity
+        if: runner.os == 'Windows' && inputs.support_stage == 'opencode' && inputs.support_provider == 'codex'
+        shell: bash
+        run: |
+          node tests/helpers/bootstrap-codex-native-windows.cjs
+      - name: Require the real Codex dynamic preflight
+        if: inputs.support_stage == 'opencode' && inputs.support_provider == 'codex'
+        timeout-minutes: 15
+        shell: bash
+        env:
+          AUTOPROMPT_REAL_CODEX_PREFLIGHT: '1'
+        run: |
+          set -o pipefail
+          PATH="$GITHUB_WORKSPACE/.native-provider/node_modules/.bin:$PATH" node --test --test-concurrency=1 --test-reporter=tap --test-name-pattern='^real Codex dynamic preflight accepts the isolated qualified activation without a model call$' tests/source/codex-explicit-activation-v2.test.cjs | tee native-codex-tests.log
+          PATH="$GITHUB_WORKSPACE/.native-provider/node_modules/.bin:$PATH" node -e "const fs=require('node:fs'),{testSummary}=require('./scripts/harness-v2-conformance.cjs');const summary=testSummary(fs.readFileSync('native-codex-tests.log','utf8'));if(summary.tests!==1||summary.pass!==1||summary.fail!==0||summary.cancelled!==0||summary.skipped!==0||summary.todo!==0)throw new Error('Codex preflight TAP evidence is incomplete: '+JSON.stringify(summary));fs.writeFileSync('native-codex-evidence.json',JSON.stringify({schemaVersion:1,provider:'codex',platform:process.platform,architecture:process.arch,node:process.version,commit:process.env.GITHUB_SHA,scope:'installed-provider-no-model-preflight',preflightPassed:true,counts:summary},null,2)+'\\n');"
+      - name: Diagnose Codex Windows sandbox network identity and firewall scope
+        if: always() && runner.os == 'Windows' && inputs.support_stage == 'opencode' && inputs.support_provider == 'codex'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $accounts = @('CodexSandboxOffline', 'CodexSandboxOnline')
+          $identities = foreach ($name in $accounts) {
+            try {
+              $user = Get-LocalUser -Name $name -ErrorAction Stop
+              [ordered]@{ name = $name; present = $true; enabled = [bool]$user.Enabled; sid = [string]$user.SID.Value }
+            } catch {
+              [ordered]@{ name = $name; present = $false; enabled = $null; sid = $null }
+            }
+          }
+          $ruleNames = @(
+            'codex_sandbox_offline_block_outbound',
+            'codex_sandbox_offline_block_loopback_tcp',
+            'codex_sandbox_offline_block_loopback_udp',
+            'codex_sandbox_offline_allow_loopback_proxy'
+          )
+          # The official setup helper uses INetFwPolicy2.Rules.Item(name) after
+          # setting INetFwRule3.Name. Use that exact COM lookup, rather than the
+          # NetSecurity provider's rule identity, to audit the installed rules.
+          $policy = New-Object -ComObject HNetCfg.FwPolicy2
+          $rules = foreach ($name in $ruleNames) {
+            try {
+              $rule = $policy.Rules.Item($name)
+            } catch {
+              [ordered]@{ name = $name; present = $false; enabled = $null; direction = $null; action = $null; profile = $null; securityLocalUser = $null; remoteAddress = $null; protocol = $null; remotePort = $null }
+              continue
+            }
+            [ordered]@{
+              name = $name
+              present = $true
+              enabled = [string]$rule.Enabled
+              direction = [string]$rule.Direction
+              action = [string]$rule.Action
+              profile = [string]$rule.Profiles
+              securityLocalUser = [string]$rule.LocalUserAuthorizedList
+              remoteAddress = [string]$rule.RemoteAddresses
+              protocol = [string]$rule.Protocol
+              remotePort = [string]$rule.RemotePorts
+            }
+          }
+          $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
+            [ordered]@{ name = [string]$_.Name; enabled = [string]$_.Enabled }
+          })
+          [ordered]@{
+            schemaVersion = 1
+            identities = @($identities)
+            rules = @($rules)
+            profiles = $profiles
+          } | ConvertTo-Json -Depth 4 -Compress | Tee-Object -FilePath native-codex-network-diagnostic.json
+      - name: Compare OpenCode startup at shallow and deep private temporary roots
+        if: inputs.support_stage == 'opencode-startup'
+        timeout-minutes: 35
+        env:
+          AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1'
+          AUTOPROMPT_OPENCODE_STARTUP_DIAGNOSTIC: '1'
+        shell: pwsh
+        run: |
+          node --test --test-concurrency=1 --test-reporter=tap --test-name-pattern='OpenCode Windows startup diagnostic' tests/source/harness-v2-opencode-capability-native.test.cjs *> opencode-startup-tests.log
+          $result = $LASTEXITCODE
+          Get-Content opencode-startup-tests.log
+          exit $result
+      - name: Collect bounded macOS Grok sandbox denial diagnostics
+        if: always() && runner.os == 'macOS' && inputs.support_stage == 'opencode' && env.SUPPORT_PROVIDER == 'grok'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import subprocess
+
+          output = 'grok-macos-sandbox-denials.json'
+          result = {'schemaVersion': 1, 'status': 'unavailable', 'records': []}
+          pattern = re.compile(r'\bgrok\((?P<pid>[0-9]+)\)\s+deny(?:\([0-9]+\))?(?=\s)')
+
+          def bounded(value, limit=1024):
+              data = value.encode('utf-8', 'replace')[:limit]
+              return data.decode('utf-8', 'replace')
+
+          try:
+              completed = subprocess.run(
+                  [
+                      '/usr/bin/sudo', '-n', '/usr/bin/log', 'show', '--last', '10m', '--style', 'compact', '--info', '--debug',
+                      '--predicate',
+                      'eventMessage CONTAINS[c] "Sandbox" AND eventMessage CONTAINS[c] "grok"',
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  encoding='utf-8',
+                  errors='replace',
+                  timeout=30,
+                  check=False,
+              )
+              for line in completed.stdout.splitlines():
+                  match = pattern.search(line)
+                  if not match:
+                      continue
+                  result['records'].append({
+                      'observedPid': match.group('pid'),
+                      'message': bounded(line),
+                  })
+                  if len(result['records']) == 40:
+                      break
+              result['status'] = 'records' if result['records'] else ('none' if completed.returncode == 0 else 'unavailable')
+              result['logStatus'] = completed.returncode
+              if completed.returncode != 0:
+                  result['error'] = bounded(completed.stderr, 512)
+          except subprocess.TimeoutExpired:
+              result['status'] = 'unavailable'
+              result['error'] = 'log-show-timeout'
+          except Exception as error:
+              result['status'] = 'unavailable'
+              result['error'] = bounded(type(error).__name__, 128)
+
+          with open(output, 'w', encoding='utf-8') as handle:
+              json.dump(result, handle, sort_keys=True, separators=(',', ':'))
+              handle.write('\n')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ${{ inputs.support_stage == 'opencode-startup' && 'opencode-startup' || inputs.support_provider }}-${{ matrix.runner.os }}-node24
+          path: |
+            native-${{ inputs.support_provider }}-evidence.json
+            native-${{ inputs.support_provider }}-tests.log
+            native-codex-network-diagnostic.json
+            opencode-startup-tests.log
+            grok-macos-sandbox-denials.json
+          if-no-files-found: error
+
+  opencode-public:
+    if: github.event_name == 'workflow_dispatch' && inputs.support_stage == 'opencode-public'
+    name: Public OpenCode / ${{ matrix.runner.os }} / Node 24
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.support_arm == true && '[{"os":"windows-11-arm","arch":"arm64"}]' || inputs.support_single == true && '[{"os":"windows-latest","arch":"x64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 135
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - run: npm ci --ignore-scripts
+      - run: npm install --prefix .native-provider --no-package-lock --no-audit --no-fund opencode-ai@1.18.32
+      - name: Verify genuine npm launchers and packed public activation
+        timeout-minutes: 125
+        env:
+          AUTOPROMPT_REQUIRE_NATIVE_TESTS: '1'
+          AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+        shell: pwsh
+        run: |
+          $env:AUTOPROMPT_OPENCODE_TEST_CLI = (Resolve-Path '.native-provider/node_modules/.bin/opencode.cmd').Path
+          node --test --test-concurrency=1 --test-reporter=tap tests/source/harness-v2-opencode-public-activation-windows.test.cjs *> public-opencode-tests.log
+          $result = $LASTEXITCODE
+          Get-Content public-opencode-tests.log
+          exit $result
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: public-opencode-${{ matrix.runner.os }}-node24
+          path: public-opencode-tests.log
+          if-no-files-found: error
+
+  vscode-native-acquisition:
+    if: github.event_name == 'workflow_dispatch' && (inputs.support_stage == 'vscode' || inputs.support_stage == 'vscode-diagnostic')
+    name: VS Code 1.136.1 / ${{ matrix.runner.os }} / ${{ matrix.runner.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.support_host == 'linux' && inputs.support_arm == true && '[{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_host == 'linux' && inputs.support_single == true && '[{"os":"ubuntu-latest","arch":"x64"}]' || inputs.support_host == 'linux' && '[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_arm == true && inputs.support_host == 'windows' && '[{"os":"windows-11-arm","arch":"arm64"}]' || inputs.support_single == true && inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"}]' || inputs.support_single == true && '[{"os":"windows-latest","arch":"x64"}]' || inputs.support_host == 'macos' && '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]' || inputs.support_stage == 'vscode-diagnostic' && '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"}]' || '[{"os":"windows-latest","arch":"x64"},{"os":"windows-11-arm","arch":"arm64"},{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 60
+    env:
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - name: Install Linux VS Code display and isolation prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap xvfb xauth libgtk-3-0t64 libasound2t64 libnss3 libgbm1 libxss1 libxshmfence1
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: npm ci --ignore-scripts
+      - name: Acquire and hash the official VS Code archive
+        shell: bash
+        run: node tests/helpers/install-vscode-native-ci.cjs | tee vscode-native-acquisition.json
+      - name: Diagnose bounded Windows VS Code bootstrap
+        if: runner.os == 'Windows' && inputs.support_stage == 'vscode-diagnostic'
+        timeout-minutes: 8
+        shell: bash
+        run: node tests/helpers/vscode-windows-probe-diagnostic.cjs | tee vscode-windows-probe-diagnostic.json
+      - name: Diagnose owned macOS VS Code GUI startup and short aliases
+        if: runner.os == 'macOS' && inputs.support_stage == 'vscode-diagnostic'
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -o pipefail
+          node tests/helpers/vscode-macos-probe-diagnostic.cjs | tee vscode-macos-probe-diagnostic.json
+      - name: Probe the native VS Code bundle and preserve identity
+        if: inputs.support_stage == 'vscode'
+        shell: bash
+        run: |
+          node - <<'NODE' | tee vscode-native-probe.json
+          const fs = require('node:fs')
+          const native = require('./scripts/harness-v2-native.cjs')
+          const executable = process.env.AUTOPROMPT_VSCODE_TEST_CLI
+          if (!executable || !fs.existsSync(executable)) throw new Error('VS Code executable was not exported by acquisition')
+          const binding = native.probeExecutable({ provider: 'vscode', executable, timeoutMs: 120000 })
+          process.stdout.write(JSON.stringify({ executable, version: binding.version, runtimeIdentity: binding.runtimeIdentity }, null, 2) + '\n')
+          NODE
+      - name: Verify selected native VS Code capabilities
+        if: inputs.support_stage == 'vscode' && runner.os != 'Linux'
+        timeout-minutes: 45
+        env:
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
+        run: node tests/helpers/provider-platform-ci.cjs vscode
+      - name: Verify selected native VS Code capabilities under Linux display ownership
+        if: inputs.support_stage == 'vscode' && runner.os == 'Linux'
+        timeout-minutes: 45
+        env:
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
+        shell: bash
+        run: xvfb-run -a node tests/helpers/provider-platform-ci.cjs vscode
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: vscode-1.136.1-${{ matrix.runner.os }}-${{ matrix.runner.arch }}
+          path: |
+            vscode-native-acquisition.json
+            vscode-native-probe.json
+            vscode-windows-probe-diagnostic.json
+            vscode-macos-probe-diagnostic.json
+            native-vscode-evidence.json
+            native-vscode-tests.log
+          if-no-files-found: error
+
+  hermes-macos-acquisition:
+    if: github.event_name == 'workflow_dispatch' && (inputs.support_stage == 'hermes-macos' || inputs.support_stage == 'hermes-linux')
+    name: Hermes 0.21.1 / ${{ matrix.runner.os }} / ${{ matrix.runner.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.support_stage == 'hermes-linux' && inputs.support_arm == true && '[{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_stage == 'hermes-linux' && inputs.support_single == true && '[{"os":"ubuntu-latest","arch":"x64"}]' || inputs.support_stage == 'hermes-linux' && '[{"os":"ubuntu-latest","arch":"x64"},{"os":"ubuntu-24.04-arm","arch":"arm64"}]' || inputs.support_arm == true && '[{"os":"macos-latest","arch":"arm64"}]' || inputs.support_single == true && '[{"os":"macos-15-intel","arch":"x64"}]' || '[{"os":"macos-15-intel","arch":"x64"},{"os":"macos-latest","arch":"arm64"}]') }}
+    runs-on: ${{ matrix.runner.os }}
+    timeout-minutes: 80
+    env:
+      AUTOPROMPT_CI_EXPECTED_ARCH: ${{ matrix.runner.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.x
+          architecture: ${{ matrix.runner.arch }}
+      - name: Install Linux Hermes build and isolation prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap git build-essential libatomic1 pkg-config libssl-dev libffi-dev python3-dev ripgrep ffmpeg
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: npm ci --ignore-scripts
+      - name: Acquire the pinned official Hermes installation
+        timeout-minutes: 25
+        shell: bash
+        env:
+          HERMES_ACQUISITION_LOG: ${{ runner.os == 'Linux' && 'hermes-linux-acquisition.json' || 'hermes-macos-acquisition.json' }}
+        run: |
+          set -o pipefail
+          bash tests/helpers/install-hermes-macos-ci.sh "$RUNNER_TEMP/hermes-macos-0.21.1" | tee "$HERMES_ACQUISITION_LOG"
+      - name: Require selected native Hermes capabilities
+        timeout-minutes: 45
+        shell: bash
+        env:
+          AUTOPROMPT_CI_CAPABILITY: ${{ inputs.support_capability }}
+        run: node tests/helpers/provider-platform-ci.cjs hermes
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hermes-0.21.1-${{ matrix.runner.os }}-${{ matrix.runner.arch }}
+          path: |
+            hermes-macos-acquisition.json
+            hermes-linux-acquisition.json
+            native-hermes-evidence.json
+            native-hermes-tests.log
+            ${{ runner.temp }}/hermes-macos-0.21.1/hermes-macos-acquisition.json
+            ${{ runner.temp }}/hermes-macos-0.21.1/hermes-linux-acquisition.json
+            ${{ runner.temp }}/hermes-macos-0.21.1/official-installer.log
+            ${{ runner.temp }}/hermes-macos-0.21.1/bedrock-dependencies.log
+          if-no-files-found: error

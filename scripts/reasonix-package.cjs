@@ -10,15 +10,25 @@ const removal = require('../agents/reasonix/workflow/package-removal.js')
 const ROOT = path.resolve(__dirname, '..')
 const RECEIPT = '.autoprompt-reasonix-v2.json'
 const SHIM = '---\nname: autoprompt\ndescription: "Start explicitly requested Autoprompt v2 work in Reasonix."\ninvocation: manual\n---\n\nRun `autoprompt activate reasonix --target <absolute-project-path> -- <mission>` in a terminal. The launcher starts the private v2 controller. Loading this skill alone never starts or resumes work.\n'
-const TREES = ['agents/reasonix', 'agents/codex', 'agents/contracts', 'node_modules/@iarna/toml']
+const TREES = ['agents/reasonix', 'agents/codex', 'agents/contracts', 'scripts/harness-v2-bridge', 'node_modules/@iarna/toml']
 const BUNDLE_PACKAGE = '{"name":"@autoprompt-skill/reasonix-runtime","version":"2.0.0","private":true,"type":"commonjs"}\n'
-const FILES = ['scripts/local-only-safety.cjs', 'scripts/darwin-runtime-setup.cjs', 'scripts/reasonix-package.cjs', 'scripts/reasonix-configure.cjs', 'scripts/install/operation-lock.cjs',
+const FILES = ['scripts/local-only-safety.cjs', 'scripts/windows-git-bootstrap-config.cjs', 'scripts/darwin-runtime-setup.cjs', 'scripts/darwin-command-sandbox.cjs', 'scripts/darwin-command-probe.cjs', 'scripts/harness-v2-command-owner-discovery.cjs', 'scripts/reasonix-package.cjs', 'scripts/reasonix-configure.cjs', 'scripts/install/operation-lock.cjs',
   'scripts/harness-v2-tool-boundary.cjs', 'scripts/harness-v2-tool-server.cjs', 'scripts/harness-v2-controlled-tools.cjs',
+  'scripts/harness-v2-configure.cjs', 'scripts/harness-v2-transport.cjs', 'scripts/harness-v2-canonical-json-wire.cjs', 'scripts/harness-v2-vscode-config.cjs', 'scripts/harness-v2-hermes.cjs', 'scripts/harness-v2-grok.cjs', 'scripts/harness-v2-pi-config.cjs',
   'scripts/harness-v2-conformance.cjs', 'scripts/harness-v2-local-admission.cjs', 'scripts/harness-v2-package.cjs', 'scripts/harness-v2-native.cjs', 'scripts/harness-v2-native-wire-projection.cjs', 'scripts/harness-v2-request-quota.cjs', 'scripts/harness-v2-quota-relay.cjs', 'scripts/harness-v2-quota-connection.cjs',
   'scripts/harness-v2-canary.cjs', 'scripts/harness-v2-closed-canary.cjs', 'scripts/harness-v2-trust/evidence.json',
   'scripts/harness-v2-trust/trusted-public-keys.json', 'scripts/harness-v2-admission.cjs',
   'scripts/harness-v2-prime-migration.cjs', 'scripts/install/harness-v2-legacy.json', 'scripts/install/prime-settings.cjs']
-const CONFORMANCE_ASSETS = ['tests/source/reasonix-controlled-native.test.cjs', 'tests/source/harness-v2-reasonix-capability-native.test.cjs']
+const CONFORMANCE_ASSETS = ['tests/source/reasonix-controlled-native.test.cjs', 'tests/source/harness-v2-reasonix-capability-native.test.cjs', 'tests/helpers/native-platform.cjs']
+const DARWIN_EXECUTABLES = new Set([
+  'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-x64',
+  'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-arm64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-x64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-arm64',
+])
+function setPackagedMode(relative, target) {
+  if (process.platform !== 'win32' && DARWIN_EXECUTABLES.has(relative)) fs.chmodSync(target, 0o700)
+}
 
 function absoluteRoot(root) {
   if (typeof root !== 'string' || !path.isAbsolute(root) || /[\0\r\n]/.test(root) || path.resolve(root) === path.parse(root).root) {
@@ -171,7 +181,9 @@ function install(root, sourceRoot = ROOT) {
       for (const [file, hash] of Object.entries(receipt.files)) {
         const bytes = readBound(sourcePath(sourceRoot, file))
         if (sha256(bytes) !== hash) throw new ReasonixError('PAYLOAD_INVALID', 'Reasonix source changed during installation')
-        writePrivate(path.join(stage, file), bytes)
+        const target = path.join(stage, file)
+        writePrivate(target, bytes)
+        setPackagedMode(file, target)
       }
       writePrivate(path.join(stage, 'package.json'), BUNDLE_PACKAGE)
       guard.assertExisting(stage, 'directory')
@@ -261,6 +273,38 @@ function uninstall(root) {
   } finally { release(lease) }
 }
 
+function doctorPrerequisites(root, options = {}) {
+  const installed = verify(root)
+  const result = { ...installed, payload: 'verified', detected: false, activation: 'unavailable', reason: 'activation-prerequisites-unavailable' }
+  try {
+    const native = require('../agents/reasonix/workflow/native.js')
+    const admission = require('../agents/reasonix/workflow/admission.js')
+    const environment = options.env || process.env
+    const probeRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-reasonix-doctor-')))
+    let executable
+    try {
+      const probeEnv = require('./harness-v2-native.cjs').isolatedEnvironment(probeRoot, environment)
+      executable = native.probeExecutable({ env: environment, executable: options.executable,
+        spawnSync(file, argv, settings) {
+          return require('node:child_process').spawnSync(file, argv, { ...settings, env: probeEnv, cwd: probeRoot, windowsHide: true })
+        } })
+    } finally { fs.rmSync(probeRoot, { recursive: true, force: true }) }
+    result.detected = true; result.nativeVersion = executable.version
+    const imported = require('./reasonix-configure.cjs').importedAdmission(root)
+    let pending = null
+    try { admission.verifyAdmission(installed, executable, imported || {}) }
+    catch (error) {
+      if (imported || !admission.awaitingIndependentConformance(installed)) throw error
+      pending = admission.reviewedLocalPending(installed, executable, { now: options.now })
+      if (!pending) throw error
+    }
+    require('./harness-v2-tool-boundary.cjs').assertCommandSandboxPrerequisites({ env: environment })
+    return { ...result, activation: pending ? 'local-canary-required' : 'static-ready;dynamic-preflight-required', reason: '-', nativeVersion: executable.version }
+  } catch (error) {
+    return { ...result, reason: String(error.code || 'RUNTIME_FAILURE').toLowerCase().replaceAll('_', '-'), message: error.message }
+  }
+}
+
 function run(argv = process.argv.slice(2), options = {}) {
   const [action, flag, value] = argv
   if (!['install', 'verify', 'doctor', 'uninstall', 'plan'].includes(action) ||
@@ -271,11 +315,12 @@ function run(argv = process.argv.slice(2), options = {}) {
   if (action === 'plan') return sourceInventory(options.sourceRoot)
   if (action === 'install') return install(root, options.sourceRoot)
   if (action === 'uninstall') return uninstall(root)
+  if (action === 'doctor') return doctorPrerequisites(root, options)
   return verify(root)
 }
 
 if (require.main === module) {
-  try { const result = run(); process.stdout.write(`${JSON.stringify({ status: result.status, root: result.root, payloadGeneration: result.payloadGeneration })}\n`) }
+  try { const result = run(); process.stdout.write(`${JSON.stringify({ status: result.status, root: result.root, payloadGeneration: result.payloadGeneration, payload: result.payload, detected: result.detected, activation: result.activation, reason: result.reason, message: result.message, nativeVersion: result.nativeVersion })}\n`); if (result.activation === 'unavailable') process.exitCode = 1 }
   catch (error) { process.stderr.write(`${error.code || 'RUNTIME_FAILURE'}: ${error.message}\n`); process.exitCode = 1 }
 }
-module.exports = { RECEIPT, ROOT, SHIM, launcher, bundlePath, install, readReceipt, resolveRoot, run, sourceInventory, uninstall, verify, walk }
+module.exports = { RECEIPT, ROOT, SHIM, launcher, bundlePath, install, readReceipt, resolveRoot, run, sourceInventory, uninstall, verify, doctor: doctorPrerequisites, doctorPrerequisites, walk }

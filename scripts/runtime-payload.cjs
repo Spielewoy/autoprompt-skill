@@ -372,6 +372,18 @@ function discoverCodexExternalRuntimeDependencies(root = ROOT) {
     })]),
     kind: 'dynamic-safety-module',
   }))
+  dependencies.push(Object.freeze({
+    source: 'scripts/windows-git-bootstrap-config.cjs',
+    destination: 'scripts/windows-git-bootstrap-config.cjs',
+    requiredFrom: 'scripts/local-only-safety.cjs',
+    runtimeRequest: './windows-git-bootstrap-config.cjs',
+    requiredBy: Object.freeze([Object.freeze({
+      kind: 'runtime-require',
+      requiredFrom: 'scripts/local-only-safety.cjs',
+      runtimeRequest: './windows-git-bootstrap-config.cjs',
+    })]),
+    kind: 'static-require',
+  }))
   dependencies.sort((left, right) => left.source.localeCompare(right.source))
   return Object.freeze(dependencies)
 }
@@ -445,6 +457,47 @@ function assertCodexSourceClosure(root, runtimeFiles) {
   return true
 }
 
+const CODEX_WINDOWS_WORKER_ASSETS=Object.freeze([
+ 'bootstrap/capture-arm64.exe','bootstrap/capture-arm64.exe.config','bootstrap/capture-x64.exe','bootstrap/capture-x64.exe.config',
+ 'bundle/assets/bash.br','bundle/assets/msys.br','bundle/assets/node-arm64.br','bundle/assets/node-x64.br','bundle/manifest.json',
+ 'notices/README.md','notices/SOURCE-PROVENANCE.json','notices/THIRD-PARTY-NOTICES.txt',
+].sort())
+function codexWorkerAssets(root){
+ let totalBytes=0
+ root=path.resolve(root)
+ for(let cursor=root;;cursor=path.dirname(cursor)){const st=fs.lstatSync(cursor);require('node:assert/strict').ok(st.isDirectory()&&!st.isSymbolicLink(),'Physical asset parent required');if(cursor===path.dirname(cursor))break}
+ const files=[],dirs=[];let count=0
+ function visit(relative){for(const name of fs.readdirSync(path.join(root,relative))){require('node:assert/strict').ok(++count<=32,'Closed asset entry bound');const key=relative?relative+'/'+name:name;const st=fs.lstatSync(path.join(root,key));require('node:assert/strict').ok(!st.isSymbolicLink(),'Linked asset refused');if(st.isDirectory()){dirs.push(key);visit(key)}else{require('node:assert/strict').ok(st.isFile()&&st.nlink===1,'Single-link regular asset required');const max=key.endsWith('.br')?128*1024*1024:key.endsWith('.exe')?1024*1024:key.endsWith('.exe.config')?4096:key==='bundle/manifest.json'?65536:key.startsWith('notices/')?4*1024*1024:0;require('node:assert/strict').ok(Number.isSafeInteger(st.size)&&st.size>0&&st.size<=max,'Closed asset file size bound');totalBytes+=st.size;require('node:assert/strict').ok(totalBytes<=256*1024*1024,'Closed asset aggregate bound');files.push(key)}}}
+ visit('');require('node:assert/strict').deepEqual(files.sort(),CODEX_WINDOWS_WORKER_ASSETS,'Exact nested asset inventory')
+ const expectedDirs=new Set();for(const file of CODEX_WINDOWS_WORKER_ASSETS){let parent=path.posix.dirname(file);while(parent!=='.'){expectedDirs.add(parent);parent=path.posix.dirname(parent)}}
+ require('node:assert/strict').deepEqual(dirs.sort(),[...expectedDirs].sort(),'Exact nested asset directories')
+ return CODEX_WINDOWS_WORKER_ASSETS.map(file=>'workflow/windows-worker/'+file)
+}
+
+const CODEX_DARWIN_EXECUTABLES = Object.freeze(['coalition-helper-arm64', 'coalition-helper-x64'])
+const CODEX_DARWIN_LISTENER_EXECUTABLES = Object.freeze(['listener-supervisor-arm64', 'listener-supervisor-x64'])
+function codexDarwinAssets(workflowDirectory) {
+  const runtime = path.join(workflowDirectory, 'darwin-coalition-runtime')
+  const expected = [...CODEX_DARWIN_EXECUTABLES, 'manifest.json'].sort()
+  if (JSON.stringify(fs.readdirSync(runtime).sort()) !== JSON.stringify(expected)) {
+    throw new Error('Darwin coalition runtime must contain exactly its declared helper files')
+  }
+  // The loader checks both architectures, exact binary/source hashes, Mach-O
+  // headers, deployment target, and physical paths before packaging any bytes.
+  require('../agents/codex/workflow/darwin-coalition-loader.js').validateDarwinCoalitionRuntime(
+    runtime, 'x64', path.join(workflowDirectory, 'darwin-coalition-helper.c'))
+  const listenerRuntime = path.join(workflowDirectory, 'darwin-listener-runtime')
+  const listenerFiles = [...CODEX_DARWIN_LISTENER_EXECUTABLES, 'manifest.json'].sort()
+  if (JSON.stringify(fs.readdirSync(listenerRuntime).sort()) !== JSON.stringify(listenerFiles)) {
+    throw new Error('Darwin listener runtime must contain exactly its declared helper files')
+  }
+  require('../agents/codex/workflow/darwin-listener-loader.js').validateDarwinListenerRuntime(
+    listenerRuntime, 'x64', path.join(workflowDirectory, 'darwin-launchd-listener-supervisor.c'))
+  return ['workflow/darwin-coalition-helper.c', 'workflow/darwin-launchd-listener-supervisor.c',
+    ...expected.map(file => `workflow/darwin-coalition-runtime/${file}`),
+    ...listenerFiles.map(file => `workflow/darwin-listener-runtime/${file}`)]
+}
+
 function codexRuntimeFiles(root = ROOT) {
   const { loadCodexV2Contracts } = require('./generate-provider-contracts.cjs')
   const contracts = loadCodexV2Contracts(root)
@@ -465,6 +518,8 @@ function codexRuntimeFiles(root = ROOT) {
     .filter(entry => entry.isFile() && CODEX_RUNTIME_EXTENSIONS.has(path.extname(entry.name)))
     .map(entry => `workflow/${entry.name}`)
   files.push(...workflow)
+  files.push(...codexWorkerAssets(path.join(workflowDirectory, 'windows-worker')))
+  files.push(...codexDarwinAssets(workflowDirectory))
 
   const sorted = [...new Set(files)].sort()
   assertCodexSourceClosure(root, sorted)
@@ -867,7 +922,10 @@ function installationPlan(provider, destination, root = ROOT) {
       validateRelativePath(site.requiredFrom)
       if (site.kind === 'runtime-require' || site.kind === 'runtime-path-resolution' ||
           site.kind === 'dynamic-runtime-require' || !site.kind) {
-        const requiringFile = path.join(layout.skillRoot, ...site.requiredFrom.split('/'))
+        const requiringDependency = (manifest.externalDependencies || []).find(candidate => candidate.source === site.requiredFrom)
+        const requiringFile = requiringDependency
+          ? path.join(dependencyRoot, ...requiringDependency.destination.split('/'))
+          : path.join(layout.skillRoot, ...site.requiredFrom.split('/'))
         const resolvedRequest = path.resolve(path.dirname(requiringFile), site.runtimeRequest)
         if (!sameFilesystemPath(resolvedRequest, target)) {
           throw new Error(`external runtime destination does not satisfy ${site.requiredFrom}: ${dependency.destination}`)
@@ -1127,6 +1185,12 @@ function installPayload(provider, destination, root = ROOT) {
   for (const item of plan.files) {
     assertRegularUnlinked(item.source, `${item.kind} source`)
     assertDirectoryChainUnlinked(plan.activationRoot, path.dirname(item.target), true)
+    const codexRelative = provider === 'codex' ? path.relative(path.join(root, 'agents', 'codex'), item.source).split(path.sep).join('/') : ''
+    const darwinAsset = codexRelative === 'workflow/darwin-coalition-helper.c' || codexRelative === 'workflow/darwin-launchd-listener-supervisor.c' ||
+      codexRelative.startsWith('workflow/darwin-coalition-runtime/') || codexRelative.startsWith('workflow/darwin-listener-runtime/')
+    const executable = provider === 'codex' && (
+      CODEX_DARWIN_EXECUTABLES.some(name => path.relative(path.join(root, 'agents', 'codex'), item.source) === path.join('workflow', 'darwin-coalition-runtime', name)) ||
+      CODEX_DARWIN_LISTENER_EXECUTABLES.some(name => path.relative(path.join(root, 'agents', 'codex'), item.source) === path.join('workflow', 'darwin-listener-runtime', name)))
     if (fs.existsSync(item.target)) {
       const targetStats = fs.lstatSync(item.target)
       if (!targetStats.isFile() || targetStats.isSymbolicLink() || targetStats.nlink !== 1) {
@@ -1136,11 +1200,16 @@ function installPayload(provider, destination, root = ROOT) {
         if (payloadSha256(provider, item.target) !== item.sha256) {
           throw new Error(`immutable Codex bundle drift: ${item.receiptPath}`)
         }
+        if (darwinAsset && process.platform !== 'win32') {
+          fs.chmodSync(path.dirname(item.target), 0o700)
+          fs.chmodSync(item.target, executable ? 0o700 : 0o600)
+        }
         continue
       }
     }
     const temporary = `${item.target}.tmp-${process.pid}`
-    fs.writeFileSync(temporary, payloadBytes(provider, item.source), { flag: 'wx' })
+    if (darwinAsset && process.platform !== 'win32') fs.chmodSync(path.dirname(item.target), 0o700)
+    fs.writeFileSync(temporary, payloadBytes(provider, item.source), { flag: 'wx', ...(darwinAsset ? { mode: executable ? 0o700 : 0o600 } : {}) })
     try {
       fs.renameSync(temporary, item.target)
     } catch (error) {
@@ -1393,6 +1462,7 @@ module.exports = {
   assertCodexSourceClosure,
   codexRoleProjection,
   codexRuntimeFiles,
+  codexDarwinAssets,
   codexPayloadDigest,
   codexPayloadClosureDigest,
   deriveCodexDeployCore,

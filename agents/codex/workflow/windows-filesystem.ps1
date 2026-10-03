@@ -9,8 +9,21 @@
 [CmdletBinding()]
 param([switch]$Request)
 
+$captureClock = [System.Diagnostics.Stopwatch]::StartNew()
+# Windows PowerShell may reconstruct an empty inherited module path on first
+# cmdlet lookup. Pin the inbox path after startup, before any module autoload.
+[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$capturePhases = $env:AUTOPROMPT_CAPTURE_PHASES -ceq '1'
+$captureLastPhase = $null
+function Write-CapturePhase([string]$phase) {
+  $script:captureLastPhase = $phase
+  if ($capturePhases) {
+    $elapsed = $captureClock.ElapsedMilliseconds.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    [Console]::Error.WriteLine('AUTOPROMPT_CAPTURE_PHASE:' + $phase + ':' + $elapsed)
+  }
+}
 
 $source = @'
 using System;
@@ -20,13 +33,14 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 public static class AutopromptWindowsCapture {
-  const uint FILE_READ_DATA = 0x00000001, FILE_READ_ATTRIBUTES = 0x00000080, SYNCHRONIZE = 0x00100000;
+  const uint FILE_READ_DATA = 0x00000001, FILE_WRITE_ATTRIBUTES = 0x00000100, FILE_READ_ATTRIBUTES = 0x00000080, SYNCHRONIZE = 0x00100000;
   const uint FILE_SHARE_READ = 0x00000001, FILE_SHARE_WRITE = 0x00000002, FILE_SHARE_DELETE = 0x00000004, FILE_OPEN = 1;
   const uint FILE_DIRECTORY_FILE = 0x00000001, FILE_NON_DIRECTORY_FILE = 0x00000040;
   const uint FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020, FILE_OPEN_REPARSE_POINT = 0x00200000;
   const uint OBJ_CASE_INSENSITIVE = 0x00000040, FILE_ATTRIBUTE_DIRECTORY = 0x10, FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
   const uint FILE_TYPE_DISK = 1, DRIVE_FIXED = 3;
   const int MaxBytes = 64 * 1024 * 1024, MaxRecordBytes = 8 * 1024 * 1024 + 1;
+  const int MaxTreeEntries = 16384, MaxCleanupEntries = 32768, MaxRecordEntries = 4096;
 
   [StructLayout(LayoutKind.Sequential)] struct UNICODE_STRING { public ushort Length, MaximumLength; public IntPtr Buffer; }
   [StructLayout(LayoutKind.Sequential)] struct OBJECT_ATTRIBUTES {
@@ -227,7 +241,7 @@ public static class AutopromptWindowsCapture {
   }
   // FileIdFullDirectoryInformation (class 38) is enumerated exclusively from
   // a held directory HANDLE. Dot records are structural, never child opens.
-  static List<DirectoryEntry> EnumerateHeld(IntPtr directory) {
+  static List<DirectoryEntry> EnumerateHeld(IntPtr directory, int maxEntries) {
     var result = new List<DirectoryEntry>(); var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     IntPtr buffer = Marshal.AllocHGlobal(65536);
     try {
@@ -250,7 +264,7 @@ public static class AutopromptWindowsCapture {
           string name = Marshal.PtrToStringUni(IntPtr.Add(buffer, offset + 80), nameBytes / 2);
           if (name != "." && name != "..") {
             Need(ValidComponent(name) && names.Add(name) && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0, "PREIMAGE_UNSAFE");
-            Need(result.Count < 4096, "FILESYSTEM_CAPTURE_LIMIT");
+            Need(result.Count < maxEntries, "FILESYSTEM_CAPTURE_LIMIT");
             result.Add(new DirectoryEntry { Name=name, Attributes=attrs, Id=id });
           }
           if (next == 0) break;
@@ -266,6 +280,10 @@ public static class AutopromptWindowsCapture {
     return new Dictionary<string, object> { {"dev", snapshot.Volume.ToString()}, {"ino", (((ulong)snapshot.IndexHigh << 32) | snapshot.IndexLow).ToString()},
       {"mode", mode}, {"nlink", snapshot.Links}, {"size", snapshot.Size} };
   }
+  static int ReadBufferLength(long length) {
+    Need(length >= 0 && length <= MaxBytes, "FILESYSTEM_CAPTURE_LIMIT");
+    return checked((int)Math.Min(1024L * 1024, Math.Max(1L, length)));
+  }
   static Dictionary<string, object> ReadCapturedFile(Opened file, bool includeBytes, int maxBytes) {
     Need(file.Snapshot.Size >= 0 && file.Snapshot.Size <= maxBytes, "FILESYSTEM_CAPTURE_LIMIT");
     long length = file.Snapshot.Size; byte[] firstBytes = includeBytes ? new byte[(int)length] : null;
@@ -275,7 +293,7 @@ public static class AutopromptWindowsCapture {
     for (int pass = 0; pass < 2; pass++) {
       long reset; Need(SetFilePointerEx(file.Handle, 0, out reset, 0) && reset == 0, "PREIMAGE_UNSAFE");
       using (SHA256 hash = SHA256.Create()) {
-        long remaining = length; int offset = 0; byte[] buffer = new byte[1024 * 1024];
+        long remaining = length; int offset = 0; byte[] buffer = new byte[ReadBufferLength(length)];
         while (remaining > 0) {
           uint got, wanted = (uint)Math.Min((long)buffer.Length, remaining);
           Need(ReadFile(file.Handle, buffer, wanted, out got, IntPtr.Zero) && got > 0 && got <= wanted, "PREIMAGE_UNSAFE");
@@ -297,11 +315,11 @@ public static class AutopromptWindowsCapture {
     if (includeBytes) result["dataBase64"] = Convert.ToBase64String(firstBytes);
     return result;
   }
-  static void WalkTree(TreeNode node, List<TreeNode> nodes, List<Opened> all, ref long total, int maxBytes, int depth, bool cleanup = false) {
+  static void WalkTree(TreeNode node, List<TreeNode> nodes, List<Opened> all, ref long total, int maxBytes, int depth, int maxEntries, bool cleanup = false) {
     Need(depth <= 128, "FILESYSTEM_CAPTURE_LIMIT");
-    node.Children = EnumerateHeld(node.Opened.Handle);
+    node.Children = EnumerateHeld(node.Opened.Handle, maxEntries);
     foreach (DirectoryEntry entry in node.Children) {
-      Need(nodes.Count < 4096 && depth < 128, "FILESYSTEM_CAPTURE_LIMIT");
+      Need(nodes.Count < maxEntries && depth < 128, "FILESYSTEM_CAPTURE_LIMIT");
       bool directory = (entry.Attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
       Opened child = cleanup ? OpenOwned(entry.Name, node.Opened.Handle, true, false) : OpenChecked(entry.Name, node.Opened.Handle, directory, !directory, true); all.Add(child);
       Need(child.Directory == directory, "PREIMAGE_UNSAFE");
@@ -309,7 +327,7 @@ public static class AutopromptWindowsCapture {
         (((ulong)child.Snapshot.IndexHigh << 32) | child.Snapshot.IndexLow) == entry.Id, "PREIMAGE_UNSAFE");
       var item = new TreeNode { Opened=child, Parent=node.Opened, Path=node.Path.Length == 0 ? entry.Name : node.Path + "/" + entry.Name };
       nodes.Add(item);
-      if (directory) WalkTree(item, nodes, all, ref total, maxBytes, depth + 1, cleanup);
+      if (directory) WalkTree(item, nodes, all, ref total, maxBytes, depth + 1, maxEntries, cleanup);
       else { item.Result = ReadCapturedFile(child, true, (int)(maxBytes - total)); total += child.Snapshot.Size; }
     }
   }
@@ -322,12 +340,12 @@ public static class AutopromptWindowsCapture {
       ValidateRootVolume(drive.Handle, root, rootMapping);
       foreach (string part in components) { Opened child = OpenChecked(part, chain[chain.Count - 1].Handle, true, false, true); all.Add(child); chain.Add(child); }
       var top = new TreeNode { Opened=chain[chain.Count - 1], Path="" }; nodes.Add(top);
-      long total = 0; WalkTree(top, nodes, all, ref total, maxBytes, 0);
+      long total = 0; WalkTree(top, nodes, all, ref total, maxBytes, 0, MaxTreeEntries);
       // Every parent and child remains open through full re-enumeration and
       // relative reopen validation, including the final file-content pass.
       foreach (TreeNode node in nodes) {
         if (node.Opened.Directory) {
-          List<DirectoryEntry> again = EnumerateHeld(node.Opened.Handle);
+          List<DirectoryEntry> again = EnumerateHeld(node.Opened.Handle, MaxTreeEntries);
           Need(again.Count == node.Children.Count, "PREIMAGE_UNSAFE");
           for (int i = 0; i < again.Count; i++) Need(again[i].Same(node.Children[i]), "PREIMAGE_UNSAFE");
         } else {
@@ -341,8 +359,12 @@ public static class AutopromptWindowsCapture {
         }
       }
       Verify(chain, nativeRoot); ValidateRootVolume(drive.Handle, root, rootMapping);
+      // Opened has reference identity: preserve the exact membership predicate
+      // without scanning the captured tree once for every retained handle.
+      var capturedHandles = new HashSet<Opened>();
+      foreach (TreeNode node in nodes) capturedHandles.Add(node.Opened);
       foreach (Opened item in all) {
-        bool captured = nodes.Exists(node => Object.ReferenceEquals(node.Opened, item));
+        bool captured = capturedHandles.Contains(item);
         Need(captured ? item.Snapshot.Same(Info(item.Handle)) : SameDirectoryIdentity(item.Snapshot, Info(item.Handle)), "PREIMAGE_UNSAFE");
       }
       var entries = new List<Dictionary<string, object>>();
@@ -416,7 +438,9 @@ public static class AutopromptWindowsCapture {
     RequirePrivateAcl(parent.Handle);
     var removed = new List<string>();
     var pattern = new System.Text.RegularExpressions.Regex("^\\." + System.Text.RegularExpressions.Regex.Escape(leaf) + "\\.([1-9][0-9]{0,9})\\.[0-9a-f]{16}\\.(?:tmp|create)$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
-    foreach (DirectoryEntry entry in EnumerateHeld(parent.Handle)) {
+    // Complete bounded enumeration precedes any residue deletion. Tree growth
+    // does not increase private record-recovery authority.
+    foreach (DirectoryEntry entry in EnumerateHeld(parent.Handle, MaxRecordEntries)) {
       var match = pattern.Match(entry.Name); if (!match.Success) continue;
       uint pid; Need(UInt32.TryParse(match.Groups[1].Value, out pid) && pid > 0, "PREIMAGE_UNSAFE"); RequireDeadWriter(pid);
       IntPtr file = IntPtr.Zero;
@@ -493,7 +517,8 @@ public static class AutopromptWindowsCapture {
     }
   }
   static Opened OpenOwned(string name, IntPtr parent, bool deleting, bool allowMissing) {
-    IntPtr handle = Open(name, parent, false, false, false, false, deleting, true, allowMissing);
+    IntPtr handle = Open(name, parent, false, false, false, false, deleting, true, allowMissing,
+      deleting ? FILE_WRITE_ATTRIBUTES : 0u);
     try {
       Snapshot snapshot = Info(handle); bool directory = (snapshot.Attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
       Need(directory || snapshot.Links == 1, "PREIMAGE_UNSAFE"); CheckCanonicalComponentName(handle, name);
@@ -550,18 +575,18 @@ public static class AutopromptWindowsCapture {
     finally {Marshal.FreeHGlobal(basic);}
     var after=Info(item.Handle);Need(before.Id==after.Id && before.Size==after.Size && before.Links==after.Links && ((after.Attributes&1)!=0)==readOnly,"PREIMAGE_UNSAFE");item.Snapshot=after;
   }
-  static void TransactionWrite(Opened item,byte[] bytes) {
+  static void TransactionWrite(Opened item,byte[] bytes,bool flushImmediately) {
     int offset=0;
     while(offset<bytes.Length) {int amount=Math.Min(1024*1024,bytes.Length-offset);byte[] block=new byte[amount];Buffer.BlockCopy(bytes,offset,block,0,amount);uint written;Need(WriteFile(item.Handle,block,(uint)amount,out written,IntPtr.Zero) && written>0 && written<=amount,"PREIMAGE_UNSAFE");offset+=(int)written;}
-    TransactionFlush(item.Handle);item.Snapshot=Info(item.Handle);
+    if(flushImmediately)TransactionFlush(item.Handle);item.Snapshot=Info(item.Handle);
     Need(item.Snapshot.Size==bytes.Length && (string)ReadCapturedFile(item,true,MaxBytes)["dataBase64"]==Convert.ToBase64String(bytes),"PREIMAGE_UNSAFE");
   }
   static void TransactionWalk(TreeNode node,List<TreeNode> nodes,List<Opened> handles,ref long total,int depth,bool flush,bool rename) {
     Need(depth<=128,"FILESYSTEM_CAPTURE_LIMIT");
     if(!node.Opened.Directory) {node.Result=ReadCapturedFile(node.Opened,true,(int)(MaxBytes-total));total+=node.Opened.Snapshot.Size;return;}
-    node.Children=EnumerateHeld(node.Opened.Handle);
+    node.Children=EnumerateHeld(node.Opened.Handle,MaxTreeEntries);
     foreach(var entry in node.Children) {
-      Need(nodes.Count<4096 && depth<128,"FILESYSTEM_CAPTURE_LIMIT");bool directory=(entry.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+      Need(nodes.Count<MaxTreeEntries && depth<128,"FILESYSTEM_CAPTURE_LIMIT");bool directory=(entry.Attributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
       Opened child=TransactionOpen(entry.Name,node.Opened.Handle,directory,false,flush?4u:0u,false,false,rename);handles.Add(child);
       Need(child.Snapshot.Volume==node.Opened.Snapshot.Volume && child.Snapshot.Attributes==entry.Attributes && (((ulong)child.Snapshot.IndexHigh<<32)|child.Snapshot.IndexLow)==entry.Id,"PREIMAGE_UNSAFE");
       var item=new TreeNode{Opened=child,Parent=node.Opened,Path=node.Path.Length==0?entry.Name:node.Path+"/"+entry.Name};nodes.Add(item);TransactionWalk(item,nodes,handles,ref total,depth+1,flush,rename);
@@ -570,7 +595,7 @@ public static class AutopromptWindowsCapture {
   static void TransactionValidate(List<TreeNode> nodes) {
     foreach(var node in nodes) {
       Need(node.Opened.Snapshot.Same(Info(node.Opened.Handle)),"PREIMAGE_UNSAFE");
-      if(node.Opened.Directory) {var children=EnumerateHeld(node.Opened.Handle);Need(children.Count==node.Children.Count,"PREIMAGE_UNSAFE");for(int i=0;i<children.Count;i++)Need(children[i].Same(node.Children[i]),"PREIMAGE_UNSAFE");}
+      if(node.Opened.Directory) {var children=EnumerateHeld(node.Opened.Handle,MaxTreeEntries);Need(children.Count==node.Children.Count,"PREIMAGE_UNSAFE");for(int i=0;i<children.Count;i++)Need(children[i].Same(node.Children[i]),"PREIMAGE_UNSAFE");}
       else Need((string)ReadCapturedFile(node.Opened,false,MaxBytes)["sha256"]==(string)node.Result["sha256"],"PREIMAGE_UNSAFE");
       IntPtr fresh=IntPtr.Zero;try {fresh=Open(node.Opened.Name,node.Parent.Handle,node.Opened.Directory,false,true);CheckCanonicalComponentName(fresh,node.Opened.Name);Need(node.Opened.Snapshot.Same(Info(fresh)),"PREIMAGE_UNSAFE");}finally{if(fresh!=IntPtr.Zero)CloseHandle(fresh);}
     }
@@ -592,7 +617,7 @@ public static class AutopromptWindowsCapture {
         if(mkdir || write) {
           TransactionAbsent(source.Parent,source.Leaf);source.VerifyNow();
           var made=TransactionOpen(source.Leaf,source.Parent.Handle,mkdir,true,0x104u,false,false,false);created.Add(made);
-          if(write)TransactionWrite(made,bytes);
+          if(write)TransactionWrite(made,bytes,true);
           TransactionReadonly(made,(mode&146)==0);TransactionFlush(made.Handle);source.VerifyNow();TransactionFlush(source.Parent.Handle);
           var check=new List<TreeNode>{new TreeNode{Opened=made,Parent=source.Parent,Path="",Children=mkdir?new List<DirectoryEntry>():null,Result=write?ReadCapturedFile(made,true,MaxRecordBytes):null}};
           TransactionValidate(check);source.VerifyNow();success=true;var result=TransactionStat(made);
@@ -651,13 +676,27 @@ public static class AutopromptWindowsCapture {
             var parent=node.Path.Length==0?destination.Parent:byPath[parentPath].Opened;string name=node.Path.Length==0?destination.Leaf:node.Opened.Name;
             var made=TransactionOpen(name,parent.Handle,node.Opened.Directory,true,0x104u,false,false,false);created.Add(made);
             var copied=new TreeNode{Opened=made,Parent=parent,Path=node.Path,Result=node.Result};copies.Add(copied);byPath[node.Path]=copied;
-            if(!made.Directory)TransactionWrite(made,Convert.FromBase64String((string)node.Result["dataBase64"]));
+            // Copy flushes every held file after its final attributes are set below.
+            // Keep exact readback here; success still requires all final flushes.
+            if(!made.Directory)TransactionWrite(made,Convert.FromBase64String((string)node.Result["dataBase64"]),false);
           }
           for(int i=copies.Count-1;i>=0;i--){TransactionReadonly(copies[i].Opened,(nodes[i].Opened.Snapshot.Attributes&1)!=0);TransactionFlush(copies[i].Opened.Handle);}
+          // Index parents by the same Opened reference identity used by the
+          // original child scan; every copied edge is visited exactly once.
+          var copiedDirectories=new Dictionary<Opened,TreeNode>();
           foreach(var node in copies) {
-            node.Opened.Snapshot=Info(node.Opened.Handle);if(!node.Opened.Directory)continue;node.Children=new List<DirectoryEntry>();
-            foreach(var child in copies)if(Object.ReferenceEquals(child.Parent,node.Opened))node.Children.Add(new DirectoryEntry{Name=child.Opened.Name,Attributes=child.Opened.Snapshot.Attributes,Id=((ulong)child.Opened.Snapshot.IndexHigh<<32)|child.Opened.Snapshot.IndexLow});
-            node.Children.Sort((a,b)=>StringComparer.Ordinal.Compare(a.Name,b.Name));
+            if(!node.Opened.Directory)continue;
+            node.Children=new List<DirectoryEntry>();copiedDirectories.Add(node.Opened,node);
+          }
+          // Capture expected child attributes BEFORE refreshing child snapshots,
+          // as the original parent-before-child scan did. Concurrent attribute
+          // drift must still disagree with the subsequent held enumeration.
+          foreach(var child in copies) {
+            TreeNode parent;if(copiedDirectories.TryGetValue(child.Parent,out parent))parent.Children.Add(new DirectoryEntry{Name=child.Opened.Name,Attributes=child.Opened.Snapshot.Attributes,Id=((ulong)child.Opened.Snapshot.IndexHigh<<32)|child.Opened.Snapshot.IndexLow});
+          }
+          foreach(var node in copies) {
+            node.Opened.Snapshot=Info(node.Opened.Handle);
+            if(node.Opened.Directory)node.Children.Sort((a,b)=>StringComparer.Ordinal.Compare(a.Name,b.Name));
           }
           TransactionValidate(nodes);TransactionValidate(copies);source.VerifyNow();destination.VerifyNow();TransactionFlush(destination.Parent.Handle);destination.VerifyNow();success=true;return TransactionStat(copies[0].Opened);
         }
@@ -669,7 +708,8 @@ public static class AutopromptWindowsCapture {
   }
   public static Dictionary<string, object> OwnedOperation(string operation, string root, string[] components, string parentDev, string parentIno, string targetType, string targetDev, string targetIno) {
     ValidateCaptureRequest(root, components, MaxBytes);
-    bool deleting = operation == "remove-owned-target"; Need(deleting || operation == "inspect-owned-target", "FILESYSTEM_REQUEST_INVALID");
+    bool emptyOnly = operation == "remove-owned-empty-directory";
+    bool deleting = emptyOnly || operation == "remove-owned-target"; Need(deleting || operation == "inspect-owned-target", "FILESYSTEM_REQUEST_INVALID");
     string mapping = PhysicalDriveMapping(root), nativeRoot = "\\??\\" + root;
     var chain = new List<Opened>(); var all = new List<Opened>(); var nodes = new List<TreeNode>();
     try {
@@ -695,13 +735,17 @@ public static class AutopromptWindowsCapture {
       }
       Need(MatchesOwned(target, targetDev, targetIno) && targetType == (target.Directory ? "directory" : "file"), "PREIMAGE_UNSAFE");
       var top = new TreeNode { Opened=target, Parent=parent, Path="" }; nodes.Add(top); long total = 0;
-      if (target.Directory) WalkTree(top, nodes, all, ref total, MaxBytes, 0, true);
+      if (emptyOnly) {
+        Need(target.Directory, "PREIMAGE_UNSAFE");
+        top.Children = EnumerateHeld(target.Handle, MaxCleanupEntries);
+        Need(top.Children.Count == 0, "PREIMAGE_UNSAFE");
+      } else if (target.Directory) WalkTree(top, nodes, all, ref total, MaxBytes, 0, MaxCleanupEntries, true);
       else top.Result = ReadCapturedFile(target, true, MaxBytes);
       // Validate the complete bounded subtree before the first deletion.
       foreach (TreeNode node in nodes) {
         Need(node.Opened.Snapshot.Same(Info(node.Opened.Handle)), "PREIMAGE_UNSAFE");
         if (node.Opened.Directory) {
-          List<DirectoryEntry> again = EnumerateHeld(node.Opened.Handle); Need(again.Count == node.Children.Count, "PREIMAGE_UNSAFE");
+          List<DirectoryEntry> again = EnumerateHeld(node.Opened.Handle, MaxCleanupEntries); Need(again.Count == node.Children.Count, "PREIMAGE_UNSAFE");
           for (int i = 0; i < again.Count; i++) Need(again[i].Same(node.Children[i]), "PREIMAGE_UNSAFE");
         } else Need((string)ReadCapturedFile(node.Opened, false, MaxBytes)["sha256"] == (string)node.Result["sha256"], "PREIMAGE_UNSAFE");
         IntPtr fresh = IntPtr.Zero;
@@ -709,13 +753,30 @@ public static class AutopromptWindowsCapture {
         finally { if (fresh != IntPtr.Zero) CloseHandle(fresh); }
       }
       Verify(chain, nativeRoot); ValidateRootVolume(chain[0].Handle, root, mapping);
-      for (int i = nodes.Count - 1; i >= 0; i--) {
-        Opened item = nodes[i].Opened; Snapshot now = Info(item.Handle);
-        Need(item.Directory ? SameDirectoryIdentity(item.Snapshot, now) : item.Snapshot.Same(now), "PREIMAGE_UNSAFE");
-        IntPtr information = Marshal.AllocHGlobal(1);
-        try { Marshal.WriteByte(information, 1); IO_STATUS_BLOCK io; Need(NtSetInformationFile(item.Handle, out io, information, 1, 13) == 0, "PREIMAGE_UNSAFE"); }
-        finally { Marshal.FreeHGlobal(information); }
-        CloseHandle(item.Handle); item.Handle = IntPtr.Zero;
+      var clearedReadonly = new List<Opened>();
+      try {
+        // Git marks object and pack files read-only. Mutate attributes only
+        // after the complete held tree and every fresh identity were validated.
+        foreach (TreeNode node in nodes) if ((node.Opened.Snapshot.Attributes & 1) != 0) {
+          // Record rollback authority before the syscall: setting the attribute
+          // can succeed even if its postcondition check subsequently refuses.
+          clearedReadonly.Add(node.Opened); TransactionReadonly(node.Opened, false);
+        }
+        for (int i = nodes.Count - 1; i >= 0; i--) {
+          Opened item = nodes[i].Opened; Snapshot now = Info(item.Handle);
+          Need(item.Directory ? SameDirectoryIdentity(item.Snapshot, now) : item.Snapshot.Same(now), "PREIMAGE_UNSAFE");
+          IntPtr information = Marshal.AllocHGlobal(1);
+          try { Marshal.WriteByte(information, 1); IO_STATUS_BLOCK io; Need(NtSetInformationFile(item.Handle, out io, information, 1, 13) == 0, "PREIMAGE_UNSAFE"); }
+          finally { Marshal.FreeHGlobal(information); }
+          CloseHandle(item.Handle); item.Handle = IntPtr.Zero;
+        }
+      } catch {
+        // A still-held object was not deleted. Restore its original read-only
+        // state before reporting failure; already-deleted handles are zero.
+        for (int i = clearedReadonly.Count - 1; i >= 0; i--) if (clearedReadonly[i].Handle != IntPtr.Zero) {
+          try { TransactionReadonly(clearedReadonly[i], true); } catch {}
+        }
+        throw;
       }
       VerifyMutationParents(chain, nativeRoot); ValidateRootVolume(chain[0].Handle, root, mapping);
       bool absent = false;
@@ -767,24 +828,37 @@ function Get-RefusalCode([System.Exception]$Exception) {
 
 try {
   if (-not $Request) { throw 'request mode required' }
+  # Fixed diagnostic phases use stderr only when the bound controller requests
+  # them. They never carry paths, request fields, captured bytes, or authority.
+  Write-CapturePhase 'input'
   $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+  Write-CapturePhase 'input-encoding-created'
   [Console]::InputEncoding = $strictUtf8
   [Console]::OutputEncoding = $strictUtf8
+  Write-CapturePhase 'input-encoding-set'
   # Consume at most the closed request cap and one sentinel character.  Do
   # not allocate an attacker-controlled stdin string before rejecting it.
   $maximumRequest = 12 * 1024 * 1024
   $requestText = New-Object System.Text.StringBuilder
   $requestBuffer = New-Object char[] 1024
+  Write-CapturePhase 'input-initialized'
+  # Separate Console.In initialization from the bounded blocking read itself.
+  # Keep the same reader for the complete request; do not change EOF semantics.
+  $requestReader = [Console]::In
+  Write-CapturePhase 'input-reading'
   while ($true) {
     $readLimit = [Math]::Min($requestBuffer.Length, ($maximumRequest + 1) - $requestText.Length)
-    $read = [Console]::In.Read($requestBuffer, 0, $readLimit)
+    $read = $requestReader.Read($requestBuffer, 0, $readLimit)
     if ($read -le 0) { break }
     [void]$requestText.Append($requestBuffer, 0, $read)
     if ($requestText.Length -gt $maximumRequest) { throw 'invalid request' }
   }
+  Write-CapturePhase 'input-eof'
   $raw = $requestText.ToString()
   if ($raw.Length -eq 0) { throw 'invalid request' }
+  Write-CapturePhase 'compile'
   Add-Type -TypeDefinition $source -Language CSharp
+  Write-CapturePhase 'compiled'
   [AutopromptWindowsCapture]::ValidateJson($raw)
   $requestObject = $raw | ConvertFrom-Json
   $names = @($requestObject.PSObject.Properties.Name)
@@ -808,12 +882,14 @@ try {
       $transactionMode=[int]$requestObject.mode
       if ($writeExclusive) { if ($requestObject.bytesBase64 -isnot [string]) { throw 'invalid transaction request' }; $transactionBytes=[string]$requestObject.bytesBase64 }
     } elseif ((-not ($requestObject.maxBytes -is [int] -or $requestObject.maxBytes -is [long])) -or $requestObject.maxBytes -ne 67108864) { throw 'invalid transaction request' }
+    Write-CapturePhase 'dispatch'
     $transactionResult=[AutopromptWindowsCapture]::TransactionOperation([string]$requestObject.operation,[string]$requestObject.root,[string[]]$parts,$destinationRoot,[string[]]$destinationParts,$transactionBytes,$transactionMode)
+    Write-CapturePhase 'completed'
     [ordered]@{schemaVersion=1;status='TRANSACTED';operation=$requestObject.operation;result=$transactionResult} | ConvertTo-Json -Compress -Depth 8
     exit 0
   }
   $publish = $requestObject.operation -ceq 'publish-record-exclusive'
-  $remove = $requestObject.operation -ceq 'remove-owned-target'
+  $remove = $requestObject.operation -cin @('remove-owned-target', 'remove-owned-empty-directory')
   $allowed = if ($publish) { @('schemaVersion', 'operation', 'root', 'components', 'bytesBase64') } elseif ($remove) { @('schemaVersion', 'operation', 'root', 'components', 'parentIdentity', 'targetIdentity') } else { @('schemaVersion', 'operation', 'root', 'components', 'maxBytes') }
   if ($names.Count -ne $allowed.Count -or @($names | Where-Object { $_ -cnotin $allowed }).Count -ne 0 -or
       (-not ($requestObject.schemaVersion -is [int] -or $requestObject.schemaVersion -is [long])) -or $requestObject.schemaVersion -ne 1 -or
@@ -825,15 +901,19 @@ try {
   elseif ($raw.Length -gt 16384 -or (-not ($requestObject.maxBytes -is [int] -or $requestObject.maxBytes -is [long])) -or $requestObject.maxBytes -lt 0 -or $requestObject.maxBytes -gt 67108864) { throw 'invalid request' }
   $components = @($requestObject.components | ForEach-Object { if ($_ -isnot [string]) { throw 'invalid request' }; [string]$_ })
   if ($remove -or $requestObject.operation -ceq 'inspect-owned-target') {
+    Write-CapturePhase 'dispatch'
     if ($remove) { $owned = [AutopromptWindowsCapture]::OwnedOperation([string]$requestObject.operation, [string]$requestObject.root, [string[]]$components, [string]$requestObject.parentIdentity.dev, [string]$requestObject.parentIdentity.ino, [string]$requestObject.targetIdentity.type, [string]$requestObject.targetIdentity.dev, [string]$requestObject.targetIdentity.ino) }
     else { $owned = [AutopromptWindowsCapture]::OwnedOperation([string]$requestObject.operation, [string]$requestObject.root, [string[]]$components, $null, $null, $null, $null, $null) }
+    Write-CapturePhase 'completed'
     if ($remove) { [ordered]@{ schemaVersion = 1; status = 'REMOVED'; removed = $owned.removed } | ConvertTo-Json -Compress }
     else { [ordered]@{ schemaVersion = 1; status = 'INSPECTED'; parentIdentity = $owned.parentIdentity; targetIdentity = $owned.targetIdentity } | ConvertTo-Json -Compress -Depth 8 }
     exit 0
   }
   if ($publish -or $requestObject.operation -ceq 'assert-record-parent' -or $requestObject.operation -ceq 'recover-record-publication') {
     $recordBytes = if ($publish) { [string]$requestObject.bytesBase64 } else { $null }
+    Write-CapturePhase 'dispatch'
     $record = [AutopromptWindowsCapture]::RecordOperation([string]$requestObject.operation, [string]$requestObject.root, [string[]]$components, $recordBytes)
+    Write-CapturePhase 'completed'
     if ($requestObject.operation -ceq 'recover-record-publication') {
       [ordered]@{ schemaVersion = 1; status = 'RECOVERED'; removed = @($record.removed) } | ConvertTo-Json -Compress -Depth 8
       exit 0
@@ -844,15 +924,20 @@ try {
     exit 0
   }
   if ($requestObject.operation -ceq 'tree') {
+    Write-CapturePhase 'dispatch'
     $tree = [AutopromptWindowsCapture]::CaptureTree([string]$requestObject.root, [string[]]$components, [int]$requestObject.maxBytes)
+    Write-CapturePhase 'completed'
     [ordered]@{ schemaVersion = 1; status = 'TREE_CAPTURED'; operation = 'tree'; bytes = $tree.bytes; entries = @($tree.entries) } | ConvertTo-Json -Compress -Depth 8
     exit 0
   }
+  Write-CapturePhase 'dispatch'
   $captured = [AutopromptWindowsCapture]::Capture([string]$requestObject.operation, [string]$requestObject.root, [string[]]$components, [int]$requestObject.maxBytes)
+  Write-CapturePhase 'completed'
   $out = [ordered]@{ schemaVersion = 1; status = 'CAPTURED'; operation = $requestObject.operation; identity = $captured.identity; length = $captured.length; sha256 = $captured.sha256; stat = $captured.stat }
   if ($requestObject.operation -eq 'read') { $out.dataBase64 = $captured.dataBase64 }
   $out | ConvertTo-Json -Compress -Depth 8
 } catch {
+  if ($captureLastPhase -ceq 'dispatch') { Write-CapturePhase 'completed' }
   $code = Get-RefusalCode $_.Exception
   if ([string]::IsNullOrEmpty($code)) { $code = 'FILESYSTEM_REQUEST_INVALID' }
   [ordered]@{ schemaVersion = 1; status = 'REFUSED'; code = $code } | ConvertTo-Json -Compress

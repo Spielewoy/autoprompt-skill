@@ -47,11 +47,31 @@ function claudeProjection(prepared) {
     allowedTools: boundary.TOOLS.map(tool => toolName('claude', tool.name)).join(','),
   }
 }
-function opencodeProjection(prepared, provider) {
+function opencodeProjection(prepared, provider, httpTransport) {
   const server = serverSpec(prepared, provider)
   const permission = { '*': 'deny', ...Object.fromEntries(boundary.TOOLS.map(tool => [toolName(provider, tool.name), 'allow'])) }
+  // OpenCode's MCP client otherwise abandons a call after 60 seconds. The
+  // owned bash tool permits up to 300 seconds of execution, and Windows must
+  // also prepare and restore its private AppContainer resource grants. Keep
+  // that bounded lifecycle inside the client deadline; controller cancellation
+  // and the command's own timeout continue to govern actual execution.
+  const timeout = 600_000
+  let mcp
+  if (httpTransport !== undefined) {
+    if (provider !== 'opencode' || process.platform !== 'win32' || !httpTransport || typeof httpTransport !== 'object' || Array.isArray(httpTransport) ||
+        JSON.stringify(Object.keys(httpTransport).sort()) !== JSON.stringify(['authorization', 'url']) ||
+        typeof httpTransport.authorization !== 'string' || !/^Bearer [A-Za-z0-9_-]{43}$/.test(httpTransport.authorization)) {
+      fail('TOOL_POLICY_INVALID', 'Authenticated HTTP tools are available only to the Windows OpenCode projection')
+    }
+    let url
+    try { url = new URL(httpTransport.url) } catch { fail('TOOL_POLICY_INVALID', 'OpenCode tool endpoint is invalid') }
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !/^\d+$/.test(url.port) || url.pathname !== '/mcp' || url.search || url.hash || url.username || url.password) {
+      fail('TOOL_POLICY_INVALID', 'OpenCode tool endpoint must be an exact local controller address')
+    }
+    mcp = { type: 'remote', url: url.href, headers: { Authorization: httpTransport.authorization }, oauth: false, enabled: true, timeout }
+  } else mcp = { type: 'local', command: [server.command, ...server.args], environment: server.env, enabled: true, timeout }
   return { permission,
-    mcp: { [SERVER]: { type: 'local', command: [server.command, ...server.args], environment: server.env, enabled: true } } }
+    mcp: { [SERVER]: mcp } }
 }
 
 function parseResult(output) {

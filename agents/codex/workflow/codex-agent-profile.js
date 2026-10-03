@@ -285,7 +285,7 @@ function sealedProfileOverrides(profilePath, expectedSha256) {
   for (const sourceLine of bytes.toString('utf8').split(/\r?\n/)) {
     const line = sourceLine.trim()
     if (!line || line.startsWith('#')) continue
-    const header = /^\[(sandbox_workspace_write|shell_environment_policy|features|agents(?:\.(?:[a-zA-Z0-9_-]+|"[a-zA-Z0-9_-]+"))?)\]$/.exec(line)
+    const header = /^\[(sandbox_workspace_write|windows|shell_environment_policy|features|agents(?:\.(?:[a-zA-Z0-9_-]+|"[a-zA-Z0-9_-]+"))?)\]$/.exec(line)
     if (header) {
       section = header[1].replaceAll('"', '')
       if (sections.has(section)) reject('duplicate section')
@@ -299,6 +299,9 @@ function sealedProfileOverrides(profilePath, expectedSha256) {
     if (keys.has(key)) reject('duplicate key')
     keys.add(key)
     let value = assignment[2]
+    if (section === 'windows' && (key !== 'windows.sandbox' || value !== '"elevated"')) {
+      reject('unsupported Windows sandbox policy')
+    }
     if (assignment[1] === 'config_file') {
       if (!/^agents\.[a-zA-Z0-9_-]+$/.test(section)) reject('role config outside an agent')
       let relative

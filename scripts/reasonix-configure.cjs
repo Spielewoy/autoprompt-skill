@@ -104,7 +104,7 @@ function prepareActivation(options = {}) {
     reviewedLocal = reviewedLocalPending(installed, executable, { now: options.now })
     if (!reviewedLocal) throw error
     admission = { runtimeIdentityBody: runtimeIdentityBody(installed, executable), runtimeIdentityHash: runtimeIdentity(installed, executable),
-      evidenceSha256: reviewedLocal.reviewDigest, trustSource: { kind: 'reviewed-local-pending', reviewDigest: reviewedLocal.reviewDigest } }
+      evidenceSha256: reviewedLocal.reviewDigest, trustSource: { kind: reviewedLocal.mode, reviewDigest: reviewedLocal.reviewDigest } }
   }
   const connection = connectionConfig(path.join(root, 'config.toml'))
   const credentials = credentialEnvironment(connection, root, environment)
@@ -124,6 +124,7 @@ function prepareActivation(options = {}) {
       if (record.providerId !== 'reasonix' || record.activationId !== activationId || record.target.realpath !== target ||
           record.request.sha256 !== request.sha256 || record.payloadDigest !== installed.payloadDigest ||
           record.executable.sha256 !== executable.sha256 || record.executable.path !== executable.path ||
+          JSON.stringify(record.executable.invocation || null) !== JSON.stringify(executable.invocation || null) ||
           JSON.stringify(record.executable.runtimeIdentity) !== JSON.stringify(executable.runtimeIdentity) ||
           JSON.stringify(record.executable.portableRuntimeIdentity) !== JSON.stringify(executable.portableRuntimeIdentity) ||
           (record.status === 'active' && processIdentityForPid(record.ownerPid) !== null) ||
@@ -289,7 +290,7 @@ async function supervise(options = {}) {
     const context = {
       environment, expectedBranch, ExecutionAdapter: ReasonixExecAdapter,
       executionAdapterOptions: {
-        nativeRoot, connection: activation.connection, executableBinding: activation.executable,
+        provider: 'reasonix', nativeRoot, connection: activation.connection, executableBinding: activation.executable,
         credentialEnvironment: activation.credentialEnvironment,
         rolePrompt: role => {
           if (role === 'ap-run-owner') return readBound(path.join(activation.installed.bundle, 'agents/reasonix/SKILL.md')).toString('utf8').replace(/^---\n[\s\S]*?\n---\n/, '')

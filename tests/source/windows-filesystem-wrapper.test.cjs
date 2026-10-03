@@ -64,7 +64,7 @@ test('Windows tree protocol refuses unsafe, ambiguous, missing, and unbound entr
     value => { value.entries.push({ ...value.entries[2], path: 'nested/DATA', identity: '1234abcd:0000000000000004' }) },
     value => { value.entries = [] },
     value => { value.entries[1].path = Array(129).fill('deep').join('/') },
-    value => { value.entries = Array(4097).fill(value.entries[0]) },
+    value => { value.entries = Array(16385).fill(value.entries[0]) },
     value => { value.bytes = 67108865 },
   ]
   for (const mutate of mutations) {
@@ -77,14 +77,15 @@ test('Windows tree protocol refuses unsafe, ambiguous, missing, and unbound entr
 test('Windows wrapper exposes absolute file and tree captures with bounded closed requests', () => {
   const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path')
   const filename = path.resolve(__dirname, '../../agents/codex/workflow/windows-filesystem.js')
-  const calls = [], descriptors = new Map(); let nextDescriptor = 1
+  const calls = [], descriptors = new Map(); let nextDescriptor = 1, invocationOverride, clock = 0n
   const physicalStat = { isFile: () => true, isSymbolicLink: () => false, dev: 123, ino: 456, mode: 0o100666, nlink: 1, size: 1, mtimeMs: 1, ctimeMs: 1 }
   const fakeFs = { mkdtempSync: () => 'C:\\private-temp', rmSync: () => {}, constants: { O_RDONLY: 0 }, lstatSync: () => physicalStat, realpathSync: { native: value => value },
     openSync: value => { const fd = nextDescriptor++; descriptors.set(fd, value); return fd }, fstatSync: () => physicalStat,
     readSync: (fd, buffer) => { buffer[0] = 97; return 1 }, closeSync: fd => descriptors.delete(fd) }
 
-  const sandbox = { Buffer, process: { platform: 'win32', env: { SystemRoot: 'C:\\Windows', MALICIOUS: 'omitted' } }, __dirname: path.dirname(filename), module: { exports: {} }, require: name => name === 'node:child_process' ? { spawnSync: (...args) => {
+  const sandbox = { Buffer, process: { platform: 'win32', hrtime: { bigint: () => { clock += 30000000000n; return clock } }, env: { SystemRoot: 'C:\\Windows', MALICIOUS: 'omitted' } }, __dirname: path.dirname(filename), module: { exports: {} }, require: name => name === 'node:child_process' ? { spawnSync: (...args) => {
     calls.push(args)
+    if (invocationOverride) return invocationOverride
     const request = JSON.parse(args[2].input)
     if (['fsync-directory', 'fsync-tree', 'mkdir-exclusive', 'write-exclusive', 'copy-tree-exclusive', 'rename-tree-no-replace'].includes(request.operation)) {
       const wire = transactionFixture(request.operation, request.operation !== 'write-exclusive', request.bytesBase64 ? Buffer.from(request.bytesBase64, 'base64') : Buffer.alloc(0))
@@ -92,7 +93,7 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
       return { status: 0, stderr: '', stdout: JSON.stringify(wire) }
     }
     if (request.operation === 'inspect-owned-target') return { status: 0, stderr: '', stdout: JSON.stringify({ schemaVersion: 1, status: 'INSPECTED', parentIdentity: { dev: '123', ino: '1' }, targetIdentity: { type: 'directory', dev: '123', ino: '2' } }) }
-    if (request.operation === 'remove-owned-target') return { status: 0, stderr: '', stdout: JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: true }) }
+    if (['remove-owned-target', 'remove-owned-empty-directory'].includes(request.operation)) return { status: 0, stderr: '', stdout: JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: true }) }
     if (request.operation === 'recover-record-publication') return { status: 0, stderr: '', stdout: JSON.stringify({ schemaVersion: 1, status: 'RECOVERED', removed: [] }) }
     if (request.operation === 'publish-record-exclusive' || request.operation === 'assert-record-parent') {
       const published = request.operation === 'publish-record-exclusive', bytes = published ? Buffer.from(request.bytesBase64, 'base64') : null
@@ -101,7 +102,9 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
     }
     const value = request.operation === 'tree' ? treeFixture() : { schemaVersion: 1, status: 'CAPTURED', operation: request.operation, identity: '1234abcd:0000000000000001', length: 0, stat: stat('1234abcd:0000000000000001'), sha256: crypto.createHash('sha256').digest('hex'), ...(request.operation === 'read' ? { dataBase64: '' } : {}) }
     return { status: 0, stdout: JSON.stringify(value), stderr: '' }
-  } } : name === 'node:fs' ? fakeFs : require(name) }
+  } } : name === 'node:fs' ? fakeFs
+    : name === './safe-run-root.js' ? { createWindowsCompilerDirectory: prefix => { assert.equal(prefix, 'autoprompt-windows-capture-'); return 'C:\\private-temp' }, windowsControllerEnvironment: (systemRoot, temp) => ({ SystemRoot: systemRoot, WINDIR: systemRoot, SystemDrive: 'C:', PATH: 'C:\\Windows\\System32', PSModulePath: '', TEMP: temp, TMP: temp }) }
+    : require(name) }
   vm.runInNewContext(fs.readFileSync(filename, 'utf8'), sandbox, { filename })
   const capture = sandbox.module.exports.createWindowsFilesystemCapture({ helper: 'C:\\trusted\\windows-filesystem.ps1' })
   assert.equal(capture.captureTree('C:\\project').bytes, 4)
@@ -109,8 +112,12 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.equal(capture.captureFileBytes('C:\\', ['project', 'empty'], 1).content.length, 0)
   assert.deepEqual(JSON.parse(calls[0][2].input), { schemaVersion: 1, operation: 'tree', root: 'C:\\', components: ['project'], maxBytes: 67108864 })
   assert.equal(calls[0][2].shell, false)
+  assert.equal(calls[0][2].timeout, 30000)
   assert.equal(calls[0][0], 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
   assert.equal(calls[0][2].env.MALICIOUS, undefined)
+  assert.equal(calls[0][2].env.AUTOPROMPT_CAPTURE_PHASES, '1')
+  assert.equal(calls[0][2].env.TEMP, 'C:\\private-temp')
+  assert.equal(calls[0][2].env.TMP, 'C:\\private-temp')
   assert.equal(descriptors.size, 0)
   assert.ok(calls[0][2].maxBuffer >= Math.ceil(67108864 / 3) * 4)
   for (const target of ['C:\\project\\..\\escape', 'C:\\project\\', '\\\\server\\share', 'C:\\project\\CON', 'C:\\project\\a:b']) {
@@ -127,6 +134,8 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.equal(descriptors.size, 0)
   const owned = capture.inspectOwnedTarget('C:\\project\\scratch')
   assert.equal(owned.targetIdentity.type, 'directory')
+  assert.equal(capture.removeOwnedEmptyDirectory('C:\\project\\scratch', owned.parentIdentity, owned.targetIdentity).removed, true)
+  assert.equal(JSON.parse(calls.at(-1)[2].input).operation, 'remove-owned-empty-directory')
   assert.equal(capture.removeOwnedTarget('C:\\project\\scratch', owned.parentIdentity, owned.targetIdentity).removed, true)
   assert.deepEqual(JSON.parse(calls.at(-1)[2].input), { schemaVersion: 1, operation: 'remove-owned-target', root: 'C:\\', components: ['project', 'scratch'], parentIdentity: { dev: '123', ino: '1' }, targetIdentity: { type: 'directory', dev: '123', ino: '2' } })
   assert.throws(() => capture.removeOwnedTarget('C:\\project\\scratch', { dev: '123', ino: '1', extra: true }, owned.targetIdentity), { code: 'FILESYSTEM_BACKEND_INVALID' })
@@ -137,15 +146,72 @@ test('Windows wrapper exposes absolute file and tree captures with bounded close
   assert.deepEqual(JSON.parse(calls.at(-1)[2].input), { schemaVersion: 1, operation: 'write-exclusive', root: 'C:\\', components: ['project', 'bytes'], mode: 0o600, bytesBase64: Buffer.from('exact').toString('base64') })
   capture.copyTreeExclusive('C:\\project\\source', 'D:\\private\\copy')
   assert.deepEqual(JSON.parse(calls.at(-1)[2].input).destination, { root: 'D:\\', components: ['private', 'copy'] })
+  assert.equal(calls.at(-1)[2].timeout, 120000)
   capture.renameTreeNoReplace('C:\\project\\source', 'C:\\project\\moved')
+  assert.equal(calls.at(-1)[2].timeout, 30000)
+  for (const call of calls) assert.equal(call[2].timeout, JSON.parse(call[2].input).operation === 'copy-tree-exclusive' ? 120000 : 30000)
   assert.equal(JSON.parse(calls.at(-1)[2].input).operation, 'rename-tree-no-replace')
   assert.throws(() => capture.mkdirExclusive('C:\\project\\bad', 0o10000), { code: 'FILESYSTEM_BACKEND_INVALID' })
   assert.throws(() => capture.writeExclusive('C:\\project\\bad', Buffer.alloc(8388610), 0o600), { code: 'FILESYSTEM_BACKEND_INVALID' })
+  invocationOverride = { error: { code: 'ETIMEDOUT' }, signal: 'SIGTERM', status: null,
+    stderr: ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile'].map((phase, index) => `AUTOPROMPT_CAPTURE_PHASE:${phase}:${index * 2}\r\n`).join(''), stdout: 'private captured data must not be copied into errors' }
+  assert.throws(() => capture.captureTree('C:\\project'), error => {
+    assert.equal(error.code, 'FILESYSTEM_BACKEND_UNAVAILABLE')
+    assert.match(error.message, /compile: ETIMEDOUT/)
+    assert.equal(error.details.helperPhase, 'compile')
+    assert.match(error.message, /totalMs=30000; phaseMs=input=0,.*compile=12; unaccountedMs=29988/)
+    assert.equal(error.details.timeoutMs, 30000)
+    assert.equal(error.details.invocationElapsedMs, 30000)
+    assert.equal(error.details.phaseElapsedMs.compile, 12)
+    assert.equal(error.details.unaccountedMs, 29988)
+    assert.equal(error.details.cause, 'ETIMEDOUT')
+    assert.equal(error.details.stderr, '')
+    assert.doesNotMatch(JSON.stringify(error), /private captured data/)
+    return true
+  })
+  assert.throws(() => capture.copyTreeExclusive('C:\\project\\source', 'C:\\private\\copy'), error => {
+    assert.equal(error.details.timeoutMs, 120000); assert.equal(error.details.cause, 'ETIMEDOUT'); return true
+  })
+  assert.equal(descriptors.size, 0)
+  invocationOverride = undefined
   const invoked = calls.length
   fakeFs.readSync = (fd, buffer) => { buffer[0] = 98; return 1 }
   assert.throws(() => capture.captureTree('C:\\project'), { code: 'FILESYSTEM_BACKEND_MISMATCH' })
   assert.equal(calls.length, invoked)
   assert.equal(descriptors.size, 0)
+})
+
+test('Windows capture phases accept only bounded monotonic contiguous timing and preserve unexpected stderr', () => {
+  const { invocationDiagnostics } = require('../../agents/codex/workflow/windows-filesystem.js')
+  const phases = ['input', 'input-encoding-created', 'input-encoding-set', 'input-initialized', 'input-reading', 'input-eof', 'compile', 'compiled', 'dispatch', 'completed']
+  const marker = (phase, time) => `AUTOPROMPT_CAPTURE_PHASE:${phase}:${time}\r\n`
+  for (let count = 0; count <= phases.length; count++) {
+    const selected = phases.slice(0, count), trace = selected.map((phase, index) => marker(phase, index * 10)).join('')
+    assert.deepEqual(invocationDiagnostics(trace), {
+      helperPhase: count ? phases[count - 1] : 'startup',
+      phaseElapsedMs: Object.fromEntries(selected.map((phase, index) => [phase, index * 10])), stderr: '',
+    })
+    assert.equal(invocationDiagnostics(trace + 'compiler error').stderr, 'compiler error')
+  }
+  for (const invalid of ['-1', '1.5', 'NaN', 'Infinity', '1e3', '01', '300001', '9999999999999999999', '', '0:extra', ' 1', '1 ']) {
+    const trace = marker('input', invalid)
+    assert.equal(invocationDiagnostics(trace).stderr, trace, 'Malformed elapsed time must remain a refusal')
+  }
+  assert.equal(invocationDiagnostics(marker('input', 300000)).phaseElapsedMs.input, 300000)
+  assert.equal(invocationDiagnostics(marker('input', 3) + marker('input-encoding-created', 3)).stderr, '')
+  const descending = marker('input-encoding-created', 2)
+  assert.deepEqual(invocationDiagnostics(marker('input', 3) + descending), {
+    helperPhase: 'input', phaseElapsedMs: { input: 3 }, stderr: descending,
+  })
+  for (const trace of [marker('native', 0), marker('compiled', 0), marker('input', 0) + marker('input', 1),
+    'AUTOPROMPT_CAPTURE_PHASE:input:0', '\n', '\r\n', marker('input', 0) + '\n',
+    marker('input', 0) + 'noise\n' + marker('compile', 1),
+    marker('input', 0) + marker('compile', 1), marker('input', 0) + marker('input-reading', 1),
+    marker('input', 0) + marker('completed', 1), marker('input', 0).replace('\r\n', '\0\n')]) {
+    assert.notEqual(invocationDiagnostics(trace).stderr, '', 'Malformed phase output must still refuse the invocation')
+  }
+  assert.deepEqual(invocationDiagnostics(marker('input', 0) + '\n' + marker('compile', 1)),
+    { helperPhase: 'input', phaseElapsedMs: { input: 0 }, stderr: '\n' + marker('compile', 1) })
 })
 
 
@@ -179,6 +245,8 @@ test('Windows owned cleanup parser closes identity and removal framing', () => {
     assert.throws(() => parseRecordResult(JSON.stringify(changed), 'inspect-owned-target'), { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
   }
   assert.equal(parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: false }), 'remove-owned-target').removed, false)
+  assert.equal(parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: false }), 'remove-owned-empty-directory').removed, false)
+  assert.throws(() => parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: 'false' }), 'remove-owned-empty-directory'), { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
   assert.throws(() => parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'REMOVED', removed: 'false' }), 'remove-owned-target'), { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
   assert.throws(() => parseCapture(JSON.stringify({ schemaVersion: 1, status: 'REFUSED', code: 'FILESYSTEM_NOT_FOUND' }), 'read'), { code: 'ENOENT' })
 })
@@ -211,4 +279,32 @@ test('Windows transaction protocol distinguishes missing tree, required director
   for (const [native, code] of [['FILESYSTEM_ALREADY_EXISTS', 'EEXIST'], ['FILESYSTEM_CROSS_DEVICE', 'EXDEV'], ['FILESYSTEM_NOT_FOUND', 'ENOENT'], ['FILESYSTEM_DURABILITY_UNAVAILABLE', 'FILESYSTEM_DURABILITY_UNAVAILABLE']]) {
     assert.throws(() => parseTransactionResult(JSON.stringify({ schemaVersion: 1, status: 'REFUSED', code: native }), 'rename-tree-no-replace'), { code })
   }
+})
+
+
+test('Windows tree parser accepts the full 16384-entry boundary and refuses overflow without truncation', () => {
+  const root = treeFixture().entries[0]
+  const entries = [root]
+  const expected = crypto.createHash('sha256')
+  for (let index = 1; index < 16384; index++) {
+    const identity = '1234abcd:' + (index + 1).toString(16).padStart(16, '0')
+    const name = 'd' + String(index).padStart(5, '0')
+    entries.push({ type: 'directory', path: name, identity, attributes: 16, stat: stat(identity, 0, true) })
+    expected.update('directory\0' + name + '\0' + 0o666 + '\0')
+  }
+  const value = { schemaVersion: 1, status: 'TREE_CAPTURED', operation: 'tree', bytes: 0, entries }
+  const parsed = parseCapture(JSON.stringify(value), 'tree')
+  assert.equal(parsed.entries.length, 16384)
+  assert.equal(parsed.hash, expected.digest('hex'))
+  const identity = '1234abcd:0000000000004001'
+  entries.push({ type: 'directory', path: 'overflow', identity, attributes: 16, stat: stat(identity, 0, true) })
+  assert.throws(() => parseCapture(JSON.stringify(value), 'tree'), { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
+})
+
+test('Windows record recovery retains its independent 4096-name boundary', () => {
+  const removed = Array.from({ length: 4096 }, (_, index) => '.terminal.json.1234.' + index.toString(16).padStart(16, '0') + '.create')
+  const result = () => parseRecordResult(JSON.stringify({ schemaVersion: 1, status: 'RECOVERED', removed }), 'recover-record-publication', undefined, 'terminal.json')
+  assert.deepEqual(result(), removed)
+  removed.push('.terminal.json.1234.0000000000001000.create')
+  assert.throws(result, { code: 'FILESYSTEM_BACKEND_UNAVAILABLE' })
 })

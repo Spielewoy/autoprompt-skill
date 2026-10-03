@@ -14,6 +14,40 @@ const path = require('node:path')
 
 function fail(message) { throw new Error(`DARWIN_RUNTIME_SETUP_INVALID: ${message}`) }
 const PROVIDERS = new Set(['claude', 'codex', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'hermes', 'grok', 'reasonix'])
+function directoryIdentity(item) {
+  return { dev: String(item.dev), ino: String(item.ino) }
+}
+function sameDirectoryIdentity(left, right) {
+  return left && right && left.dev === String(right.dev) && left.ino === String(right.ino)
+}
+function tightenInstallerPrivateRoot(directory) {
+  const expectedUid = typeof process.getuid === 'function' ? process.getuid() : null
+  const before = fs.lstatSync(directory)
+  if (!before.isDirectory() || before.isSymbolicLink() ||
+      (expectedUid !== null && before.uid !== expectedUid) || (before.mode & 0o022) !== 0 ||
+      fs.realpathSync(directory) !== directory) fail('controller private root is not private')
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW
+  const descriptor = fs.openSync(directory, flags)
+  try {
+    const opened = fs.fstatSync(descriptor)
+    const named = fs.lstatSync(directory)
+    if (!opened.isDirectory() || (expectedUid !== null && opened.uid !== expectedUid) || (opened.mode & 0o022) !== 0 ||
+        !sameDirectoryIdentity(directoryIdentity(before), opened) ||
+        named.isSymbolicLink() || (named.mode & 0o022) !== 0 || !sameDirectoryIdentity(directoryIdentity(before), named)) {
+      fail('controller private root changed while opened')
+    }
+    fs.fchmodSync(descriptor, 0o700)
+    fs.fsyncSync(descriptor)
+    const after = fs.fstatSync(descriptor)
+    const renamed = fs.lstatSync(directory)
+    if (!after.isDirectory() || (expectedUid !== null && after.uid !== expectedUid) ||
+        (after.mode & 0o777) !== 0o700 || renamed.isSymbolicLink() ||
+        !sameDirectoryIdentity(directoryIdentity(before), after) ||
+        !sameDirectoryIdentity(directoryIdentity(before), renamed) || fs.realpathSync(directory) !== directory) {
+      fail('controller private root changed while tightened')
+    }
+  } finally { fs.closeSync(descriptor) }
+}
 function persistentRoot(root, create = false) {
   const base = path.resolve(root)
   const baseItem = fs.lstatSync(base)
@@ -21,10 +55,17 @@ function persistentRoot(root, create = false) {
   const privateRoot = path.join(base, '.autoprompt-private')
   const runtimeRoot = path.join(privateRoot, 'darwin-runtime')
   if (create) {
-    if (!fs.existsSync(privateRoot)) fs.mkdirSync(privateRoot, { mode: 0o700 })
-    const privateItem = fs.lstatSync(privateRoot)
-    if (!privateItem.isDirectory() || privateItem.isSymbolicLink() || (privateItem.mode & 0o077) !== 0) fail('controller private root is not private')
-    if (!fs.existsSync(runtimeRoot)) fs.mkdirSync(runtimeRoot, { mode: 0o700 })
+    try { fs.mkdirSync(privateRoot, { mode: 0o700 }) } catch (error) {
+      if (!error || error.code !== 'EEXIST') throw error
+    }
+    // A public installer can leave this directory at 0755 under its umask.
+    // Tighten only a stable directory owned by this user with no other writers;
+    // links, foreign ownership, and group/other-writable roots
+    // remain invalid rather than being repaired in place.
+    tightenInstallerPrivateRoot(privateRoot)
+    try { fs.mkdirSync(runtimeRoot, { mode: 0o700 }) } catch (error) {
+      if (!error || error.code !== 'EEXIST') throw error
+    }
   }
   const privateItem = fs.lstatSync(privateRoot)
   if (!privateItem.isDirectory() || privateItem.isSymbolicLink() || (privateItem.mode & 0o077) !== 0) fail('controller private root is not private')

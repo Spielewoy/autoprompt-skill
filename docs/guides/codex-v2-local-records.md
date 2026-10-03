@@ -128,10 +128,14 @@ package, non-Git, non-filesystem, unsafe-link, or otherwise ineligible targets u
 one provider-private sidecar instead.
 
 On POSIX systems, private directories and files use `0700` and `0600`. Windows
-run-record helpers apply and audit a protected owner-only DACL, but that alone
-does not make the full runtime supported: native Windows has no implemented
-descriptor-anchored filesystem adapter for strict snapshots and terminal writes.
-This build's full runtime is validated only on Linux; macOS has not been validated.
+run-record helpers apply and audit a protected owner-only DACL. The local canary
+policy authorizes fresh native checks for the ten non-Codex providers on Linux, Windows, and
+macOS when the provider runtime and platform adapter are available. Windows uses
+protected process and sandbox controls; macOS uses the native sandbox and owned-
+process controls. This is an attempt policy, not a certification record: activation
+still requires all eleven exact-runtime checks to pass without a failure or skip.
+Installer and static doctor results do not replace those checks. Codex follows its
+separate canonical validation route.
 Creation or reopening
 fails closed if the private boundary cannot be established or has been widened. Run
 records are rejected if they enter tracked files, staged files, a package, or an

@@ -9,6 +9,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { packedToolPath } = require('../helpers/packed-tool-path.cjs')
 
 const ROOT = path.resolve(__dirname, '../..')
 const RECEIPT = '.autoprompt-install-receipt.json'
@@ -29,6 +30,37 @@ function ok(result, label = '') {
   assert.equal(result.status, 0, `${label}\n${result.stdout}\n${result.stderr}\n${result.error || ''}`)
   return result
 }
+function assertCodexDoctorRow(output) {
+  const row = output.split(/\r?\n/).find(line => /^codex\s/.test(line))
+  assert.ok(row, output)
+  assert.match(row, /extras=complete/)
+  if (process.platform === 'win32') {
+    assert.match(row, /^codex\s+yes\s+yes\s+no\s+/)
+    assert.match(row, /reason=codex-windows-sandbox-identity-unavailable/)
+    assert.match(row, /activation=unavailable/)
+  } else {
+    assert.match(row, /^codex\s+yes\s+yes\s+no\s+/)
+    assert.match(row, /reason=codex-cli-missing.*activation=unavailable/)
+  }
+}
+function codexDoctor(result) {
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assertCodexDoctorRow(result.stdout)
+  return result
+}
+function allProviderDoctor(result) {
+  // Every v2 payload is intact, but version-only sentinels cannot satisfy the
+  // native executable/capability prerequisites. Strict must expose that refusal.
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  for (const provider of Object.keys(VERSIONS).filter(provider => provider !== 'codex')) {
+    const row = result.stdout.split(/\r?\n/).find(line => new RegExp(`^${provider}\\s`).test(line))
+    assert.ok(row, `Missing ${provider} doctor row:\n${result.stdout}`)
+    assert.match(row, new RegExp(`^${provider}\\s+\\S+\\s+yes\\s+no\\s+`))
+    assert.match(row, /extras=complete.*payload=verified activation=unavailable/)
+  }
+  assertCodexDoctorRow(result.stdout)
+  return result
+}
 function write(file, bytes) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, bytes) }
 function digest(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex') }
 function literal(value) { return `'${value.replaceAll("'", `'"'"'`)}'` }
@@ -45,6 +77,7 @@ function npmCli() {
 }
 function environment(directory) {
   const env = { ...process.env }
+  const toolPath = packedToolPath(path.join(directory, 'tool views'))
   for (const key of ['AUTOPROMPT_INSTALL_ROOT', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'PRIME_AGENT_CODING_AGENT_DIR',
     'OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR', 'DSH_HOME', 'HERMES_HOME', 'GROK_HOME', 'REASONIX_HOME',
     'AUTOPROMPT_WORKSPACE_ROOT', 'NODE_PATH']) delete env[key]
@@ -55,7 +88,7 @@ function environment(directory) {
     LOCALAPPDATA: path.join(directory, 'localappdata'),
     npm_config_cache: path.join(directory, 'npm-cache'), npm_config_offline: 'true',
     npm_config_audit: 'false', npm_config_fund: 'false', npm_config_update_notifier: 'false',
-    PATH: [path.join(directory, 'bin'), path.dirname(process.execPath), process.env.PATH || ''].join(path.delimiter),
+    PATH: [path.join(directory, 'bin'), ...toolPath].filter(Boolean).join(path.delimiter),
   })
   for (const key of ['HOME', 'XDG_CONFIG_HOME', 'APPDATA', 'LOCALAPPDATA', 'npm_config_cache']) fs.mkdirSync(env[key], { recursive: true })
   for (const [command, version] of Object.values(VERSIONS)) {
@@ -113,7 +146,7 @@ function assertPreserved(files) { for (const [file, bytes] of files) assert.equa
 test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bundles without deleting private user data', {
   timeout: 1200000,
 }, async t => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-public-packed-'))
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-public-packed-')))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const packEnv = environment(path.join(directory, 'pack-env'))
   const packed = ok(run(process.execPath, [npmCli(), 'pack', '--ignore-scripts', '--json', '--pack-destination', directory], { cwd: ROOT, env: packEnv }), 'offline npm pack')
@@ -143,7 +176,7 @@ test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bu
     }
     ok(invoke(['install', 'all']))
     assert.equal(codexInstallation(root).generation, initial.generation)
-    ok(invoke(['doctor', '--strict']))
+    allProviderDoctor(invoke(['doctor', '--strict']))
     // Make receipt-created parents nonempty with unowned data after installation.
     // Uninstall must relinquish them, not recurse or retain a stale receipt.
     const preserved = preservationFiles(root)
@@ -162,7 +195,7 @@ test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bu
     assertPreserved(preserved)
     ok(invoke(['install', 'all']))
     const reinstalled = codexInstallation(root)
-    ok(invoke(['doctor', '--strict']))
+    allProviderDoctor(invoke(['doctor', '--strict']))
     ok(invoke(['uninstall', 'all']))
     assertRemoved(root, reinstalled)
     assertPreserved(preserved)
@@ -184,7 +217,7 @@ test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bu
     const first = codexInstallation(root)
     ok(invoke(['install', 'codex']))
     assert.equal(codexInstallation(root).generation, first.generation)
-    ok(invoke(['doctor', 'codex', '--strict']))
+    codexDoctor(invoke(['doctor', 'codex', '--strict']))
     const lease = lock.acquire(root, 'public-lifecycle-regression')
     try {
       const before = snapshot(root)
@@ -199,7 +232,7 @@ test('packed public Codex and all-provider lifecycles remove receipt-bound v2 bu
     assertPreserved(preserved)
     ok(invoke(['install', 'codex']))
     const second = codexInstallation(root)
-    ok(invoke(['doctor', 'codex', '--strict']))
+    codexDoctor(invoke(['doctor', 'codex', '--strict']))
     const drift = path.join(second.bundle, 'skills/autoprompt/GATES.md')
     fs.appendFileSync(drift, '\nuser edit must survive public uninstall\n')
     fs.appendFileSync(second.marker, '\nuser manifest edit must survive\n')
@@ -225,7 +258,7 @@ for (const port of ['bash', 'powershell']) test(`${port}: Codex v2 scope require
     : (process.platform === 'win32' ? 'powershell.exe' : 'pwsh')
   const probeArgs = port === 'bash' ? ['--version'] : ['-NoProfile', '-NonInteractive', '-Command', 'exit 0']
   if (!executable || run(executable, probeArgs).status !== 0) { t.skip(`${executable} unavailable`); return }
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-scope-'))
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-scope-')))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const env = environment(directory)
   const root = path.join(directory, 'root')

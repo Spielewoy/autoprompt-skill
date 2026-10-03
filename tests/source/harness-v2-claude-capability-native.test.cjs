@@ -11,23 +11,48 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { performance } = require('node:perf_hooks')
 
 const native = require('../../scripts/harness-v2-native.cjs')
 const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter, HarnessEventStream } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const { modelService } = require('../helpers/harness-native-service.cjs')
 
-const CLI = process.env.AUTOPROMPT_CLAUDE_TEST_CLI
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, cleanupNativeFixture, waitForNativeObservation } = require('../helpers/native-platform.cjs')
+const CLI = requiredNativeCli('claude')
+
+function nativeFailureFiles(roots) {
+  const pending = [...new Set(roots.filter(Boolean))], output = []
+  let directories = 0
+  while (pending.length && directories++ < 32 && output.length < 8) {
+    const directory = pending.pop()
+    try {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true }).slice(0, 128)) {
+        const file = path.join(directory, entry.name)
+        if (entry.isDirectory() && pending.length < 32) pending.push(file)
+        else if (entry.isFile() && /(?:^|\.)stderr\.log$/.test(entry.name) && output.length < 8) {
+          const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+          try {
+            const stat = fs.fstatSync(fd)
+            if (!stat.isFile() || stat.nlink !== 1) continue
+            const bytes = Buffer.alloc(Math.min(8192, stat.size))
+            const size = fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, stat.size - bytes.length))
+            output.push({ file: entry.name, bytes: stat.size, tail: bytes.subarray(0, size).toString('utf8') })
+          } finally { fs.closeSync(fd) }
+        }
+      }
+    } catch {} // Preserve the original native error if its diagnostics disappear.
+  }
+  return output
+}
 
 function createFixture() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-capability-native-'))
-  const target = path.join(root, 'target'), controller = path.join(root, 'controller')
-  fs.mkdirSync(target, { mode: 0o700 }); fs.mkdirSync(controller, { mode: 0o700 })
-  const nativeRoot = path.join(controller, 'native'); fs.mkdirSync(nativeRoot, { mode: 0o700 })
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'claude-capability-native-')))
+  const target = privateDirectory(path.join(root, 'target')), controller = privateDirectory(path.join(root, 'controller'))
+  const nativeRoot = privateDirectory(path.join(controller, 'native'))
   const suppliedChallenge = process.env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE
   if (suppliedChallenge !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(suppliedChallenge)) throw new Error('AUTOPROMPT_CLOSED_CANARY_CHALLENGE must be one 32-byte base64url nonce')
   const challenge = suppliedChallenge || crypto.randomBytes(32).toString('base64url')
@@ -66,9 +91,12 @@ function createFixture() {
   return { root, target, controller, nativeRoot, record, projection, scratch, schema, challenge }
 }
 
-function registeredProcessOwner(f, adapter) {
+function registeredProcessOwner(f) {
   const root = process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT
-  if (!root) return new ProcessOwner({ adapter, registryPath: path.join(f.controller, 'processes.json'), pollMs: 10 })
+  if (!root) {
+    const registryPath = path.join(f.controller, 'processes.json')
+    return new ProcessOwner({ adapter: nativeProcessAdapter(registryPath), registryPath, pollMs: 10 })
+  }
   if (!path.isAbsolute(root) || !/^[A-Za-z0-9_-]{43}$/.test(f.challenge) ||
       process.env.AUTOPROMPT_CLOSED_CANARY_PROVIDER !== 'claude' ||
       process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID !== f.record.activationId ||
@@ -76,19 +104,53 @@ function registeredProcessOwner(f, adapter) {
     throw new Error('closed canary ownership registration binding is invalid')
   }
   const directory = path.join(root, `claude-${crypto.randomUUID()}`)
-  fs.mkdirSync(directory, { mode: 0o700 })
+  privateDirectory(directory)
   const registryPath = path.join(directory, 'processes.json')
   fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ schemaVersion: 1,
     provider: 'claude', activationId: f.record.activationId, generation: f.record.generation,
     challenge: f.challenge, registryPath }), { flag: 'wx', mode: 0o600 })
-  return new ProcessOwner({ adapter, registryPath, pollMs: 10 })
+  return new ProcessOwner({ adapter: nativeProcessAdapter(registryPath, root), registryPath, pollMs: 10 })
 }
 
 async function scenario(t, options = {}) {
+  const phaseEvents = []
+  const phaseStarted = performance.now()
+  const markPhase = name => {
+    if (phaseEvents.length >= 32) return
+    const event = { name, elapsedMs: Math.round(Math.max(0, performance.now() - phaseStarted)) }
+    phaseEvents.push(event)
+    if (process.env.AUTOPROMPT_NATIVE_TEST_EVIDENCE_ROOT) {
+      process.stderr.write(`NATIVE_CANARY_PHASE:${JSON.stringify({ case: t.name, ...event })}\n`)
+    }
+  }
+  const timingDiagnostic = diagnostic => ({ ...diagnostic, phaseTiming: phaseEvents.slice(-32) })
+  markPhase('scenario-start')
   assert.ok(CLI, 'AUTOPROMPT_CLAUDE_TEST_CLI is required for this native capability suite')
   const sandbox = await boundary.probeCommandSandbox()
   assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
+  markPhase('sandbox-ready')
+  if (process.platform === 'win32') {
+    const loader = require('../../agents/codex/workflow/windows-worker-loader.js')
+    const tuple = loader.describeTuple(await loader.captureWorkerTuple())
+    assert.equal(sandbox.workerIdentity, tuple.identity, 'the actual command canary must use the receipt-bound packaged tuple')
+    assert.equal(tuple.architecture, process.arch)
+    assert.equal(sandbox.processCleanup, 'owned-job-drained')
+    // The outer closed-canary artifacts bind this actual TAP output hash. The
+    // packed public-activation test reopens it, rather than simulating Windows.
+    t.diagnostic(`PACKAGED_WINDOWS_WORKER:${JSON.stringify({ identity: tuple.identity, architecture: tuple.architecture,
+      manifestSha256: tuple.manifestSha256, sharedId: tuple.sharedId, files: tuple.files })}`)
+  }
   const f = createFixture()
+  markPhase('fixture-ready')
+  let service, owner
+  t.after(async () => {
+    markPhase('cleanup-start')
+    await cleanupNativeFixture(f, 'claude', {
+      stop: async () => { if (owner) await owner.cancelAll({ reason: 'claude native capability cleanup', graceMs: 0, killMs: 2000 }); markPhase('owner-drained') },
+      close: async () => { if (service) await service.close(); markPhase('service-closed') },
+    })
+    markPhase('cleanup-end')
+  })
   const candidate = path.join(f.target, 'candidate.txt')
   const secret = path.join(f.controller, 'private.txt')
   const marker = `claude-native-capability-${crypto.randomUUID()}`
@@ -97,14 +159,39 @@ async function scenario(t, options = {}) {
   fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', { mode: 0o600 })
   let command = typeof options.command === 'function'
     ? options.command({ ...f, candidate, secret, marker })
-    : options.command || `cat ${quote(candidate)}`
-  command = `${command}; printf '\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(f.challenge)}`
-  const service = await modelService('claude', options.tool || { name: controlled.toolName('claude', 'bash'), args: { command } }, options.serviceOptions)
+    : options.command || readCommand(candidate)
+  command = withChallenge(command, f.challenge)
+  service = await modelService('claude', options.tool || { name: controlled.toolName('claude', 'bash'), args: { command } }, options.serviceOptions)
+  markPhase('model-service-ready')
   const binding = native.probeExecutable({ provider: 'claude', executable: CLI })
-  const processAdapter = createPosixProcessAdapter()
-  const owner = registeredProcessOwner(f, processAdapter)
-  const proxy = path.join(f.controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+  owner = registeredProcessOwner(f)
+  markPhase('owner-ready')
+  const launchShapes = []
+  const ownedLaunch = owner.launch.bind(owner)
+  owner.launch = async spec => {
+    markPhase('owned-launch-start')
+    try {
+      const owned = await ownedLaunch(spec); markPhase('owned-launch-ready'); return owned
+    }
+    catch (error) { markPhase('owned-launch-failed'); throw error }
+  }
+  const processAdapter = owner.adapter
+  const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'claude-closed-native-canary', pollMs: 10 })
+  const ownedRun = runner.run.bind(runner)
+  runner.run = spec => {
+    markPhase('proxy-run-start')
+    const settings = spec.argv.indexOf('--settings')
+    if (launchShapes.length < 8) launchShapes.push({
+      executableLength: spec.executable.length, cwdLength: spec.cwd.length,
+      settingsLength: settings >= 0 ? spec.argv[settings + 1]?.length : undefined,
+      environmentPathLengths: Object.fromEntries(['HOME', 'USERPROFILE', 'CLAUDE_CONFIG_DIR', 'TEMP', 'TMP'].map(key => {
+        const actual = Object.keys(spec.env).find(name => name.toUpperCase() === key)
+        return [key, typeof spec.env[actual] === 'string' ? spec.env[actual].length : null]
+      })),
+    })
+    return ownedRun(spec)
+  }
   const adapter = new HarnessExecAdapter({
     provider: 'claude', runner, nativeRoot: f.nativeRoot, executableBinding: binding,
     targetPath: f.target, connection: { model: 'claude-sonnet-4-6', environment: { ANTHROPIC_BASE_URL: service.url } },
@@ -114,21 +201,82 @@ async function scenario(t, options = {}) {
     ...(options.adapterOptions || {}),
   })
   const debits = []
+  const cliStartup = []
+  const cliToolResults = []
   const run = async overrides => {
+    markPhase('launch-start')
     const record = { ...f.record, ...overrides }
-    record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { PATH: process.env.PATH })
+    record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
     record.onUsageDelta = (delta, cumulative, evidence) => { debits.push(delta); return overrides?.onUsageDelta ? overrides.onUsageDelta(delta, cumulative, evidence) : { continue: true } }
-    record.signal = overrides?.signal || AbortSignal.timeout(90000)
-    const result = await adapter.launch(record)
-    assert.ok(service.requests.some(request => JSON.stringify(request.body).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`)), 'the actual native tool result omitted its closed-canary challenge')
+    const callerOnEvent = overrides?.onEvent
+    record.onEvent = (event, raw) => {
+      if (event?.type === 'user' && Array.isArray(event.message?.content)) {
+        // Capture bounded diagnostics before strict receipt verification can
+        // reject the event and prevent another request to the model service.
+        const observed = boundedClaudeToolDiagnostics({ requests: [{ body: { messages: [event.message] } }], errors: [] }, null)
+        cliToolResults.push(...observed.toolResults)
+        if (cliToolResults.length > 8) cliToolResults.splice(0, cliToolResults.length - 8)
+        if (observed.toolResults.length) markPhase('tool-result')
+      }
+      if (event?.type === 'system' && event.subtype === 'init') {
+        markPhase('cli-init')
+        cliStartup.push({
+          tools: (Array.isArray(event.tools) ? event.tools : []).slice(0, 32).filter(value => typeof value === 'string').map(value => value.slice(0, 256)),
+          mcpServers: (Array.isArray(event.mcp_servers) ? event.mcp_servers : []).slice(0, 16).map(server => ({
+            name: typeof server?.name === 'string' ? server.name.slice(0, 256) : undefined,
+            status: typeof server?.status === 'string' ? server.status.slice(0, 80) : undefined,
+            error: typeof server?.error === 'string' ? server.error.slice(0, 512) : undefined,
+          })),
+        })
+        if (cliStartup.length > 8) cliStartup.shift()
+      }
+      callerOnEvent?.(event, raw)
+    }
+    // Windows may spend up to 120 seconds assigning the provider Job, then
+    // the fresh MCP process must run its own native sandbox canary before
+    // executing the command. This test budget includes all three stages.
+    record.signal = overrides?.signal || AbortSignal.timeout(process.platform === 'win32' ? 300000 : 90000)
+    const onAbort = () => markPhase('abort')
+    record.signal.addEventListener?.('abort', onAbort, { once: true })
+    const firstNewRequest = service.requests.length
+    const requestPoll = setInterval(() => {
+      if (service.requests.slice(firstNewRequest).some(request => request.path.includes('/messages'))) {
+        markPhase('first-request')
+        clearInterval(requestPoll)
+      }
+    }, 25)
+    requestPoll.unref?.()
+    let result
+    let launchError
+    try { result = await adapter.launch(record) } catch (error) {
+      launchError = error
+    } finally {
+      clearInterval(requestPoll)
+      record.signal.removeEventListener?.('abort', onAbort)
+      markPhase('launch-end')
+    }
+    if (launchError) {
+      const diagnostic = timingDiagnostic(boundedClaudeToolDiagnostics(service, null, cliStartup, cliToolResults))
+      diagnostic.launchFailure = {
+        code: typeof launchError?.code === 'string' ? launchError.code.slice(0, 80) : undefined,
+        message: String(launchError?.message || 'Native launch failed').slice(0, 512),
+      }
+      diagnostic.launchShapes = launchShapes.slice(-8)
+      diagnostic.nativeFailureFiles = nativeFailureFiles([f.controller, path.dirname(owner.registryPath)])
+      t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(diagnostic)}`)
+      throw launchError
+    }
+    const challengeObserved = service.requests.some(request => JSON.stringify(request.body).includes(`CLOSED_CANARY_CHALLENGE:${f.challenge}`))
+    t.diagnostic(`CLAUDE_TOOL_RESULT_DIAGNOSTIC:${JSON.stringify(timingDiagnostic(boundedClaudeToolDiagnostics(service, result, cliStartup, cliToolResults)))}`)
+    assert.ok(challengeObserved, 'the actual native tool result omitted its closed-canary challenge')
     return result
   }
-  const close = async () => {
-    try { await owner.cancelAll({ reason: 'claude native capability cleanup', graceMs: 0, killMs: 2000 }) }
-    finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
-  }
-  t.after(close)
+  markPhase('scenario-ready')
   return { ...f, candidate, secret, marker, service, binding, owner, adapter, run, debits, command }
+}
+
+function checkerCommand(candidate, receipt) {
+  return nodeCommand(`const fs=require('node:fs');process.stdout.write(fs.readFileSync(${JSON.stringify(candidate)}));fs.writeFileSync(${JSON.stringify(receipt)},'checked');let denied=false;try{fs.writeFileSync(${JSON.stringify(candidate)},'wrong')}catch(error){denied=['EACCES','EPERM','EROFS'].includes(error.code)}if(!denied)throw Error('Checker modified frozen candidate')`)
 }
 
 function assertSuccessful(result) {
@@ -138,7 +286,62 @@ function assertSuccessful(result) {
   assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/)
 }
 
-const nativeOptions = { skip: !CLI || process.platform === 'win32', timeout: 240000 }
+function boundedClaudeToolDiagnostics(service, result, cliStartup = [], cliToolResults = []) {
+  const scalar = value => typeof value === 'string' ? value.slice(0, 256)
+    : typeof value === 'boolean' || Number.isFinite(value) ? value : undefined
+  const bounded = value => {
+    const text = String(value ?? ''), bytes = Buffer.byteLength(text)
+    return { text: text.slice(0, 4096), bytes, truncated: bytes > Buffer.byteLength(text.slice(0, 4096)) }
+  }
+  const toolResults = []
+  const requests = service.requests.slice(-8).map((request, index) => ({
+    requestOrdinal: service.requests.length - Math.min(service.requests.length, 8) + index + 1,
+    method: scalar(request.method), path: scalar(request.path),
+    tools: (Array.isArray(request.body?.tools) ? request.body.tools : []).slice(0, 16).map(tool => ({
+      name: scalar(tool?.name || tool?.function?.name), type: scalar(tool?.type),
+    })),
+    messageRoles: (Array.isArray(request.body?.messages) ? request.body.messages : []).slice(-8)
+      .map(message => scalar(message?.role)),
+  }))
+  for (const [requestOrdinal, request] of service.requests.entries()) {
+    if (requestOrdinal < service.requests.length - 8) continue
+    for (const message of Array.isArray(request.body?.messages) ? request.body.messages.slice(-8) : []) {
+      for (const block of Array.isArray(message?.content) ? message.content.slice(-8) : []) {
+        if (block?.type !== 'tool_result') continue
+        const parts = typeof block.content === 'string' ? [block.content] : Array.isArray(block.content)
+          ? block.content.filter(item => item?.type === 'text' && typeof item.text === 'string').map(item => item.text) : []
+        const content = parts.slice(0, 4).map(text => {
+          try {
+            const parsed = JSON.parse(text)
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return {
+              parsed: true, tool: scalar(parsed.tool), status: scalar(parsed.status), exitCode: scalar(parsed.exitCode),
+              code: scalar(parsed.code), executionState: scalar(parsed.executionState), output: bounded(parsed.output),
+              outputSha256: scalar(parsed.outputSha256),
+            }
+          } catch {}
+          return { parsed: false, content: bounded(text) }
+        })
+        toolResults.push({ requestOrdinal: requestOrdinal + 1, toolUseId: scalar(block.tool_use_id),
+          isError: block.is_error === true, content })
+        if (toolResults.length > 8) toolResults.shift()
+      }
+    }
+  }
+  return {
+    cliStartup: cliStartup.slice(-8),
+    cliToolResults: cliToolResults.slice(-8),
+    requestCount: service.requests.length,
+    requests,
+    toolResults: toolResults.slice(-8),
+    serviceErrors: service.errors.slice(-8).map(bounded),
+    adapterResult: result && { ok: scalar(result.ok), contextId: scalar(result.contextId),
+      eventStreamHash: scalar(result.transportEvidence?.eventStreamHash),
+      policySha256: scalar(result.toolBoundaryEvidence?.policySha256),
+      toolReceiptCount: result.toolBoundaryEvidence?.receiptHashes?.length },
+  }
+}
+
+const nativeOptions = { skip: !CLI, timeout: process.platform === 'win32' ? 900000 : 240000 }
 
 test('claude closed native capability: full canonical role schema is accepted and validated', nativeOptions, async t => {
   const output = {
@@ -153,26 +356,24 @@ test('claude closed native capability: full canonical role schema is accepted an
     remainingConcerns: [], allAssignedItemsPass: true,
     requestedTransition: { event: 'WORK_ITEM_VERIFIED', reason: 'The exact structured result passed.', invalidateEvidenceIds: [] },
   }
-  const f = await scenario(t, { serviceOptions: { structuredOutput: output } })
+  // The real CLI emits a tool_progress heartbeat after 30 seconds. Keep this
+  // owned command alive long enough to exercise that wire event on every
+  // native platform, then validate the same exact command receipt and result.
+  const f = await scenario(t, { serviceOptions: { structuredOutput: output },
+    command: ({ candidate }) => nodeCommand(`Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,35000);process.stdout.write(require('node:fs').readFileSync(${JSON.stringify(candidate)}))`) })
   fs.copyFileSync(path.join(__dirname, '..', '..', 'agents', 'contracts', 'schemas', 'role-report.schema.json'), f.schema)
   let result
+  const heartbeats = []
   const quotaHooks = {
     providerTokenLimit: 100000, finiteTokenBudget: false,
     onProviderRequestStarted() {}, onProviderRequestSettled() {}, onUnknownProviderSpend() {},
+    onEvent(event) { if (event.type === 'tool_progress' && event.heartbeat === true) heartbeats.push(event) },
   }
-  try { result = await f.run(quotaHooks) } catch (error) {
-    const pending = [f.controller]
-    while (pending.length) {
-      const directory = pending.pop()
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const item = path.join(directory, entry.name)
-        if (entry.isDirectory()) pending.push(item)
-        else if (entry.name === 'stderr.log') process.stderr.write(fs.readFileSync(item, 'utf8').slice(0, 4096))
-      }
-    }
-    throw error
-  }
+  result = await f.run(quotaHooks)
   assert.match(result.contextId, /^[0-9a-f-]{36}$/i)
+  assert.ok(heartbeats.length > 0, 'the installed CLI must emit an actual heartbeat for the slow owned command')
+  assert.ok(heartbeats.every(event => event.parent_tool_use_id === 'fixture-native-read' &&
+    event.tool_name === controlled.toolName('claude', 'bash') && event.session_id === result.contextId))
   assert.ok(result.transportEvidence.eventCount > 0)
   assert.match(result.transportEvidence.eventStreamHash, /^[a-f0-9]{64}$/)
   assert.deepEqual(Object.fromEntries(Object.entries(output).filter(([key]) => !['candidateHash'].includes(key))),
@@ -194,34 +395,58 @@ test('claude closed native capability: full canonical role schema is accepted an
 
 test('claude closed native capability: isolation denies candidate/private/network while allowing scratch', nativeOptions, async t => {
   const net = require('node:net')
-  let contacted = false
-  const listener = net.createServer(socket => { contacted = true; socket.destroy() })
+  let accepted = 0
+  const listener = net.createServer(socket => { accepted++; socket.end() })
   await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
   const port = listener.address().port
+  const controlListener = async () => {
+    await new Promise((resolve, reject) => {
+      const socket = net.connect({ port, host: '127.0.0.1', family: 4 })
+      socket.once('connect', () => { socket.destroy(); resolve() })
+      socket.once('error', reject)
+      socket.setTimeout(1500, () => { socket.destroy(); reject(new Error('controller listener timeout')) })
+    })
+    await new Promise(resolve => setImmediate(resolve))
+  }
   try {
+    await controlListener()
+    assert.equal(accepted, 1, 'listener must accept a controller connection before the command')
+    accepted = 0
+    let networkFile
     const f = await scenario(t, { command: ({ candidate, secret, scratch }) => {
       const scratchFile = path.join(scratch, 'isolation.txt')
-      const network = `const n=require('node:net');const s=n.connect(${port},'127.0.0.1');s.on('connect',()=>process.exit(19));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),700)`
-      return [
-        `cat ${quote(candidate)}`,
-        `printf scratch-ok > ${quote(scratchFile)}`,
-        `if printf forbidden > ${quote(candidate)} 2>/dev/null; then exit 18; fi`,
-        `if cat ${quote(secret)} 2>/dev/null; then exit 20; fi`,
-        `${quote(process.execPath)} -e ${quote(network)}`,
-      ].join('; ')
+      networkFile = path.join(scratch, 'network-observed.json')
+      return nodeCommand(`
+        const fs=require('node:fs'),net=require('node:net');
+        const denied=operation=>{let error;try{operation()}catch(value){error=value}if(!error||!['EACCES','EPERM','EROFS','ENOENT'].includes(error.code))throw Error('Expected permission denial')};
+        process.stdout.write(fs.readFileSync(${JSON.stringify(candidate)}));
+        fs.writeFileSync(${JSON.stringify(scratchFile)},'scratch-ok');
+        denied(()=>fs.writeFileSync(${JSON.stringify(candidate)},'forbidden'));
+        denied(()=>fs.readFileSync(${JSON.stringify(secret)}));
+        const s=net.connect(${port},'127.0.0.1');
+        let done=false;const finish=network=>{if(done)return;done=true;clearTimeout(timer);fs.writeFileSync(${JSON.stringify(networkFile)},JSON.stringify(network));s.destroy();if(network.status==='connected')process.exitCode=19;if(network.status==='deadline')process.exitCode=21;if(network.status==='error'&&!((process.platform==='win32'&&['EACCES','EPERM','ETIMEDOUT'].includes(network.code))||(process.platform!=='win32'&&['EACCES','EPERM','ENETUNREACH','EHOSTUNREACH','ECONNREFUSED'].includes(network.code))))process.exitCode=22};
+        const timer=setTimeout(()=>finish({status:'deadline'}),3000);
+        s.once('connect',()=>{clearTimeout(timer);finish({status:'connected'})});
+        s.once('error',error=>{clearTimeout(timer);finish({status:'error',code:error.code})});
+      `)
     } })
     const result = await f.run({})
     assertSuccessful(result)
     assert.equal(fs.readFileSync(f.candidate, 'utf8'), f.marker)
     assert.equal(fs.readFileSync(path.join(f.scratch, 'isolation.txt'), 'utf8'), 'scratch-ok')
-    assert.equal(contacted, false, 'the real command sandbox reached the host network')
+    assert.equal(accepted, 0, 'the real command sandbox reached the host network')
+    const observed = JSON.parse(fs.readFileSync(networkFile, 'utf8'))
+    assert.equal(observed.status, 'error')
+    assert.ok((process.platform === 'win32' ? ['EACCES', 'EPERM', 'ETIMEDOUT'] : ['EACCES', 'EPERM', 'ENETUNREACH', 'EHOSTUNREACH', 'ECONNREFUSED']).includes(observed.code), JSON.stringify(observed))
+    await controlListener()
+    assert.equal(accepted, 1, 'listener must remain reachable from the controller after the command')
   } finally { await new Promise(resolve => listener.close(resolve)) }
 })
 
 test('claude closed native capability: topology rejects injected nested dispatch and permits only its controller edge', nativeOptions, async t => {
   const hostile = await scenario(t, { tool: { name: 'Task', args: { prompt: 'unauthorized nested dispatch' } }, serviceOptions: { forceFirstTool: true } })
   await assert.rejects(hostile.run({}), { code: 'ROLE_POLICY_DENIED' })
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   const result = await f.run({})
   assertSuccessful(result)
   const advertised = f.service.requests.filter(request => Array.isArray(request.body.tools))
@@ -234,7 +459,7 @@ test('claude closed native capability: topology rejects injected nested dispatch
 })
 
 test('claude closed native capability: private skill root and ambient project configuration stay outside the model', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   fs.mkdirSync(path.join(f.target, '.claude'), { mode: 0o700 })
   fs.writeFileSync(path.join(f.target, '.claude', 'settings.json'), JSON.stringify({ hooks: { PreToolUse: [{ command: 'false' }] } }), { mode: 0o600 })
   const result = await f.run({})
@@ -245,7 +470,7 @@ test('claude closed native capability: private skill root and ambient project co
 })
 
 test('claude closed native capability: intermediate stream events remain correlated to the native session', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   const raw = []
   const result = await f.run({ onEvent: event => raw.push(event) })
   assertSuccessful(result)
@@ -268,12 +493,41 @@ test('Claude exact post-message ping is ignored without opening a request', () =
   assert.equal(stream.usageByRequest.size, 0)
   assert.throws(() => stream.push(JSON.stringify({ type: 'stream_event', session_id: session, event: { type: 'ping', data: 'unexpected' } })),
     { code: 'TRANSPORT_INVALID' })
+  const requests = Array.from({ length: 10 }, (_, index) => ({ method: 'POST', path: `/messages/${index}`,
+    body: { tools: Array.from({ length: 20 }, (__, tool) => ({ name: `tool-${tool}`, type: 'custom' })),
+      messages: Array.from({ length: 10 }, (__, message) => ({ role: message % 2 ? 'assistant' : 'user', content: [] })) } }))
+  const diagnostic = boundedClaudeToolDiagnostics({ requests, errors: Array(10).fill('x'.repeat(5000)) }, null,
+    Array.from({ length: 10 }, () => ({ tools: [], mcpServers: [] })), Array(10).fill({ toolUseId: 'bounded' }))
+  assert.equal(diagnostic.requestCount, 10)
+  assert.equal(diagnostic.requests.length, 8); assert.equal(diagnostic.requests[0].requestOrdinal, 3)
+  assert.equal(diagnostic.requests[0].tools.length, 16); assert.equal(diagnostic.requests[0].messageRoles.length, 8)
+  assert.equal(diagnostic.serviceErrors.length, 8); assert.equal(diagnostic.serviceErrors[0].text.length, 4096)
+  assert.equal(diagnostic.cliStartup.length, 8)
+  assert.equal(diagnostic.cliToolResults.length, 8)
+  const observed = boundedClaudeToolDiagnostics({ requests: [{ body: { messages: [{ content: Array.from({ length: 10 }, () => ({
+    type: 'tool_result', tool_use_id: 'failed-controller-command', is_error: true,
+    content: JSON.stringify({ tool: 'bash', status: 'failed', code: 'WINDOWS_RUNTIME_UNAVAILABLE', output: 'x'.repeat(5000) }),
+  })) }] } }], errors: [] }, null)
+  assert.equal(observed.toolResults.length, 8)
+  assert.equal(observed.toolResults[0].content[0].code, 'WINDOWS_RUNTIME_UNAVAILABLE')
+  assert.equal(observed.toolResults[0].content[0].output.text.length, 4096)
+})
+
+test('Claude native failure diagnostics retain empty stderr and bound captured bytes', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-native-failure-'))
+  try {
+    fs.writeFileSync(path.join(root, 'stderr.log'), '', { flag: 'wx', mode: 0o600 })
+    fs.writeFileSync(path.join(root, 'helper.stderr.log'), 'x'.repeat(12000), { flag: 'wx', mode: 0o600 })
+    const retained = nativeFailureFiles([root])
+    assert.deepEqual(retained.find(record => record.file === 'stderr.log'), { file: 'stderr.log', bytes: 0, tail: '' })
+    assert.deepEqual(retained.find(record => record.file === 'helper.stderr.log'), { file: 'helper.stderr.log', bytes: 12000, tail: 'x'.repeat(8192) })
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
 test('claude closed native capability: exact controller tool receipt binds the real command output', nativeOptions, async t => {
   const f = await scenario(t, { command: ({ candidate, scratch }) => {
     const receipt = path.join(scratch, 'receipt.txt')
-    return `cat ${quote(candidate)}; printf exact-receipt > ${quote(receipt)}`
+    return nodeCommand(`const fs=require('node:fs');process.stdout.write(fs.readFileSync(${JSON.stringify(candidate)}));fs.writeFileSync(${JSON.stringify(receipt)},'exact-receipt')`)
   } })
   const raw = []
   const result = await f.run({ onEvent: event => raw.push(event) })
@@ -285,7 +539,7 @@ test('claude closed native capability: exact controller tool receipt binds the r
 })
 
 test('claude closed native capability: concurrently owned siblings receive separate native identities', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate), serviceOptions: { toolPerConversation: true } })
   let peak = 0
   const monitor = setInterval(() => { peak = Math.max(peak, f.owner.ownershipIdentities().length) }, 5)
   let results
@@ -299,13 +553,14 @@ test('claude closed native capability: concurrently owned siblings receive separ
     }))
   } finally { clearInterval(monitor) }
   assert.ok(results.every(result => result.ok === true))
+  for (const result of results) assert.equal(result.toolBoundaryEvidence.receiptHashes.length, 1, 'Each sibling must execute its own native command')
   assert.equal(new Set(results.map(result => result.contextId)).size, 2)
   assert.ok(peak >= 2, `sibling CLI processes did not overlap; peak=${peak}`)
   assert.deepEqual(f.owner.ownershipIdentities(), [])
 })
 
 test('claude closed native capability: same-context continuation succeeds while foreign target reuse is refused', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   const first = await f.run({})
   assertSuccessful(first)
   const before = f.service.requests.length
@@ -317,27 +572,29 @@ test('claude closed native capability: same-context continuation succeeds while 
   await assert.rejects(f.adapter.launch({
     ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId,
     workingDirectory: foreignTarget,
-    environment: prepareProcessLaunchEnvironment(createPosixProcessAdapter(), crypto.randomUUID(), { PATH: process.env.PATH }),
+    environment: prepareProcessLaunchEnvironment(f.owner.adapter, crypto.randomUUID(), nativeEnvironment()),
     signal: AbortSignal.timeout(30000),
   }), { code: 'SESSION_ID_MISMATCH' })
 })
 
 test('claude closed native capability: cancellation drains the held child and a sibling remains operational', nativeOptions, async t => {
   const f = await scenario(t, {
-    command: ({ candidate }) => `cat ${quote(candidate)}`,
-    serviceOptions: { delayMessagesMs: 4000 },
+    command: ({ candidate }) => readCommand(candidate),
+    serviceOptions: { holdFirstMessage: true },
   })
   const controller = new AbortController()
   const pending = f.run({ signal: controller.signal })
   pending.catch(() => {})
-  for (let i = 0; i < 100 && f.service.requests.length === 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10))
+  const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
+  await waitForNativeObservation(pending, () => f.service.firstMessageHeld, waitForHeldMessageMs, 'the first native model response')
+  assert.equal(f.service.firstMessageHeld, true, 'the first native model response must be held before cancellation')
   const identities = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
   const fast = f.run({ ...identities, missionBinding: core.bindCanonicalMissionForChild(f.projection, {
     ...f.record, ...identities, sourceRequestHash: f.projection.sourceRequestHash,
     requestEnvelopeHash: f.record.dispatch.requestPointer.hash,
   }) })
   fast.catch(() => {})
-  for (let i = 0; i < 1000 && f.owner.ownershipIdentities().length < 2; i += 1) await new Promise(resolve => setTimeout(resolve, 10))
+  await waitForNativeObservation(fast, () => f.owner.ownershipIdentities().length >= 2, waitForHeldMessageMs, 'both owned native children')
   assert.equal(f.owner.ownershipIdentities().length, 2, 'both owned native children must be live at cancellation')
   controller.abort()
   await assert.rejects(pending, { code: 'CHILD_CANCELLED' })
@@ -351,11 +608,13 @@ test('claude closed native capability: cancellation drains the held child and a 
 test('claude closed native capability: isolated checker receives read-only candidate and private scratch', nativeOptions, async t => {
   const f = await scenario(t, { command: ({ candidate, scratch }) => {
     const checked = path.join(scratch, 'checker.txt')
-    return `cat ${quote(candidate)}; printf checked > ${quote(checked)}; if printf wrong > ${quote(candidate)} 2>/dev/null; then exit 19; fi`
+    return checkerCommand(candidate, checked)
   } })
   const frozen = path.join(f.root, 'frozen'); fs.mkdirSync(frozen, { mode: 0o700 })
   const frozenCandidate = path.join(frozen, 'candidate.txt'); fs.writeFileSync(frozenCandidate, f.marker, { mode: 0o600 })
-  const checkerScratch = path.join(f.root, 'checker-scratch'); fs.mkdirSync(checkerScratch, { mode: 0o700 })
+  // This fixture supplies the checker resource root itself; Windows requires
+  // its own protected ACL, even when its parent already has a private ACL.
+  const checkerScratch = privateDirectory(path.join(f.root, 'checker-scratch'))
   for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(checkerScratch, name), { mode: 0o700 })
   const checkerBoundary = {
     schemaVersion: 1, capability: native.sha256('closed-native-checker-boundary'), runId: 'closed-native-checker',
@@ -363,7 +622,7 @@ test('claude closed native capability: isolated checker receives read-only candi
     writableScratchRoot: checkerScratch, temporaryRoot: path.join(checkerScratch, 'tmp'),
     outputRoot: path.join(checkerScratch, 'output'), cacheRoot: path.join(checkerScratch, 'cache'),
   }
-  f.service.tool.args.command = `cat ${quote(frozenCandidate)}; printf checked > ${quote(path.join(checkerScratch, 'checker.txt'))}; if printf wrong > ${quote(frozenCandidate)} 2>/dev/null; then exit 19; fi; printf '\nCLOSED_CANARY_CHALLENGE:%s\n' ${quote(f.challenge)}`
+  f.service.tool.args.command = withChallenge(checkerCommand(frozenCandidate, path.join(checkerScratch, 'checker.txt')), f.challenge)
   const checkerRecord = {
     ...f.record, logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker',
     workingDirectory: checkerScratch, canonicalTargetPath: frozen, candidateHash: checkerBoundary.candidateHash, checkerScratchBoundary: checkerBoundary,
@@ -374,24 +633,28 @@ test('claude closed native capability: isolated checker receives read-only candi
     connection: f.adapter.connection, credentialEnvironment: { ANTHROPIC_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema,
     rolePrompt: () => 'Use only the controller checker tools and return one JSON object.', checkerScratchVerifier: () => checkerBoundary,
   })
-  checkerRecord.environment = prepareProcessLaunchEnvironment(createPosixProcessAdapter(), checkerRecord.reservationId, { PATH: process.env.PATH })
-  checkerRecord.signal = AbortSignal.timeout(90000)
+  checkerRecord.environment = prepareProcessLaunchEnvironment(f.owner.adapter, checkerRecord.reservationId, nativeEnvironment())
+  checkerRecord.signal = AbortSignal.timeout(process.platform === 'win32' ? 300000 : 90000)
   const result = await checkerAdapter.launch(checkerRecord)
   assertSuccessful(result)
+  if (!fs.existsSync(path.join(checkerScratch, 'checker.txt'))) {
+    t.diagnostic(`CLAUDE_CHECKER_RECEIPT_DIAGNOSTIC:${JSON.stringify(boundedClaudeToolDiagnostics(f.service, result))}`)
+  }
   assert.equal(fs.readFileSync(frozenCandidate, 'utf8'), f.marker)
   assert.equal(fs.readFileSync(path.join(checkerScratch, 'checker.txt'), 'utf8'), 'checked')
 })
 
 test('claude closed native capability: process ownership records completion and recovers a fresh session', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}`, serviceOptions: { delayMessagesMs: 10000 } })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate), serviceOptions: { holdFirstMessage: true } })
   const abort = new AbortController()
   const pending = f.run({ signal: abort.signal })
   pending.catch(() => {})
-  for (let i = 0; i < 1500 && f.service.requests.length === 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10))
-  assert.ok(f.service.requests.length > 0, 'native request must start before recovering its durable owner')
+  const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
+  await waitForNativeObservation(pending, () => f.service.firstMessageHeld, waitForHeldMessageMs, 'the first native model response')
+  assert.equal(f.service.firstMessageHeld, true, 'native request must reach the held model response before recovering its durable owner')
   const registry = JSON.parse(fs.readFileSync(f.owner.registryPath, 'utf8'))
   assert.ok(JSON.stringify(registry).includes('native-claude-'), 'owned native process was not durably registered')
-  const replacement = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: f.owner.registryPath, pollMs: 10 })
+  const replacement = new ProcessOwner({ adapter: nativeProcessAdapter(f.owner.registryPath, process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT || f.controller), registryPath: f.owner.registryPath, pollMs: 10 })
   await replacement.recoverReservations()
   assert.equal(replacement.ownershipIdentities().length, 1, 'replacement owner must recover the actual live CLI')
   try {
@@ -406,7 +669,7 @@ test('claude closed native capability: process ownership records completion and 
 })
 
 test('claude closed native capability: exact model effort is wired and unsupported assignment is refused', nativeOptions, async t => {
-  const f = await scenario(t, { command: ({ candidate }) => `cat ${quote(candidate)}` })
+  const f = await scenario(t, { command: ({ candidate }) => readCommand(candidate) })
   const result = await f.run({ assignment: { model: 'claude-sonnet-4-6', effort: 'high' } })
   assertSuccessful(result)
   const modelRequests = f.service.requests.filter(request => request.path.includes('/messages'))
@@ -414,11 +677,11 @@ test('claude closed native capability: exact model effort is wired and unsupport
   assert.ok(modelRequests.every(request => request.body.model === 'claude-sonnet-4-6' && request.body.output_config?.effort === 'high'), JSON.stringify(modelRequests.map(request => ({ model: request.body.model, effort: request.body.output_config }))))
   assert.ok(modelRequests.every(request => request.body.tools?.some(tool => tool.name === 'StructuredOutput' && tool.input_schema?.properties?.ok?.const === true)),
     JSON.stringify(modelRequests.map(request => (request.body.tools || []).map(tool => tool.name))))
-  assert.throws(() => native.createLaunch({ provider: 'claude', executable: f.binding.path, home: path.join(f.root, 'invalid-home'), sessionRoot: path.join(f.root, 'invalid-session'), targetPath: f.target, cwd: f.target, prompt: 'x', input: 'x', connection: f.adapter.connection, credentials: { ANTHROPIC_API_KEY: '<local-test-only>' }, environment: { PATH: process.env.PATH }, readOnly: true, effort: 'unauthorized' }), { code: 'PROFILE_INVALID' })
+  assert.throws(() => native.createLaunch({ provider: 'claude', executable: f.binding.path, home: path.join(f.root, 'invalid-home'), sessionRoot: path.join(f.root, 'invalid-session'), targetPath: f.target, cwd: f.target, prompt: 'x', input: 'x', connection: f.adapter.connection, credentials: { ANTHROPIC_API_KEY: '<local-test-only>' }, environment: nativeEnvironment(), readOnly: true, effort: 'unauthorized' }), { code: 'PROFILE_INVALID' })
 })
 
 for (const deferredInputUsage of [false, true]) {
-test(`claude native durable quota settles each tool turn exactly once${deferredInputUsage ? ' with deferred cumulative input' : ''}`, { skip: !CLI, timeout: 180000 }, async t => {
+test(`claude native durable quota settles each tool turn exactly once${deferredInputUsage ? ' with deferred cumulative input' : ''}`, { skip: !CLI, timeout: process.platform === 'win32' ? 900000 : 180000 }, async t => {
   const f = await scenario(t, { serviceOptions: { deferredInputUsage, terminalDoneSentinel: deferredInputUsage ? 'data' : false, explicitThinkingReplay: deferredInputUsage } })
 
   const starts = [], settlements = [], debits = [], unknown = []

@@ -3,6 +3,7 @@
 const path = require('node:path')
 const fs = require('node:fs')
 const { writePrivate, sha256 } = require('../agents/reasonix/workflow/native.js')
+const { descriptorValid, ensurePrivateDirectory } = require('./harness-v2-bridge/vscode/event-channel.cjs')
 function fail(message) { const error = new Error(message); error.code = 'PROFILE_INVALID'; throw error }
 function sanitize(source = {}) {
   if (!source || typeof source !== 'object' || Array.isArray(source)) fail('VS Code owned provider needs connection data')
@@ -13,6 +14,10 @@ function sanitize(source = {}) {
   }
   if (source.supportsStructuredOutput !== undefined && typeof source.supportsStructuredOutput !== 'boolean') fail('Invalid VS Code structured-output capability')
   result.supportsStructuredOutput = source.supportsStructuredOutput === true
+  if (source.logLevel !== undefined) {
+    if (!['trace', 'debug', 'info', 'warn', 'error', 'off'].includes(source.logLevel)) fail('Invalid VS Code log level')
+    result.logLevel = source.logLevel
+  }
   result.baseUrl ||= 'https://openrouter.ai/api/v1'
   let url
   try { url = new URL(result.baseUrl) } catch { fail('VS Code provider URL is invalid') }
@@ -33,9 +38,25 @@ function project(options, env) {
   if (options.effort !== undefined && options.effort !== null) connection.reasoningEffort = require('./harness-v2-native.cjs').validateEffort('vscode', options.effort)
   if (!connection.model) fail('VS Code owned BYOK execution needs an explicit model')
   if (!options.toolBoundary) fail('VS Code owned sessions require the controlled tool boundary')
+  if (!descriptorValid(options.vscodeEventChannel)) fail('VS Code owned sessions require an exact private event channel')
+  const deepUserDataDir = path.join(options.home, 'user-data')
+  const userDataDir = options.vscodeUserDataDir === undefined ? deepUserDataDir : options.vscodeUserDataDir
+  if (options.vscodeUserDataDir !== undefined) {
+    // Chromium and native logging components still create MAX_PATH-limited
+    // descendants on Windows. Leave room for their cache/log suffixes.
+    const withinLimit = process.platform === 'win32'
+      ? typeof userDataDir === 'string' && userDataDir.length < 120
+      : typeof userDataDir === 'string' && Buffer.byteLength(path.join(userDataDir, '0000-main.sock')) < 103
+    if (typeof userDataDir !== 'string' || !path.isAbsolute(userDataDir) || userDataDir.includes('\0') ||
+        !withinLimit ||
+        fs.realpathSync.native(userDataDir) !== fs.realpathSync.native(deepUserDataDir)) {
+      fail('VS Code alias must address this exact private user-data directory within the native path limit')
+    }
+  }
   const request = { version: 1, connection, connectionIdentityBaseUrl: options.providerConnectionIdentity?.baseUrl || connection.baseUrl, sessionRoot: options.sessionRoot, targetPath: options.targetPath,
     prompt: options.prompt, input: options.input, continuationId: options.continuationId || null,
     policyPath: options.toolBoundary.policyPath, policySha256: options.toolBoundary.policySha256,
+    eventChannel: options.vscodeEventChannel,
     ...(connection.supportsStructuredOutput && options.outputSchema ? { outputSchema: options.outputSchema } : {}) }
   const file = path.join(options.home, 'owned-session.json')
   const bytes = JSON.stringify(request)
@@ -48,8 +69,19 @@ function project(options, env) {
   const settingsRoot = path.join(options.home, 'user-data', 'User')
   fs.mkdirSync(settingsRoot, { recursive: true, mode: 0o700 })
   writePrivate(path.join(settingsRoot, 'settings.json'), JSON.stringify({ 'telemetry.telemetryLevel': 'off', 'update.mode': 'none', 'extensions.autoUpdate': false, 'extensions.autoCheckUpdates': false, 'workbench.startupEditor': 'none', 'security.workspace.trust.enabled': false }))
-  return ['--no-sandbox', '--disable-gpu', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',
-    '--user-data-dir', path.join(options.home, 'user-data'), '--extensions-dir', path.join(options.home, 'extensions'),
+  if (options.vscodeUserDataDir !== undefined) {
+    // VS Code's additional random IPC sockets use os.tmpdir(). Keep those
+    // lexical paths short too, with their bytes in the same private target.
+    try { ensurePrivateDirectory(path.join(deepUserDataDir, 't')) } catch { fail('VS Code private temporary directory is unsafe') }
+    env.TMPDIR = env.TMP = env.TEMP = path.join(userDataDir, 't')
+  }
+  // The owned host runs unattended, but its renderer still routes extension
+  // activation and LM requests. Keep its timers and IPC runnable when another
+  // owned window covers it; renderer priority alone does not disable throttling.
+  return ['--no-sandbox', '--disable-gpu', '--disable-renderer-backgrounding', '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows', '--disable-extensions', '--skip-welcome', '--skip-release-notes', '--disable-workspace-trust',
+    ...(process.platform === 'darwin' ? ['--use-inmemory-secretstorage'] : []),
+    ...(connection.logLevel ? ['--log', connection.logLevel] : []),
+    '--user-data-dir', userDataDir, '--extensions-dir', path.join(options.home, 'extensions'),
     '--extensionDevelopmentPath', path.join(__dirname, 'harness-v2-bridge/vscode'),
     '--extensionTestsPath', path.join(__dirname, 'harness-v2-bridge/vscode/session-driver.cjs')]
 }

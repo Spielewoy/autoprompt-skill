@@ -342,6 +342,56 @@ test('Codex Windows hash manifest accepts nested portable keys for real drive-ro
   })
 })
 
+test('Codex portable manifest keys resolve against ConfigRoot during read and write', {
+  skip: !POWERSHELL_AVAILABLE,
+}, t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-manifest-rooted-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const root = path.join(sandbox, 'provider root')
+  const relative = '.autoprompt-private/bundles/codex-v2.0.0-aaaaaaaaaaaaaaaa/skills/autoprompt/agents-runtime/ap-arbiter.toml'
+  const target = path.join(root, ...relative.split('/'))
+  const hash = 'a'.repeat(64)
+  fs.mkdirSync(path.dirname(target), { recursive: true })
+  fs.writeFileSync(target, 'portable private agent\n')
+  fs.writeFileSync(path.join(root, '.autoprompt-install-hashes.json'),
+    canonicalManifest([[relative, hash]]))
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    `. ${ps(LIBRARY)}`,
+    `$entries=Read-IdemManifestEntries -ConfigRoot ${ps(root)}`,
+    `$identity=Get-IdemManifestKeyIdentity -ConfigRoot ${ps(root)} -Key ${ps(relative)}`,
+    `$ok=Set-IdemManifestHashes -ConfigRoot ${ps(root)} -Hashes @(@{Key=${ps(target)};Hash=${ps(hash)}}) -UseIdentityIndex`,
+    `$raw=[IO.File]::ReadAllText((Join-Path ${ps(root)} '.autoprompt-install-hashes.json'))`,
+    '@{count=$entries.Count;identity=$identity;ok=$ok;raw=$raw}|ConvertTo-Json -Compress',
+  ].join(';')
+  const result = runPowerShell(command)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  const actual = JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1))
+  assert.equal(actual.count, 1)
+  assert.equal(actual.identity, path.resolve(target))
+  assert.equal(actual.ok, true)
+  assert.equal(actual.raw, canonicalManifest([[relative, hash]]))
+
+  // The relative and absolute spellings identify one file.  A cwd-based
+  // parser sees two different identities; ConfigRoot-based parsing must reject
+  // the alias before the manifest can be rewritten.
+  fs.writeFileSync(path.join(root, '.autoprompt-install-hashes.json'),
+    canonicalManifest([[relative, hash], [target, hash]]))
+  const duplicateCommand = [
+    "$ErrorActionPreference = 'Stop'",
+    `. ${ps(LIBRARY)}`,
+    `$threw=$false; try { Read-IdemManifestEntries -ConfigRoot ${ps(root)} | Out-Null } catch { $threw=$true }`,
+    '@{threw=$threw}|ConvertTo-Json -Compress',
+  ].join(';')
+  const duplicateResult = runPowerShell(duplicateCommand)
+  assert.equal(duplicateResult.status, 0,
+    `${duplicateResult.stdout}\n${duplicateResult.stderr}`)
+  assert.deepEqual(
+    JSON.parse(duplicateResult.stdout.trim().split(/\r?\n/).at(-1)),
+    { threw: true },
+  )
+})
+
 test('Codex Windows hash manifest rejects noncanonical or escaping nested target spellings', {
   skip: process.platform !== 'win32',
 }, t => {
@@ -1099,6 +1149,111 @@ test('Codex indexed registration rejects a source mutation before publish or rec
     code: 46, target: false, receipt: 0, residue: 0,
   })
   fs.rmSync(sandbox, { recursive: true, force: true })
+})
+
+test('Codex indexed reinstall compare-and-swaps a receipt-owned manifest hash', {
+  skip: !POWERSHELL_AVAILABLE,
+}, t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-index-update-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const root = path.join(sandbox, 'root')
+  const source = path.join(sandbox, 'source.txt')
+  const target = path.join(root, 'agents', 'ap-arbiter.toml')
+  const manifest = path.join(root, '.autoprompt-install-hashes.json')
+  const oldBytes = Buffer.from('old model\n')
+  const newBytes = Buffer.from('new model\n')
+  const oldHash = crypto.createHash('sha256').update(oldBytes).digest('hex')
+  const newHash = crypto.createHash('sha256').update(newBytes).digest('hex')
+  fs.mkdirSync(path.dirname(target), { recursive: true })
+  fs.writeFileSync(target, oldBytes)
+  fs.writeFileSync(source, newBytes)
+  fs.writeFileSync(manifest, canonicalManifest([['agents/ap-arbiter.toml', oldHash]]))
+  // Linux PowerShell hides dot-prefixed files without -Force; Windows does not.
+  const getItemShim = process.platform === 'win32' ? '' :
+    "function Get-Item {param([string]$LiteralPath,[switch]$Force,[string]$ErrorAction='Stop');Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath -Force -ErrorAction $ErrorAction}"
+  const command = [
+    "$ErrorActionPreference = 'Stop'", `. ${ps(LIBRARY)}`, getItemShim,
+    `$script:AutopromptReceiptFiles=@(${ps(target)},${ps(manifest)});$script:AutopromptReceiptCreatedDirectories=@();$script:AutopromptReceiptEdits=@();$script:AutopromptManagedUndoJournal=@()`,
+    `$mapping=@{Source=${ps(source)};Target=${ps(target)}}`,
+    `$code=Install-IdemManagedFiles -ConfigRoot ${ps(root)} -Mappings @($mapping) -RefuseUnownedTarget -UseCodexBatchIndex`,
+    '$committed=if($code-eq 0){Complete-IdemManagedChanges}else{$false}',
+    `$raw=[IO.File]::ReadAllText(${ps(manifest)});$landed=[IO.File]::ReadAllText(${ps(target)})`,
+    '@{code=$code;committed=$committed;raw=$raw;landed=$landed}|ConvertTo-Json -Compress',
+  ].filter(Boolean).join(';')
+  const result = runPowerShell(command)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.deepEqual(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)), {
+    code: 0,
+    committed: true,
+    raw: canonicalManifest([['agents/ap-arbiter.toml', newHash]]),
+    landed: newBytes.toString(),
+  })
+})
+
+test('Codex indexed reinstall rejects a stale manifest compare-and-swap and rolls back bytes', {
+  skip: !POWERSHELL_AVAILABLE,
+}, t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-index-stale-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const root = path.join(sandbox, 'root')
+  const source = path.join(sandbox, 'source.txt')
+  const target = path.join(root, 'agents', 'ap-arbiter.toml')
+  const manifest = path.join(root, '.autoprompt-install-hashes.json')
+  const oldBytes = Buffer.from('old model\n')
+  const newBytes = Buffer.from('new model\n')
+  const oldHash = crypto.createHash('sha256').update(oldBytes).digest('hex')
+  const staleHash = crypto.createHash('sha256').update('foreign manifest').digest('hex')
+  const originalManifest = canonicalManifest([['agents/ap-arbiter.toml', oldHash]])
+  fs.mkdirSync(path.dirname(target), { recursive: true })
+  fs.writeFileSync(target, oldBytes)
+  fs.writeFileSync(source, newBytes)
+  fs.writeFileSync(manifest, originalManifest)
+  // Linux PowerShell hides dot-prefixed files without -Force; Windows does not.
+  const getItemShim = process.platform === 'win32' ? '' :
+    "function Get-Item {param([string]$LiteralPath,[switch]$Force,[string]$ErrorAction='Stop');Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath -Force -ErrorAction $ErrorAction}"
+  const command = [
+    "$ErrorActionPreference = 'Stop'", `. ${ps(LIBRARY)}`, getItemShim,
+    `$script:AutopromptReceiptFiles=@(${ps(target)},${ps(manifest)});$script:AutopromptReceiptCreatedDirectories=@();$script:AutopromptReceiptEdits=@();$script:AutopromptManagedUndoJournal=@()`,
+    `$hook={param($source,$target)[IO.File]::WriteAllText(${ps(manifest)},${ps(canonicalManifest([['agents/ap-arbiter.toml', staleHash]]))})}`,
+    `$mapping=@{Source=${ps(source)};Target=${ps(target)}}`,
+    `$code=Install-IdemManagedFiles -ConfigRoot ${ps(root)} -Mappings @($mapping) -RefuseUnownedTarget -UseCodexBatchIndex -BeforeCodexCopy $hook`,
+    `$raw=[IO.File]::ReadAllText(${ps(manifest)});$landed=[IO.File]::ReadAllText(${ps(target)})`,
+    '@{code=$code;raw=$raw;landed=$landed}|ConvertTo-Json -Compress',
+  ].filter(Boolean).join(';')
+  const result = runPowerShell(command)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /error=hash-manifest-invalid-entry/u)
+  assert.deepEqual(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)), {
+    code: 40, raw: originalManifest, landed: oldBytes.toString(),
+  })
+})
+
+test('Codex indexed setter rejects contradictory compare-and-swap duplicates without mutation', {
+  skip: !POWERSHELL_AVAILABLE,
+}, t => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-codex-index-cas-'))
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }))
+  const root = path.join(sandbox, 'root')
+  const target = path.join(root, 'owned.txt')
+  const manifest = path.join(root, '.autoprompt-install-hashes.json')
+  const oldHash = '1'.repeat(64), otherOldHash = '2'.repeat(64), newHash = '3'.repeat(64)
+  const originalManifest = canonicalManifest([['owned.txt', oldHash]])
+  fs.mkdirSync(root)
+  fs.writeFileSync(manifest, originalManifest)
+  const command = [
+    "$ErrorActionPreference = 'Stop'", `. ${ps(LIBRARY)}`,
+    `$default=Set-IdemManifestHashes -ConfigRoot ${ps(root)} -Hashes @(@{Key=${ps(target)};Hash=${ps(newHash)}}) -UseIdentityIndex`,
+    `$hashes=@(@{Key=${ps(target)};Hash=${ps(newHash)};ExpectedPreviousHash=${ps(oldHash)}},@{Key=${ps(target)};Hash=${ps(newHash)};ExpectedPreviousHash=${ps(otherOldHash)}})`,
+    `$ok=Set-IdemManifestHashes -ConfigRoot ${ps(root)} -Hashes $hashes -UseIdentityIndex`,
+    `$raw=[IO.File]::ReadAllText(${ps(manifest)})`,
+    '@{default=$default;ok=$ok;raw=$raw}|ConvertTo-Json -Compress',
+  ].join(';')
+  const result = runPowerShell(command)
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.match(result.stderr, /error=hash-manifest-invalid-entry/u)
+  assert.deepEqual(JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)), {
+    default: false, ok: false, raw: originalManifest,
+  })
 })
 
 test('Git Bash Codex single and inventory flows reject source mutation without residue', {

@@ -34,6 +34,11 @@ function temporaryDirectory(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
 
+function withGroupWritableUmask(action) {
+  const previous = process.umask(0o002)
+  try { return action() } finally { process.umask(previous) }
+}
+
 function npmCliPath() {
   const candidates = [
     process.env.npm_execpath,
@@ -313,7 +318,13 @@ test('all eleven public provider payloads contain the complete product', () => {
     .filter(file => ['.js', '.ps1', '.sh', '.py', '.cs'].includes(path.extname(file)))
     .map(file => `workflow/${file}`)
     .sort()
-  assert.deepEqual(codex.files.filter(file => file.startsWith('workflow/')), runtimeWorkflow)
+  const workerAssets = [
+    'bootstrap/capture-arm64.exe', 'bootstrap/capture-arm64.exe.config',
+    'bootstrap/capture-x64.exe', 'bootstrap/capture-x64.exe.config',
+    'bundle/assets/bash.br', 'bundle/assets/msys.br', 'bundle/assets/node-arm64.br', 'bundle/assets/node-x64.br',
+    'bundle/manifest.json', 'notices/README.md', 'notices/SOURCE-PROVENANCE.json', 'notices/THIRD-PARTY-NOTICES.txt',
+  ].map(file => 'workflow/windows-worker/' + file)
+  assert.deepEqual(codex.files.filter(file => file.startsWith('workflow/')), [...runtimeWorkflow, ...workerAssets].sort())
   for (const source of ['workflow/windows-appcontainer-native.cs', 'workflow/windows-appcontainer-resources-native.cs']) {
     assert.ok(runtimeWorkflow.includes(source), `Codex runtime declares required Windows native source: ${source}`)
   }
@@ -465,7 +476,7 @@ test('Codex installs and verifies as a complete isolated payload', () => {
         assert.equal(fs.readFileSync(path.join(destination, 'custom.txt'), 'utf8'), 'retain')
         continue
       }
-      const installed = installPayload(provider, destination, ROOT)
+      const installed = withGroupWritableUmask(() => installPayload(provider, destination, ROOT))
       const manifest = loadManifest(provider, ROOT)
       const plan = installationPlan(provider, destination, ROOT)
       assert.deepEqual(installed, plan.files.map(item => item.target))
@@ -474,6 +485,14 @@ test('Codex installs and verifies as a complete isolated payload', () => {
         provider,
       })
       if (provider === 'codex') {
+        if (process.platform !== 'win32') for (const arch of ['x64', 'arm64']) {
+          for (const [directory, name] of [['darwin-coalition-runtime', 'coalition-helper'], ['darwin-listener-runtime', 'listener-supervisor']]) {
+            const helper = plan.files.find(item => item.target.endsWith(`${path.sep}${directory}${path.sep}${name}-${arch}`))
+            assert.ok(helper, `packaged Darwin ${arch} ${name} is installed`)
+            assert.equal(fs.statSync(helper.target).mode & 0o777, 0o700)
+            assert.equal(fs.statSync(path.dirname(helper.target)).mode & 0o777, 0o700)
+          }
+        }
         assert.equal(plan.files.filter(item => item.kind === 'external-runtime').length, CODEX_EXTERNAL_RUNTIME_DEPENDENCIES.length)
         assert.deepEqual(
           plan.files.filter(item => item.kind === 'external-runtime')
@@ -493,6 +512,25 @@ test('Codex installs and verifies as a complete isolated payload', () => {
           `codex-v${manifest.contractVersion}-${manifest.payloadDigest.slice(0, 16)}`,
         )
         assert.equal(plan.payloadDigest, manifest.payloadDigest)
+        if (process.platform !== 'win32') {
+          const workflow = path.join(plan.skillRoot, 'workflow')
+          const validate = [
+            [require('../../agents/codex/workflow/darwin-coalition-loader.js').validateDarwinCoalitionRuntime, 'darwin-coalition-runtime', 'darwin-coalition-helper.c'],
+            [require('../../agents/codex/workflow/darwin-listener-loader.js').validateDarwinListenerRuntime, 'darwin-listener-runtime', 'darwin-launchd-listener-supervisor.c'],
+          ]
+          for (const [validateRuntime, directory, source] of validate) for (const arch of ['x64', 'arm64']) {
+            const binding = validateRuntime(path.join(workflow, directory), arch, path.join(workflow, source))
+            assert.match(binding.sha256, /^[a-f0-9]{64}$/)
+          }
+          for (const file of ['darwin-coalition-helper.c', 'darwin-launchd-listener-supervisor.c',
+            'darwin-coalition-runtime/manifest.json', 'darwin-listener-runtime/manifest.json']) {
+            assert.equal(fs.statSync(path.join(workflow, file)).mode & 0o777, 0o600, `group-writable umask cannot loosen packaged ${file}`)
+          }
+          const helpers = ['coalition-helper-x64', 'listener-supervisor-x64'].map(name => plan.files.find(item => item.target.endsWith(`${path.sep}${name}`)))
+          for (const helper of helpers) fs.chmodSync(helper.target, 0o600)
+          withGroupWritableUmask(() => installPayload(provider, destination, ROOT))
+          for (const helper of helpers) assert.equal(fs.statSync(helper.target).mode & 0o777, 0o700, 'reinstall restores the verified native helper executable mode')
+        }
       } else {
         assert.equal(plan.files.length, manifest.files.length)
       }
@@ -641,7 +679,7 @@ test('packed npm payload installs the complete Codex activation dependency closu
   const packedRuntime = require(path.join(packageRoot, 'scripts', 'runtime-payload.cjs'))
   const activationRoot = path.join(sandbox, 'activation-private')
   const destination = path.join(activationRoot, 'skills', 'autoprompt')
-  const installed = packedRuntime.installPayload('codex', destination, packageRoot)
+  const installed = withGroupWritableUmask(() => packedRuntime.installPayload('codex', destination, packageRoot))
   const packedPlan = packedRuntime.installationPlan('codex', destination, packageRoot)
   const expectedCount = packedPlan.files.length
   assert.equal(installed.length, expectedCount)
@@ -660,6 +698,12 @@ test('packed npm payload installs the complete Codex activation dependency closu
   )
 
   const phase = require(path.join(packedPlan.skillRoot, 'workflow', 'phase-budget.js'))
+  const listenerLoader = require(path.join(packedPlan.skillRoot, 'workflow', 'darwin-listener-loader.js'))
+  for (const architecture of ['x64', 'arm64']) {
+    const helper = listenerLoader.validateDarwinListenerRuntime(listenerLoader.RUNTIME_ROOT, architecture)
+    assert.equal(fs.statSync(helper.path).size > 0, true)
+    if (process.platform !== 'win32') assert.equal(fs.statSync(helper.path).mode & 0o777, 0o700)
+  }
   assert.equal(new phase.RolePolicy().contract.kind, 'autoprompt-role-contract')
   assert.equal(typeof phase.safeEnvironmentFactory(), 'function')
   assert.equal(require(path.join(packedPlan.skillRoot, 'workflow', 'router.js')).ROUTES.length, 3)
@@ -704,4 +748,35 @@ test('v2 native providers reject every legacy public payload mutation before wri
       assert.deepEqual(fs.readdirSync(root), [], provider)
     }
   }
+})
+
+test('actual closed worker inventory refuses missing extras and linked asset escapes', t => {
+  const text = fs.readFileSync(path.join(ROOT, 'scripts/runtime-payload.cjs'), 'utf8')
+  const start = text.indexOf('const CODEX_WINDOWS_WORKER_ASSETS='), end = text.indexOf('\nfunction codexRuntimeFiles(', start)
+  assert.ok(start >= 0 && end > start)
+  // Evaluate the unchanged actual private inventory implementation against real
+  // filesystem fixtures; this does not replace executable-byte authentication.
+  const inventory = vm.runInNewContext(text.slice(start, end) + '\ncodexWorkerAssets', { fs, path, require })
+  const expected = [
+    'bootstrap/capture-arm64.exe', 'bootstrap/capture-arm64.exe.config', 'bootstrap/capture-x64.exe', 'bootstrap/capture-x64.exe.config',
+    'bundle/assets/bash.br', 'bundle/assets/msys.br', 'bundle/assets/node-arm64.br', 'bundle/assets/node-x64.br', 'bundle/manifest.json',
+    'notices/README.md', 'notices/SOURCE-PROVENANCE.json', 'notices/THIRD-PARTY-NOTICES.txt',
+  ].sort()
+  const base = fs.realpathSync.native(temporaryDirectory('closed-worker-inventory-'))
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const root = path.join(base, 'assets'); fs.mkdirSync(root)
+  for (const file of expected) { const target = path.join(root, file); fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, 'fixture', { flag: 'wx' }) }
+  assert.deepEqual(Array.from(inventory(root)), expected.map(file => 'workflow/windows-worker/' + file))
+  const missing = path.join(root, expected[0]); fs.unlinkSync(missing)
+  assert.throws(() => inventory(root), /Exact nested asset inventory/); fs.writeFileSync(missing, 'fixture')
+  const extra = path.join(root, 'extra'); fs.writeFileSync(extra, 'extra')
+  assert.throws(() => inventory(root), /Closed asset file size bound/); fs.unlinkSync(extra)
+  fs.mkdirSync(extra); assert.throws(() => inventory(root), /Exact nested asset directories/); fs.rmdirSync(extra)
+  const outside = path.join(base, 'outside'); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'guard'), 'preserve')
+  fs.symlinkSync(outside, extra, process.platform === 'win32' ? 'junction' : 'dir')
+  assert.throws(() => inventory(root), /Linked asset refused/)
+  if (process.platform === 'win32') fs.rmdirSync(extra); else fs.unlinkSync(extra)
+  fs.unlinkSync(missing); fs.linkSync(path.join(outside, 'guard'), missing)
+  assert.throws(() => inventory(root), /Single-link regular asset required/)
+  assert.equal(fs.readFileSync(path.join(outside, 'guard'), 'utf8'), 'preserve')
 })

@@ -7,7 +7,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { atomicWriteJson, fsyncDirectory, readChecksummedJson, sha256, stableStringify } = require('./event-log.js')
-const { auditPrivatePermissions, ensureWindowsPrivateAcl } = require('./safe-run-root.js')
+const { auditPrivatePermissions, ensureWindowsPrivateAcl, windowsControllerEnvironment } = require('./safe-run-root.js')
 
 const LEASE_SCHEMA_VERSION = 3
 const TOKEN_PATTERN = /^[a-f0-9]{32,64}$/
@@ -83,9 +83,11 @@ function processIdentityForPid(pid) {
     ].join(';')
     let output
     try {
-      output = childProcess.execFileSync('powershell.exe', [
+      const environment = windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR)
+      const powershell = path.win32.join(environment.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+      output = childProcess.execFileSync(powershell, [
         '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
-      ], { encoding: 'utf8', windowsHide: true, timeout: 10000 }).trim()
+      ], { encoding: 'utf8', windowsHide: true, timeout: 10000, env: environment }).trim()
     } catch (error) {
       try { process.kill(pid, 0) } catch (probeError) {
         if (probeError && probeError.code === 'ESRCH') return null
