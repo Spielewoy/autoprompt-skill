@@ -11,6 +11,29 @@ const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessEventStream } = require('../../scripts/harness-v2-transport.cjs')
 
+test('Hermes retains bounded controller startup diagnostics and closes failed initialization', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-startup-failure-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const server = path.join(root, 'server.cjs')
+  fs.writeFileSync(server, `process.stdin.once('data', () => {
+    process.stderr.write('EXACT_CONTROLLER_STARTUP_DIAGNOSTIC\\n');
+    process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32603,data:{code:'TOOL_LEASE_UNAVAILABLE'}}})+'\\n');
+    setInterval(() => {},1000);
+  });`)
+  const program = ['import runpy,sys', 'plugin=runpy.run_path(sys.argv[1])',
+    'try: plugin["Controller"]()', 'except RuntimeError as error: print(str(error))',
+    'else: raise AssertionError("initialization unexpectedly succeeded")'].join('\n')
+  const result = cp.spawnSync(process.env.AUTOPROMPT_TEST_PYTHON || 'python3', ['-I', '-B', '-c', program,
+    path.resolve(__dirname, '../../scripts/harness-v2-bridge/hermes/plugin.py')], {
+    encoding: 'utf8', timeout: 10000, env: { ...process.env, AUTOPROMPT_NODE: process.execPath,
+      AUTOPROMPT_TOOL_SERVER: server, AUTOPROMPT_TOOL_POLICY: 'unused', AUTOPROMPT_TOOL_POLICY_SHA256: 'unused' },
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stderr, /EXACT_CONTROLLER_STARTUP_DIAGNOSTIC/)
+  assert.match(result.stderr, /AUTOPROMPT_HERMES_CONTROLLER_FAILURE:TOOL_LEASE_UNAVAILABLE/)
+  assert.match(result.stdout, /Controller tool request failed: TOOL_LEASE_UNAVAILABLE/)
+})
+
 for (const toolFree of [false, true]) {
   test(`Hermes Python plugin registers the actual controller inventory (toolFree=${toolFree})`, t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-inventory-'))
@@ -88,6 +111,27 @@ test('Hermes bridge contains a direct fixed-tool plugin and an owned SQLite wrap
   assert.match(wrapper, /before\.sessionIds\.includes/)
 })
 
+test('Hermes wrapper preserves structural SQLite subprocess diagnostics', { skip: !process.env.AUTOPROMPT_TEST_PYTHON && process.platform === 'win32' || !process.env.AUTOPROMPT_TEST_PYTHON && !fs.existsSync('/usr/bin/python3') }, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-hermes-snapshot-diagnostic-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const home = path.join(root, 'home'); fs.mkdirSync(home, { mode: 0o700 })
+  fs.writeFileSync(path.join(home, 'state.db'), 'fixture', { mode: 0o600 })
+  const projection = path.join(root, 'projection.jsonl'); fs.writeFileSync(projection, '', { mode: 0o600 })
+  const python = process.env.AUTOPROMPT_TEST_PYTHON || '/usr/bin/python3'
+  const spec = path.join(root, 'spec.json')
+  fs.writeFileSync(spec, JSON.stringify({
+    hermesExecutable: python, pythonExecutable: python, home, sessionRoot: root,
+    toolProjectionPath: projection, receiptPath: path.join(root, 'receipts.jsonl'), argv: [], continuationId: null,
+  }), { mode: 0o600 })
+  const wrapper = path.resolve(__dirname, '../../scripts/harness-v2-bridge/hermes/owned-wrapper.cjs')
+  const result = cp.spawnSync(process.execPath, [wrapper, '--spec', spec], { encoding: 'utf8', timeout: 10000 })
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /Hermes SQLite journal snapshot failed/)
+  assert.match(result.stderr, /"status":17/)
+  assert.match(result.stderr, /"sqlite":\{"class":"DatabaseError","code":26\}/)
+  assert.doesNotMatch(result.stderr, /fixture/)
+})
+
 test('Hermes journals known live usage through a held terminal and only observes terminal receipts once', () => {
   const usage = { input: 13, cachedInput: 2, cachedWrite: 0, output: 5, reasoning: 1, apiCalls: 1, toolCalls: 1 }
   const debits = [], observedTools = []
@@ -146,8 +190,8 @@ test('Hermes journals known live usage through a held terminal and only observes
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
-test('Hermes wrapper waits for a receipt/projection common prefix and rejects no complete staged publication', { skip: process.platform === 'win32' || !fs.existsSync('/usr/bin/python3'), timeout: 15000 }, async t => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-hermes-projection-race-'))
+test('Hermes wrapper reads special SQLite paths while waiting for a receipt/projection common prefix', { skip: !process.env.AUTOPROMPT_TEST_PYTHON && process.platform === 'win32' || !process.env.AUTOPROMPT_TEST_PYTHON && !fs.existsSync('/usr/bin/python3'), timeout: 15000 }, async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `autoprompt-hermes projection # %${process.platform === 'win32' ? '' : ' ?'}-`))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const target = path.join(root, 'target'), scratch = path.join(root, 'scratch'), controller = path.join(root, 'controller'), home = path.join(root, 'home')
   for (const directory of [target, scratch, controller, home]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
@@ -161,7 +205,8 @@ test('Hermes wrapper waits for a receipt/projection common prefix and rejects no
   const childScript = path.join(root, 'fake-hermes.py')
   fs.writeFileSync(childScript, `import sqlite3,sys,time\ndb=sys.argv[1]\nc=sqlite3.connect(db)\nc.execute('create table sessions (id text, started_at integer, input_tokens integer, output_tokens integer, cache_read_tokens integer, cache_write_tokens integer, reasoning_tokens integer, api_call_count integer, tool_call_count integer, estimated_cost_usd real, actual_cost_usd real, cost_status text, cost_source text)')\nc.execute('create table messages (id integer, session_id text, role text, active integer, content text)')\nc.execute(\"insert into sessions values ('hermes-race-session',1,3,2,0,0,0,1,1,null,null,null,null)\")\nc.execute(\"insert into messages values (1,'hermes-race-session','assistant',1,'{\\\"ok\\\":true}')\")\nc.commit()\ntime.sleep(2)\n`, { mode: 0o700 })
   const specPath = path.join(root, 'spec.json')
-  fs.writeFileSync(specPath, JSON.stringify({ hermesExecutable: '/usr/bin/python3', pythonExecutable: '/usr/bin/python3', home, sessionRoot: root,
+  const python = process.env.AUTOPROMPT_TEST_PYTHON || '/usr/bin/python3'
+  fs.writeFileSync(specPath, JSON.stringify({ hermesExecutable: python, pythonExecutable: python, home, sessionRoot: root,
     receiptPath: toolBoundary.receiptPath, toolProjectionPath: projectionPath, continuationId: null, argv: [childScript, path.join(home, 'state.db')] }), { mode: 0o600 })
   const wrapper = path.join(__dirname, '../../scripts/harness-v2-bridge/hermes/owned-wrapper.cjs')
   const child = cp.spawn(process.execPath, [wrapper, '--spec', specPath], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -198,22 +243,31 @@ test('Hermes keeps its persistent state bound to the context across fresh reserv
     targetPath: target, scratchPath: scratch, readableRoots: [target, scratch], writableRoots: [scratch],
     nestedDispatch: false, commandBoundary: true, externalWrites: false,
   } })
-  const make = (reservation, continuationId) => {
+  const make = (reservation, continuationId, relayPort = 1) => {
     const home = path.join(root, reservation)
     fs.mkdirSync(home, { recursive: true, mode: 0o700 })
     const promptFile = path.join(home, 'prompt.json')
     fs.writeFileSync(promptFile, '{}', { mode: 0o600 })
     return hermes.prepare({ home, stateHome, sessionRoot, toolBoundary, model: 'fixture/model', maxTokens: 317,
-      baseUrl: 'http://127.0.0.1:1/v1', apiKey: 'local-test-key', promptFile,
+      baseUrl: `http://127.0.0.1:${relayPort}/v1`, apiKey: `local-test-key-${relayPort}`, promptFile,
       hermesExecutable: '/tmp/hermes', pythonExecutable: '/usr/bin/python3', continuationId })
   }
   try {
     const first = make('reservation-1', undefined)
-    const second = make('reservation-2', 'session_1')
+    const second = make('reservation-2', 'session_1', 2)
     assert.equal(first.env.HERMES_HOME, stateHome)
     assert.equal(second.env.HERMES_HOME, stateHome)
-    assert.equal(JSON.parse(fs.readFileSync(path.join(stateHome, 'config.yaml'), 'utf8')).model.default, 'fixture/model')
-    assert.equal(JSON.parse(fs.readFileSync(path.join(stateHome, 'config.yaml'), 'utf8')).providers['autoprompt-owned'].extra_body.max_tokens, 317)
+    assert.equal(first.env.AUTOPROMPT_HERMES_RELAY_BASE_URL, 'http://127.0.0.1:1/v1')
+    assert.equal(second.env.AUTOPROMPT_HERMES_RELAY_BASE_URL, 'http://127.0.0.1:2/v1')
+    assert.equal(first.env.AUTOPROMPT_HERMES_RELAY_API_KEY, 'local-test-key-1')
+    assert.equal(second.env.AUTOPROMPT_HERMES_RELAY_API_KEY, 'local-test-key-2')
+    const stableConfig = JSON.parse(fs.readFileSync(path.join(stateHome, 'config.yaml'), 'utf8'))
+    assert.equal(stableConfig._config_version, 41)
+    assert.equal(stableConfig.onboarding.seen.tool_progress_prompt, true)
+    assert.equal(stableConfig.model.default, 'fixture/model')
+    assert.equal(stableConfig.model.base_url, '${env:AUTOPROMPT_HERMES_RELAY_BASE_URL}')
+    assert.equal(stableConfig.model.api_key, '${env:AUTOPROMPT_HERMES_RELAY_API_KEY}')
+    assert.equal(stableConfig.providers['autoprompt-owned'].extra_body.max_tokens, 317)
     assert.equal(JSON.parse(fs.readFileSync(first.specFile, 'utf8')).home, stateHome)
     assert.equal(JSON.parse(fs.readFileSync(second.specFile, 'utf8')).home, stateHome)
     assert.notEqual(first.specFile, second.specFile)

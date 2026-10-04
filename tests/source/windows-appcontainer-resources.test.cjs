@@ -1,12 +1,17 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const path = require('node:path')
+const os = require('node:os')
+const cp = require('node:child_process')
+const crypto = require('node:crypto')
 const { createWindowsAppContainerResources, resourceRoots, validatePlan } = require('../../agents/codex/workflow/windows-appcontainer-resources.js')
 const controlRoot = 'C:\\controller'
 const policy = { provider: 'claude', schemaVersion: 1, readOnly: false, targetPath: 'C:\\clone', scratchPath: 'C:\\scratch', readableRoots: ['C:\\clone', 'C:\\scratch'], writableRoots: ['C:\\clone', 'C:\\scratch'] }
 const executableRoots = [{ path: 'C:\\runtime\\node.exe', kind: 'file' }, { path: 'C:\\controller\\command.cmd', kind: 'file' }]
 const profileSid = 'S-1-15-2-1-2-3-4-5-6-7'
-function harness(applyResult) {
+function harness(applyResult, transforms = {}) {
   const events = [], records = new Map(), branded = new WeakSet()
   let applied
   const capture = {
@@ -18,8 +23,9 @@ function harness(applyResult) {
     events.push([request.operation, request])
     if (request.operation === 'plan') {
       const roots = request.roots.map((root, index) => ({ ...root, identity: `12345678:${(index + 1).toString(16).padStart(16, '0')}`, creation: '132000000000000000' }))
-      return { schemaVersion: 1, profileName: request.profileName, profileSid, roots,
-        entries: roots.map(root => ({ identity: root.identity, creation: root.creation, label: '', directory: root.kind === 'directory', writable: root.writable, git: false, root: true })) }
+      const plan = { schemaVersion: 3, profileName: request.profileName, profileSid, roots,
+        entries: roots.map(root => ({ identity: root.identity, creation: root.creation, label: '', directory: root.kind === 'directory', writable: root.writable, git: false, root: true, daclProtected: true, inheritedAces: [], explicitAces: [] })) }
+      return transforms.plan ? transforms.plan(plan) : plan
     }
     if (request.operation === 'apply') {
       applied = request.plan
@@ -27,12 +33,60 @@ function harness(applyResult) {
       return applyResult || { profileName: request.plan.profileName, profileSid, profilePath: 'C:\\profiles\\owned' }
     }
     assert.deepEqual(request.plan, applied, 'recovery must retain every original object identity and label')
-    return { restored: applied.entries.length, newEntries: 2, deletedEntries: 0 }
+    return transforms.restore ? transforms.restore(applied) : { restored: applied.entries.length, newEntries: 2, deletedEntries: 0 }
   }
   const api = createWindowsAppContainerResources(() => ({ capture, invoke }))
   const verifyDrainEvidence = (evidence, binding) => branded.has(evidence) && binding.profileSid === profileSid && evidence.leaseId === binding.leaseId
   return { api, events, records, verifyDrainEvidence, options: { policy, controlRoot, executableRoots, verifyDrainEvidence }, evidence(lease) { const evidence = { leaseId: lease.recovery.leaseId }; branded.add(evidence); return evidence } }
 }
+function sizedPlan(plan, count, entryOverrides = {}) {
+  const original = plan.entries[0]
+  while (plan.entries.length < count) {
+    plan.entries.push({ ...original, root: false, directory: false, ...entryOverrides,
+      identity: `12345678:${(plan.entries.length + 1).toString(16).padStart(16, '0')}` })
+  }
+  return plan
+}
+for (const count of [8192, 16384]) test(`resource journal preserves ${count} identities through durable recovery`, async () => {
+  const h = harness(undefined, { plan: plan => sizedPlan(plan, count),
+    restore: () => ({ restored: count - 1, deletedEntries: 1, newEntries: 32768 - count + 1 }) })
+  const lease = await h.api.prepareWindowsAppContainerResources(h.options)
+  const bytes = h.records.get(lease.recovery.journalPath)
+  assert.equal(JSON.parse(bytes).plan.entries.length, count)
+  assert.ok(bytes.length < 8 * 1024 * 1024)
+  const options = { controlRoot, ...lease.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence: h.evidence(lease) }
+  const result = await h.api.recoverWindowsAppContainerResources(options)
+  assert.equal(result.restored + result.newEntries, 32768)
+  await h.api.recoverWindowsAppContainerResources(options)
+  assert.equal(h.events.filter(event => event[0] === 'restore').length, 1)
+})
+test('resource object and journal byte limits refuse before durable publication or ACL apply', async () => {
+  for (const transform of [plan => sizedPlan(plan, 16385), plan => sizedPlan(plan, 8192, { label: Buffer.alloc(1024).toString('base64') })]) {
+    const h = harness(undefined, { plan: transform })
+    await assert.rejects(h.api.prepareWindowsAppContainerResources(h.options), { code: 'WINDOWS_RESOURCE_LIMIT' })
+    assert.equal(h.records.size, 0)
+    assert.equal(h.events.some(event => event[0] === 'apply'), false)
+  }
+})
+test('recovery refuses oversized or inconsistent helper counts and retains its journal', async () => {
+  for (const result of [
+    { restored: 16385, deletedEntries: 0, newEntries: 0 },
+    { restored: 0, deletedEntries: 16385, newEntries: 0 },
+    { restored: 4, deletedEntries: 0, newEntries: 32769 },
+    { restored: 4, deletedEntries: 0, newEntries: 32765 },
+    { restored: 3, deletedEntries: 0, newEntries: 0 },
+  ]) {
+    const h = harness(undefined, { restore: () => result })
+    const lease = await h.api.prepareWindowsAppContainerResources(h.options)
+    await assert.rejects(lease.release(h.evidence(lease)), error => {
+      assert.equal(error.code, 'WINDOWS_RESOURCE_PROTOCOL')
+      assert.equal(error.recovery.journalPath, lease.recovery.journalPath)
+      return true
+    })
+    assert.ok(h.records.has(lease.recovery.journalPath))
+    assert.equal(h.records.has(lease.recovery.journalPath + '.restored'), false)
+  }
+})
 test('resource scope accepts boundary metadata and grants executable files without their parents', () => {
   const roots = resourceRoots(policy, controlRoot, executableRoots)
   assert.equal(roots.length, 4)
@@ -73,9 +127,63 @@ test('closed plans reject unknown keys, duplicated identities, and replacement r
   const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
   const plan = JSON.parse(h.records.get(lease.recovery.journalPath)).plan
   assert.equal(validatePlan(plan), plan)
+  assert.equal(plan.schemaVersion, 3)
+  assert.throws(() => validatePlan({ ...plan, schemaVersion: 1 }), { code: 'WINDOWS_RESOURCE_INVALID' })
+  for (const value of [undefined, 'false', 0]) {
+    const entries = plan.entries.map(entry => ({ ...entry }))
+    if (value === undefined) delete entries[0].daclProtected
+    else entries[0].daclProtected = value
+    assert.throws(() => validatePlan({ ...plan, entries }), { code: 'WINDOWS_RESOURCE_INVALID' })
+  }
   assert.throws(() => validatePlan({ ...plan, extra: true }), { code: 'WINDOWS_RESOURCE_INVALID' })
   assert.throws(() => validatePlan({ ...plan, entries: [...plan.entries, plan.entries[0]] }), { code: 'WINDOWS_RESOURCE_INVALID' })
   assert.throws(() => validatePlan({ ...plan, roots: [{ ...plan.roots[0], creation: '1' }, ...plan.roots.slice(1)] }), { code: 'WINDOWS_RESOURCE_INVALID' })
+})
+
+test('closed resource plans reject line endings in exact identities and decimal creation values', async () => {
+  const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
+  const plan = JSON.parse(h.records.get(lease.recovery.journalPath)).plan
+  for (const suffix of ['\n', '\r\n', '\r']) for (const field of ['identity', 'creation']) for (const scope of [1, 2, 3]) {
+    const invalid = structuredClone(plan)
+    if (scope & 1) invalid.entries[0][field] += suffix
+    if (scope & 2) invalid.roots[0][field] += suffix
+    assert.throws(() => validatePlan(invalid), { code: 'WINDOWS_RESOURCE_INVALID' })
+  }
+  for (const creation of ['0', '1', '1234567890123456789']) {
+    const valid = structuredClone(plan); valid.entries[0].creation = valid.roots[0].creation = creation
+    assert.equal(validatePlan(valid), valid)
+  }
+  await lease.release(h.evidence(lease))
+})
+
+test('v3 provenance preserves multiplicity and rejects malformed or unowned inheritance records', async () => {
+  const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
+  const plan = JSON.parse(h.records.get(lease.recovery.journalPath)).plan
+  const inherited = 'ABMUAP8BHwABAQAAAAAABRIAAAA=', explicit = 'AAMUAP8BHwABAQAAAAAABRIAAAA='
+  const entry = { ...plan.entries[0], git: true, daclProtected: false, inheritedAces: [inherited, inherited], explicitAces: [explicit] }
+  const withEntry = value => ({ ...plan, entries: [value, ...plan.entries.slice(1)] })
+  assert.equal(validatePlan(withEntry(entry)).entries[0], entry)
+  const malformedHeader = Buffer.from(inherited, 'base64'); malformedHeader[2]--
+  const unrelated = Buffer.from(explicit, 'base64'); unrelated[4] ^= 2
+  // A 24-byte inherited Administrators ACE beside the 20-byte SYSTEM ACE
+  // distinguishes the exact aligned USHORT ACL-size boundary.
+  const administrator = Buffer.alloc(24); Buffer.from(inherited, 'base64').copy(administrator)
+  administrator.writeUInt16LE(24, 2); administrator[9] = 2; administrator.writeUInt32LE(32, 16); administrator.writeUInt32LE(544, 20)
+  const longer = administrator.toString('base64')
+  for (const change of [
+    { inheritedAces: undefined }, { explicitAces: null }, { inheritedAces: 'not-an-array' },
+    { inheritedAces: [null] }, { inheritedAces: ['invalid-base64'] }, { inheritedAces: [inherited + '\n'] },
+    { inheritedAces: [malformedHeader.toString('base64')] }, { inheritedAces: [explicit] },
+    { explicitAces: [inherited] }, { explicitAces: [unrelated.toString('base64')] },
+    { git: false }, { daclProtected: true },
+    { inheritedAces: Array(8193).fill(inherited), explicitAces: [] },
+    { inheritedAces: Array(3277).fill(inherited), explicitAces: [] },
+    { inheritedAces: [...Array(3274).fill(inherited), longer, longer], explicitAces: [] },
+  ]) assert.throws(() => validatePlan(withEntry({ ...entry, ...change })), { code: 'WINDOWS_RESOURCE_INVALID' })
+  // Both fields are mandatory even when this object owns no transition.
+  const missing = { ...entry }; delete missing.explicitAces
+  assert.throws(() => validatePlan(withEntry(missing)), { code: 'WINDOWS_RESOURCE_INVALID' })
+  assert.equal(validatePlan(withEntry({ ...entry, inheritedAces: [...Array(3275).fill(inherited), longer], explicitAces: [] })).schemaVersion, 3)
 })
 
 test('invalid native apply replies retain the journal recovery binding', async () => {
@@ -90,6 +198,20 @@ test('invalid native apply replies retain the journal recovery binding', async (
   await h.api.recoverWindowsAppContainerResources({ controlRoot, ...error.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence })
 })
 
+for (const version of [1, 2]) test(`v${version} recovery is refused without removing the retained journal or invoking restore`, async () => {
+  const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
+  const journal = JSON.parse(h.records.get(lease.recovery.journalPath))
+  journal.plan.schemaVersion = version
+  for (const entry of journal.plan.entries) { if (version === 1) delete entry.daclProtected; delete entry.inheritedAces; delete entry.explicitAces }
+  const body = { schemaVersion: journal.schemaVersion, leaseId: journal.leaseId, plan: journal.plan }
+  journal.sha256 = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex')
+  const bytes = Buffer.from(JSON.stringify(journal))
+  h.records.set(lease.recovery.journalPath, bytes)
+  await assert.rejects(h.api.recoverWindowsAppContainerResources({ controlRoot, ...lease.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence: h.evidence(lease) }), { code: 'WINDOWS_RESOURCE_INVALID' })
+  assert.equal(h.events.filter(event => event[0] === 'restore').length, 0)
+  assert.deepEqual(h.records.get(lease.recovery.journalPath), bytes)
+})
+
 test('completion receipt permits exact recovery after private scratch removal without another native restore', async () => {
   const h = harness(), lease = await h.api.prepareWindowsAppContainerResources(h.options)
   const evidence = h.evidence(lease)
@@ -100,4 +222,64 @@ test('completion receipt permits exact recovery after private scratch removal wi
   const receipt = JSON.parse(h.records.get(lease.recovery.journalPath + '.restored')); receipt.profileSid += '-9'
   h.records.set(lease.recovery.journalPath + '.restored', Buffer.from(JSON.stringify(receipt)))
   await assert.rejects(h.api.recoverWindowsAppContainerResources({ controlRoot, ...lease.recovery, verifyDrainEvidence: h.verifyDrainEvidence, evidence }), { code: 'WINDOWS_RESOURCE_JOURNAL_MISMATCH' })
+})
+
+test('Windows resource ancestry tolerates sibling writes while refusing captured mutations and ancestor replacement', { skip: process.platform !== 'win32' }, t => {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'windows-resource-stable-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const workflow = path.resolve(__dirname, '../../agents/codex/workflow')
+  const script = path.join(root, 'windows-appcontainer-resources.ps1')
+  fs.copyFileSync(path.join(workflow, 'windows-appcontainer-resources.ps1'), script)
+  const source = fs.readFileSync(path.join(workflow, 'windows-appcontainer-resources-native.cs'), 'utf8')
+  const marker = '  static void Stable(Forest forest) {'
+  assert.equal(source.includes(marker), true)
+  const injected = source.replace(marker, marker + `
+    string mode=Environment.GetEnvironmentVariable("AUTOPROMPT_STABLE_TEST_MODE");
+    string target=forest.roots[0].path; string parent=Directory.GetParent(target).FullName;
+    System.Threading.Thread.Sleep(20);
+    if(mode=="sibling")File.WriteAllText(Path.Combine(parent,"unrelated.tmp"),"sibling");
+    if(mode=="resource")File.WriteAllText(Path.Combine(target,"changed.tmp"),"mutation");
+    if(mode=="ancestor"){
+      int denied=0;
+      try{Directory.Move(parent,parent+"-moved");}
+      catch(IOException error){uint status=unchecked((uint)error.HResult);Need(status==0x80070020u || status==0x80070005u,"STABLE_FIXTURE_MOVE_ERROR");denied=(int)(status&0xffff);}
+      catch(UnauthorizedAccessException error){Need(unchecked((uint)error.HResult)==0x80070005u,"STABLE_FIXTURE_MOVE_ERROR");denied=5;}
+      if(denied!=0){
+        var heldParent=forest.items.Single(item=>item.full==target).opened.Parent;
+        IntPtr fresh=Open(heldParent.Name,heldParent.Parent.Handle,true);
+        try{Need(SameDirectoryIdentity(heldParent.Snapshot,Info(fresh)),"STABLE_FIXTURE_PARENT_CHANGED");}
+        finally{CloseHandle(fresh);}
+        Need(Directory.Exists(parent)&&Directory.Exists(target)&&!Directory.Exists(parent+"-moved"),"STABLE_FIXTURE_MOVE_PARTIAL");
+        File.WriteAllText(Environment.GetEnvironmentVariable("AUTOPROMPT_STABLE_TEST_OUTCOME"),"blocked:"+denied);
+      }else{
+        Directory.CreateDirectory(parent);Directory.CreateDirectory(target);
+        File.WriteAllText(Environment.GetEnvironmentVariable("AUTOPROMPT_STABLE_TEST_OUTCOME"),"renamed");
+      }
+    }
+`)
+  fs.writeFileSync(path.join(root, 'windows-appcontainer-resources-native.cs'), injected)
+  const hash = crypto.createHash('sha256').update(injected).digest('hex')
+  const powershell = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== 'psmodulepath'))
+  for (const mode of ['sibling', 'resource', 'ancestor']) {
+    const target = path.join(root, mode, 'target'); fs.mkdirSync(target, { recursive: true })
+    const parent = path.dirname(target), before = fs.statSync(parent, { bigint: true }), outcome = path.join(root, `${mode}-outcome`)
+    const request = { schemaVersion: 1, operation: 'plan', profileName: 'Autoprompt_' + crypto.randomBytes(16).toString('hex'),
+      roots: [{ path: target, kind: 'directory', writable: false }] }
+    const result = cp.spawnSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-NativeSha256', hash, '-Request'], {
+      input: JSON.stringify(request), encoding: 'utf8', timeout: 120000,
+      env: { ...environment, AUTOPROMPT_STABLE_TEST_MODE: mode, AUTOPROMPT_STABLE_TEST_OUTCOME: outcome },
+    })
+    assert.ifError(result.error); assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, '')
+    const wire = JSON.parse(result.stdout)
+    const blocked = mode === 'ancestor' && fs.existsSync(outcome) && /^blocked:(?:5|32)$/.test(fs.readFileSync(outcome, 'utf8'))
+    if (blocked) {
+      const after = fs.statSync(parent, { bigint: true })
+      assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino)
+      assert.equal(fs.existsSync(target), true); assert.equal(fs.existsSync(parent + '-moved'), false)
+    }
+    if (mode === 'sibling' || blocked) { assert.equal(wire.status, 'PLANNED', result.stdout); assert.equal(wire.plan.entries.length, 1) }
+    else { assert.equal(wire.status, 'REFUSED', result.stdout); assert.equal(wire.code, 'PREIMAGE_UNSAFE', result.stdout) }
+    if (mode === 'ancestor' && !blocked) assert.equal(fs.readFileSync(outcome, 'utf8'), 'renamed')
+  }
 })

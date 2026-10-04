@@ -1,5 +1,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$NativeSha256,[switch]$Request)
+# Pin inbox modules after PowerShell's startup environment reconstruction.
+[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
@@ -32,10 +34,17 @@ try {
   [ordered]@{schemaVersion=1;status=$status;result=$result}|ConvertTo-Json -Depth 12 -Compress
  }
 }catch{
- $code='WINDOWS_RESOURCE_REFUSED';$exception=$_.Exception
+ $code='WINDOWS_RESOURCE_REFUSED';$exception=$_.Exception;$diagnostic='unknown'
  for($i=0;$i-lt 8-and $null-ne $exception;$i++){
   if($exception.Message-cmatch '^(?:WINDOWS|FILESYSTEM|PREIMAGE)_[A-Z_]{1,80}$'){$code=$exception.Message}
+  $kind=$exception.GetType().Name;$site='unknown'
+  if($null-ne $exception.TargetSite){$site=$exception.TargetSite.Name}
+  if($kind-cmatch '^[A-Za-z0-9_]{1,80}$'-and $site-cmatch '^[A-Za-z0-9_]{1,80}$'){
+   $diagnostic=$kind+':'+$site
+   if($exception-is [ComponentModel.Win32Exception]){$diagnostic+=':'+([string]$exception.NativeErrorCode)}
+   if($exception.Message-cmatch '^[A-Za-z0-9_ .:()-]{1,80}$'){$diagnostic+=':'+ $exception.Message}
+  }
   $exception=$exception.InnerException
  }
- [ordered]@{schemaVersion=1;status='REFUSED';code=$code}|ConvertTo-Json -Compress
+ [ordered]@{schemaVersion=1;status='REFUSED';code=$code;diagnostic=$diagnostic}|ConvertTo-Json -Compress
 }

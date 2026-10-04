@@ -16,12 +16,12 @@ const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture, waitForNativeObservation } = require('../helpers/native-platform.cjs')
 const { modelService } = require('../helpers/harness-native-service.cjs')
 
 const CLI = process.env.AUTOPROMPT_DEEPSEEK_TEST_CLI || null
 const providers = Object.freeze({ deepseek: CLI })
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 
 function closedCanaryBinding(provider) {
@@ -35,9 +35,9 @@ function closedCanaryBinding(provider) {
 function canaryRegistry(provider, fallback) {
   const supplied = closedCanaryBinding(provider)
   if (!supplied) return fallback
-  const root = supplied.root, stat = fs.statSync(root)
-  if (!stat.isDirectory() || (stat.mode & 0o077)) throw new Error('closed canary ownership root is not private')
-  const directory = path.join(root, `${provider}-${crypto.randomUUID()}`); fs.mkdirSync(directory, { mode: 0o700 })
+  const root = privateDirectory(supplied.root), stat = fs.statSync(root)
+  if (!stat.isDirectory() || (process.platform !== 'win32' && (stat.mode & 0o077))) throw new Error('closed canary ownership root is not private')
+  const directory = privateDirectory(path.join(root, `${provider}-${crypto.randomUUID()}`))
   const registryPath = path.join(directory, 'processes.json'), registration = path.join(directory, 'registration.json')
   const body = { schemaVersion: 1, provider, activationId: supplied.activationId, generation: supplied.generation, challenge: supplied.challenge, registryPath }
   fs.writeFileSync(registration, JSON.stringify(body), { flag: 'wx', mode: 0o600 })
@@ -45,9 +45,9 @@ function canaryRegistry(provider, fallback) {
 }
 
 function fixture(provider) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), `${provider}-capability-native-`))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), `${provider}-capability-native-`)))
   const target = path.join(root, 'target'), controller = path.join(root, 'controller'), nativeRoot = path.join(controller, 'native')
-  for (const dir of [target, controller, nativeRoot]) fs.mkdirSync(dir, { mode: 0o700 })
+  for (const dir of [target, controller, nativeRoot]) privateDirectory(dir)
   const closed = closedCanaryBinding(provider)
   const projection = core.createCanonicalMissionProjection('FIRST_CONTEXT_SENTINEL: use only the assigned controller command and return JSON.')
   const record = { activationId: closed?.activationId || `${provider}-closed-native-canary`, generation: closed?.generation || 1, sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'closed-native-capability', logicalRole: 'worker', physicalRole: 'ap-worker', providerRole: 'ap-worker', canonicalMission: projection.canonicalMission, workingDirectory: target, dispatch: { requestPointer: { hash: native.sha256(`${provider}-capability`) } } }
@@ -60,6 +60,18 @@ function fixture(provider) {
 }
 function connection(service) { return { model: 'deepseek-chat', environment: { DEEPSEEK_BASE_URL: service.url } } }
 
+function fixtureFailureDiagnostic(f, error) {
+  // Capture the synthetic provider events before the real runner drains and
+  // removes its private transcript. No ambient files or user logs are read.
+  const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
+    phase: f.nativePhase || 'unlabeled', launch: f.nativeLaunch || null, proxyError: f.nativeProxyError || null,
+    requestCount: f.service?.requests.length || 0, heldResponse: f.service?.firstMessageHeld === true,
+    ownership: f.owner?.ownershipIdentities().map(item => ({ id: item.id, reservationId: item.reservationId })) || [],
+    stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
+  while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
+  console.error(JSON.stringify(output))
+}
+
 async function scenario(provider, options = {}) {
   const cli = providers[provider]; assert.ok(cli && fs.existsSync(cli), 'AUTOPROMPT_DEEPSEEK_TEST_CLI must name the installed official dsh binary')
   const sandbox = await boundary.probeCommandSandbox(); assert.equal(sandbox.supported, true, JSON.stringify(sandbox))
@@ -68,26 +80,52 @@ async function scenario(provider, options = {}) {
   fs.writeFileSync(candidate, marker, { mode: 0o600 }); fs.writeFileSync(secret, 'PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE', { mode: 0o600 }); fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', { mode: 0o600 })
   let service, owner
   try {
-    service = await modelService(provider, options.tool || { name: controlled.toolName(provider, 'bash'), args: { command: `cat ${quote(candidate)}` } }, { resetToolAfterCompletion: true, ...(options.serviceOptions || {}) })
+    service = await modelService(provider, options.tool || { name: controlled.toolName(provider, 'bash'), args: { command: readCommand(candidate) } }, { resetToolAfterCompletion: true, ...(options.serviceOptions || {}) })
     const binding = native.probeExecutable({ provider, executable: cli })
-    const registryPath = canaryRegistry(provider, path.join(f.controller, 'processes.json')), processAdapter = createPosixProcessAdapter(), ownerValue = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
-    owner = ownerValue
-    const proxy = path.join(f.controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+    const registryPath = canaryRegistry(provider, path.join(f.controller, 'processes.json')), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)), ownerValue = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
+    owner = ownerValue; f.owner = owner; f.service = service
+    const proxy = privateDirectory(path.join(f.controller, 'proxy'))
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
+    const ownedRun = runner.run.bind(runner)
+    runner.run = async spec => {
+      f.nativeEvents = []; f.nativeStderr = ''; f.nativeProxyError = null
+      try {
+      const result = await ownedRun({ ...spec, onStdoutLine: line => {
+        f.nativeEvents.push(String(line).slice(-8192))
+        if (f.nativeEvents.length > 16) f.nativeEvents.shift()
+        return spec.onStdoutLine?.(line)
+      } })
+      f.nativeStderr = result.stderr
+      return result
+      } catch (error) {
+        let details = null
+        try { details = error.details === undefined ? null : JSON.stringify(error.details).slice(0, 2048) } catch { details = 'unserializable' }
+        f.nativeProxyError = { code: String(error.code || 'RUNTIME_FAILURE').slice(0, 96), message: String(error.message || error).replace(/[\r\n]+/g, ' ').slice(0, 512), details }
+        throw error
+      }
+    }
     const adapter = new HarnessExecAdapter({ provider, runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: connection(service), credentialEnvironment: { DEEPSEEK_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only assigned controller tools and return one JSON object.' })
-    const run = async overrides => { const record = { ...f.record, ...overrides }; record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { PATH: process.env.PATH }); record.signal = overrides?.signal || AbortSignal.timeout(90000); return adapter.launch(record) }
+    const run = async (overrides = {}, phase = 'unlabeled') => {
+      f.nativePhase = phase
+      f.nativeLaunch = { phase, startedAt: new Date().toISOString(), reservationId: overrides.reservationId || f.record.reservationId, workItemId: overrides.workItemId || f.record.workItemId }
+      const record = { ...f.record, ...overrides }
+      record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
+      record.signal = overrides?.signal || AbortSignal.timeout(process.platform === 'win32' ? 300000 : 90000)
+      try { return await adapter.launch(record) }
+      catch (error) { fixtureFailureDiagnostic(f, error); throw error }
+    }
     let closed = false
-    return { ...f, provider, candidate, secret, marker, service, binding, owner, registryPath, adapter, run,
-      async close() { if (closed) return; closed = true; try { await owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } } } }
+    return { ...f, provider, candidate, secret, marker, service, binding, processAdapter, owner, registryPath, adapter, run,
+      async close() { if (closed) return; closed = true; await cleanupNativeFixture(f, provider, { stop: () => owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service.close() }) } }
   } catch (error) {
-    try { if (owner) await owner.cancelAll({ reason: `${provider} capability setup failed`, graceMs: 0, killMs: 2000, waitForPending: true }) } finally { try { if (service) await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
+    try { await cleanupNativeFixture(f, provider, { stop: () => owner?.cancelAll({ reason: `${provider} capability setup failed`, graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service?.close() }) } catch {}
     throw error
   }
 }
 function good(result) { assert.equal(result.ok, true); assert.ok(result.transportEvidence.eventCount > 0); assert.match(result.contextId, /^[a-zA-Z0-9_-]+$/); assert.match(result.toolBoundaryEvidence.policySha256, /^[a-f0-9]{64}$/) }
 function command(f, value) { f.service.tool.args.command = value }
 
-test('deepseek native zero-tool reservation sends only its schema-bound terminal tool', { skip: !CLI || process.platform === 'win32', timeout: 180000 }, async t => {
+test('deepseek native zero-tool reservation sends only its schema-bound terminal tool', { skip: !CLI, timeout: 180000 }, async t => {
   const f = await scenario('deepseek', { serviceOptions: { noTool: true } })
   t.after(() => f.close())
   const result = await f.run({ providerToolCallLimit: 0, assignment: { model: 'deepseek-chat', effort: 'low' } })
@@ -104,7 +142,7 @@ async function runScenario(provider) {
   const hostile = await scenario(provider, { tool: { name: 'Task', args: { prompt: 'unauthorized nested dispatch' } }, serviceOptions: { forceFirstTool: true } })
   let f, listener
   try {
-    await assert.rejects(hostile.run({}), { code: 'ROLE_POLICY_DENIED' })
+    await assert.rejects(hostile.run({}, 'hostile-topology'), { code: 'ROLE_POLICY_DENIED' })
     f = await scenario(provider)
     // A challenge is included in the controller-produced receipt bytes, not
     // merely in test metadata. This binds each observed tool exchange to the
@@ -114,8 +152,8 @@ async function runScenario(provider) {
     let contacted = false; listener = net.createServer(socket => { contacted = true; socket.destroy() })
     await new Promise((resolve, reject) => { listener.once('error', reject); listener.listen(0, '127.0.0.1', resolve) })
     const port = listener.address().port, probe = `const n=require('node:net');const s=n.connect(${port},'127.0.0.1');s.on('connect',()=>process.exit(19));s.on('error',()=>process.exit(0));setTimeout(()=>process.exit(0),700)`
-    command(f, `cat ${quote(f.candidate)}; { cat ${quote(f.candidate)}; printf '\\nCLOSED_CANARY_CHALLENGE:${f.challenge}\\n'; } > ${quote(readback)}; printf scratch-ok > ${quote(scratchFile)}; if printf nope > ${quote(f.candidate)} 2>/dev/null; then exit 18; fi; if cat ${quote(f.secret)} 2>/dev/null; then exit 20; fi; ${quote(process.execPath)} -e ${quote(probe)}`)
-    const first = await f.run({ assignment: { model: 'deepseek-chat', effort: 'low' } }); good(first)
+    command(f, withChallenge(`${readCommand(f.candidate)}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(readback)}, require('node:fs').readFileSync(${JSON.stringify(f.candidate)}, 'utf8') + ${JSON.stringify(`\nCLOSED_CANARY_CHALLENGE:${f.challenge}\n`)}); require('node:fs').writeFileSync(${JSON.stringify(scratchFile)}, 'scratch-ok'); try { require('node:fs').writeFileSync(${JSON.stringify(f.candidate)}, 'nope'); process.exit(18) } catch {} ; try { require('node:fs').readFileSync(${JSON.stringify(f.secret)}); process.exit(20) } catch {} ; ${probe}`)}`, f.challenge))
+    const first = await f.run({ assignment: { model: 'deepseek-chat', effort: 'low' } }, 'initial-isolation'); good(first)
     assert.equal(fs.readFileSync(readback, 'utf8'), expectedReceipt, 'controller receipt body did not bind the exact candidate bytes and challenge')
     assert.equal(fs.readFileSync(f.candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(scratchFile, 'utf8'), 'scratch-ok'); assert.equal(contacted, false); assert.equal(first.toolBoundaryEvidence.receiptHashes.length, 1)
     const names = f.service.requests.filter(item => Array.isArray(item.body.tools)).flatMap(item => item.body.tools.map(tool => tool.function?.name || tool.name))
@@ -127,41 +165,29 @@ async function runScenario(provider) {
     assert.ok(projectedPrompt.includes('Its first byte must be "{" and its last byte must be "}".'))
     assert.ok(f.service.requests.some(item => item.path.includes('/chat/completions'))); assert.ok(f.service.requests.some(item => item.body.reasoning_effort === 'low'), JSON.stringify(f.service.requests.map(item => ({ path: item.path, model: item.body.model, effort: item.body.reasoning_effort }))))
     assert.throws(() => native.validateEffort(provider, 'invalid'), { code: 'PROFILE_INVALID' })
-    command(f, `cat ${quote(f.candidate)}`); const before = f.service.requests.length
-    const resumed = await f.run({ reservationId: crypto.randomUUID(), continuationId: first.contextId, assignment: { model: 'deepseek-chat', effort: 'high' } }); good(resumed); assert.equal(resumed.contextId, first.contextId)
+    command(f, readCommand(f.candidate)); const before = f.service.requests.length
+    const resumed = await f.run({ reservationId: crypto.randomUUID(), continuationId: first.contextId, assignment: { model: 'deepseek-chat', effort: 'high' } }, 'continuation'); good(resumed); assert.equal(resumed.contextId, first.contextId)
     const continuationCarriesPrompt = f.service.requests.slice(before).some(item => JSON.stringify(item.body).includes('FIRST_CONTEXT_SENTINEL')); assert.equal(continuationCarriesPrompt, true)
-    const foreign = path.join(f.root, 'foreign'); fs.mkdirSync(foreign)
+    const foreign = privateDirectory(path.join(f.root, 'foreign')), foreignReservation = crypto.randomUUID()
     let foreignCode
-    try { await f.adapter.launch({ ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(createPosixProcessAdapter(), crypto.randomUUID(), { PATH: process.env.PATH }), signal: AbortSignal.timeout(30000) }) } catch (error) { foreignCode = error.code }
+    try { await f.adapter.launch({ ...f.record, reservationId: foreignReservation, continuationId: first.contextId, workingDirectory: foreign, environment: prepareProcessLaunchEnvironment(f.processAdapter, foreignReservation, nativeEnvironment()), signal: AbortSignal.timeout(30000) }) } catch (error) { foreignCode = error.code }
     assert.equal(foreignCode, 'SESSION_ID_MISMATCH')
     let peak = 0; const monitor = setInterval(() => { peak = Math.max(peak, f.owner.ownershipIdentities().length) }, 5)
-    let siblings; try { siblings = await Promise.all([0, 1].map(index => { const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: `sibling-${index}` }; return f.run({ ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) }) })) } finally { clearInterval(monitor) }
+    let siblings; f.nativePhase = 'concurrent-siblings'; try { siblings = await Promise.all([0, 1].map(index => { const ids = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: `sibling-${index}` }; return f.run({ ...ids, missionBinding: core.bindCanonicalMissionForChild(f.projection, { ...f.record, ...ids, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }) }, `concurrent-sibling-${index}`) })) } finally { clearInterval(monitor) }
     assert.ok(siblings.every(item => item.ok)); assert.equal(new Set(siblings.map(item => item.contextId)).size, 2); assert.ok(peak >= 2); assert.deepEqual(f.owner.ownershipIdentities(), [])
-    const originalTool = f.service.tool.args.command; command(f, `cat ${quote(f.candidate)}`)
-    const delayed = await scenario(provider, { serviceOptions: { delayMessagesMs: 3500 } })
-    let pending, fastResult, recoveredLive
-    try {
-      const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }); for (let i = 0; i < 100 && delayed.service.requests.length === 0; i++) await sleep(10)
-      const recoveredOwner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: delayed.registryPath, pollMs: 10 }); await recoveredOwner.recoverReservations()
-      const heldIdentity = recoveredOwner.ownershipIdentities(); assert.equal(heldIdentity.length, 1, 'fresh owner did not recover the persisted live child'); recoveredLive = heldIdentity[0]
-      const fastIds = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
-      const fast = delayed.run({ ...fastIds, missionBinding: core.bindCanonicalMissionForChild(delayed.projection, { ...delayed.record, ...fastIds, sourceRequestHash: delayed.projection.sourceRequestHash, requestEnvelopeHash: delayed.record.dispatch.requestPointer.hash }) })
-      for (let i = 0; i < 100 && delayed.owner.ownershipIdentities().length < 2; i++) await sleep(10)
-      assert.ok(delayed.owner.ownershipIdentities().length >= 2, 'fast sibling did not overlap the held native child')
-      await recoveredOwner.cancelAll({ reason: 'fresh-owner crash recovery', graceMs: 0, killMs: 2000, waitForPending: true }); abort.abort()
-      await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); fastResult = await fast; good(fastResult); assert.deepEqual(delayed.owner.ownershipIdentities(), [])
-    } finally { await delayed.close() }
+    const originalTool = f.service.tool.args.command; command(f, readCommand(f.candidate))
+    const cancellation = await cancellationWitness(provider)
     command(f, originalTool)
-    const frozen = path.join(f.root, 'frozen'), checkerScratch = path.join(f.root, 'checker'); fs.mkdirSync(frozen); fs.mkdirSync(checkerScratch); for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(checkerScratch, name))
+    const frozen = privateDirectory(path.join(f.root, 'frozen')), checkerScratch = privateDirectory(path.join(f.root, 'checker')); for (const name of ['tmp', 'output', 'cache']) privateDirectory(path.join(checkerScratch, name))
     const frozenFile = path.join(frozen, 'candidate.txt'); fs.writeFileSync(frozenFile, f.marker)
     const checkerBoundary = { schemaVersion: 1, capability: native.sha256('deepseek-checker'), runId: 'closed-checker', checkerId: `${provider}-checker`, candidateHash: native.sha256(f.marker), frozenCandidateRoot: frozen, writableScratchRoot: checkerScratch, temporaryRoot: path.join(checkerScratch, 'tmp'), outputRoot: path.join(checkerScratch, 'output'), cacheRoot: path.join(checkerScratch, 'cache') }
-    command(f, `cat ${quote(frozenFile)}; printf checked > ${quote(path.join(checkerScratch, 'checked.txt'))}; if printf wrong > ${quote(frozenFile)} 2>/dev/null; then exit 19; fi`)
+    command(f, withChallenge(`${readCommand(frozenFile)}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(path.join(checkerScratch, 'checked.txt'))}, 'checked'); try { require('node:fs').writeFileSync(${JSON.stringify(frozenFile)}, 'wrong'); process.exit(19) } catch {}`)}`, f.challenge))
     const checker = new HarnessExecAdapter({ provider, runner: f.adapter.runner, nativeRoot: f.nativeRoot, executableBinding: f.binding, targetPath: checkerScratch, connection: connection(f.service), credentialEnvironment: { DEEPSEEK_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only controller checker tools and return one JSON object.', checkerScratchVerifier: () => checkerBoundary })
     const checkerRecord = { ...f.record, sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: checkerScratch, canonicalTargetPath: frozen, candidateHash: checkerBoundary.candidateHash, checkerScratchBoundary: checkerBoundary, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } }
-    checkerRecord.environment = prepareProcessLaunchEnvironment(createPosixProcessAdapter(), checkerRecord.reservationId, { PATH: process.env.PATH }); checkerRecord.signal = AbortSignal.timeout(90000); checkerRecord.missionBinding = core.bindCanonicalMissionForChild(f.projection, { ...checkerRecord, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }); const checked = await checker.launch(checkerRecord); good(checked)
+    checkerRecord.environment = prepareProcessLaunchEnvironment(f.processAdapter, checkerRecord.reservationId, nativeEnvironment()); checkerRecord.signal = AbortSignal.timeout(process.platform === 'win32' ? 300000 : 90000); checkerRecord.missionBinding = core.bindCanonicalMissionForChild(f.projection, { ...checkerRecord, sourceRequestHash: f.projection.sourceRequestHash, requestEnvelopeHash: f.record.dispatch.requestPointer.hash }); f.nativePhase = 'isolated-checker'; const checked = await checker.launch(checkerRecord); good(checked)
     assert.equal(fs.readFileSync(frozenFile, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(checkerScratch, 'checked.txt'), 'utf8'), 'checked')
-    const registry = JSON.parse(fs.readFileSync(f.registryPath, 'utf8')); assert.ok(JSON.stringify(registry).includes(`native-${provider}-`)); const completedOwner = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: f.registryPath, pollMs: 10 }); await completedOwner.recoverReservations(); assert.deepEqual(completedOwner.ownershipIdentities(), [])
-    const recovery = await f.run({ sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID() }); good(recovery); assert.deepEqual(f.owner.ownershipIdentities(), [])
+    const registry = JSON.parse(fs.readFileSync(f.registryPath, 'utf8')); assert.ok(JSON.stringify(registry).includes(`native-${provider}-`)); const completedOwner = new ProcessOwner({ adapter: nativeProcessAdapter(f.registryPath, path.dirname(f.registryPath)), registryPath: f.registryPath, pollMs: 10 }); await completedOwner.recoverReservations(); assert.deepEqual(completedOwner.ownershipIdentities(), [])
+    const recovery = await f.run({ sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID() }, 'post-checker-recovery'); good(recovery); assert.deepEqual(f.owner.ownershipIdentities(), [])
     const receiptHash = first.toolBoundaryEvidence.receiptHashes[0]
     const witnesses = {
       isolation: { candidateHash: native.sha256(fs.readFileSync(f.candidate)), receiptBody: expectedReceipt, receiptHash, scratch: fs.readFileSync(scratchFile, 'utf8'), networkContacted: contacted },
@@ -171,7 +197,7 @@ async function runScenario(provider) {
       toolOutputCapture: { receiptHash, receiptBody: expectedReceipt, marker: f.marker, readbackHash: native.sha256(fs.readFileSync(readback)) },
       stableChildIdentity: { siblingContexts: siblings.map(item => item.contextId), peakOwnedChildren: peak },
       sameContextContinuation: { firstContextId: first.contextId, resumedContextId: resumed.contextId, foreignDeniedCode: foreignCode, continuationCarriesPrompt },
-      cancellation: { recoveredIdentity: recoveredLive, fastContextId: fastResult.contextId, overlapObserved: true, pendingCancelCode: 'CHILD_CANCELLED' },
+      cancellation,
       isolatedChecking: { frozenHash: native.sha256(fs.readFileSync(frozenFile)), checked: fs.readFileSync(path.join(checkerScratch, 'checked.txt'), 'utf8'), checkerContextId: checked.contextId },
       processOwnership: { registryHash: native.sha256(JSON.stringify(registry)), recoveredCompletedChildren: completedOwner.ownershipIdentities().length, recoveryContextId: recovery.contextId },
       modelRouting: { endpointObserved: f.service.requests.some(item => item.path.includes('/chat/completions')), lowEffortObserved: f.service.requests.some(item => item.body.reasoning_effort === 'low'), invalidEffortCode: 'PROFILE_INVALID' }
@@ -184,9 +210,35 @@ async function runScenario(provider) {
   }
 }
 
+async function cancellationWitness(provider) {
+  const delayed = await scenario(provider, { serviceOptions: { holdFirstMessage: true } })
+  let pending, fastResult, recoveredLive
+  try {
+    const abort = new AbortController(); pending = delayed.run({ signal: abort.signal }, 'cancellation-held'); pending.catch(() => {})
+    const waitForHeldMessageMs = process.platform === 'win32' ? 180000 : 15000
+    await waitForNativeObservation(pending, () => delayed.service.firstMessageHeld, waitForHeldMessageMs, 'the held DeepSeek model response')
+    assert.equal(delayed.service.firstMessageHeld, true, 'the first DeepSeek response must be held before recovery and cancellation')
+    const recoveredOwner = new ProcessOwner({ adapter: nativeProcessAdapter(delayed.registryPath, path.dirname(delayed.registryPath)), registryPath: delayed.registryPath, pollMs: 10 }); await recoveredOwner.recoverReservations()
+    const heldIdentity = recoveredOwner.ownershipIdentities(); assert.equal(heldIdentity.length, 1, 'fresh owner did not recover the persisted live child'); recoveredLive = heldIdentity[0]
+    const recoveredGroup = [...recoveredOwner.groups.values()].find(record => record.reservationId === delayed.record.reservationId)
+    assert.ok(recoveredGroup && recoveredGroup.groupIdentity === recoveredLive.id, 'fresh owner did not bind the held reservation to its recovered group')
+    const fastIds = { sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), workItemId: 'fast-sibling' }
+    delayed.nativePhase = 'cancellation-fast-sibling'; const fast = delayed.run({ ...fastIds, missionBinding: core.bindCanonicalMissionForChild(delayed.projection, { ...delayed.record, ...fastIds, sourceRequestHash: delayed.projection.sourceRequestHash, requestEnvelopeHash: delayed.record.dispatch.requestPointer.hash }) }, 'cancellation-fast-sibling')
+    fast.catch(() => {})
+    await waitForNativeObservation(fast, () => delayed.owner.ownershipIdentities().length >= 2, waitForHeldMessageMs, 'both owned DeepSeek children')
+    assert.equal(delayed.owner.ownershipIdentities().length, 2, 'fast sibling did not overlap the held native child')
+    const recoveredTerminal = await recoveredOwner.cancelGroup(recoveredGroup.ownershipId, { reason: 'fresh-owner crash recovery', graceMs: 0, killMs: 2000 })
+    assert.equal(recoveredTerminal.status, 'CANCELLED', 'fresh owner did not durably drain the recovered held group')
+    assert.equal(recoveredTerminal.groupIdentity, recoveredLive.id, 'fresh owner terminal receipt changed the recovered group identity')
+    abort.abort()
+    await assert.rejects(pending, { code: 'CHILD_CANCELLED' }); fastResult = await fast; good(fastResult); assert.deepEqual(delayed.owner.ownershipIdentities(), [])
+  } finally { await delayed.close() }
+  return { recoveredIdentity: recoveredLive, fastContextId: fastResult.contextId, overlapObserved: true, pendingCancelCode: 'CHILD_CANCELLED' }
+}
+
 const scenarioRuns = new Map()
 function witnessesFor(provider) {
-  if (!scenarioRuns.has(provider)) scenarioRuns.set(provider, runScenario(provider))
+  if (!scenarioRuns.has(provider)) scenarioRuns.set(provider, process.env.AUTOPROMPT_CI_CAPABILITY === 'cancellation' ? cancellationWitness(provider).then(cancellation => ({ cancellation })) : runScenario(provider))
   return scenarioRuns.get(provider)
 }
 const capabilityChecks = Object.freeze({
@@ -205,7 +257,7 @@ const capabilityChecks = Object.freeze({
 
 for (const provider of Object.keys(providers)) {
   for (const capability of Object.keys(capabilityChecks)) {
-    test(`${provider} closed native capability: ${capability}`, { skip: !CLI || process.platform === 'win32', timeout: 300000 }, async () => {
+    test(`${provider} closed native capability: ${capability}`, { skip: !CLI, timeout: process.platform === 'win32' ? require('../../scripts/harness-v2-closed-canary.cjs').closedCanaryBatchTimeout({ platform: 'win32', caseCount: 11, approvalRemainingMs: 2040000, activationRemainingMs: 2040000 }) : 420000 }, async () => {
       const value = (await witnessesFor(provider))[capability]
       assert.ok(value, `missing real witness for ${provider}/${capability}`)
       capabilityChecks[capability](value)

@@ -13,28 +13,31 @@ const npm10NodeShim = target => [
   'IF EXIST "%dp0%\\node.exe" (', '  SET "_prog=%dp0%\\node.exe"', ') ELSE (', '  SET "_prog=node"', '  SET PATHEXT=%PATHEXT:;.JS;=;%', ')', '',
   `endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${target}" %*`, '',
 ].join('\r\n')
+
 const npm10NativeShim = target => [
   '@ECHO off', 'GOTO start', ':find_dp0', 'SET dp0=%~dp0', 'EXIT /b', ':start', 'SETLOCAL', 'CALL :find_dp0',
   `"%dp0%\\${target}"   %*`, '',
 ].join('\r\n')
 
 function fixture(t, options = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-npm-shim-'))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-npm-shim-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const packageRoot = path.join(root, 'node_modules', 'fixture-cli')
+  const packageName = options.packageName || 'fixture-cli'
+  const shimName = options.shimName || 'grok'
+  const packageRoot = path.join(root, 'node_modules', ...packageName.split('/'))
   const bin = path.join(root, 'node_modules', '.bin')
   const script = path.join(packageRoot, 'bin', 'fixture.js')
   fs.mkdirSync(path.dirname(script), { recursive: true, mode: 0o700 })
   fs.mkdirSync(bin, { recursive: true, mode: 0o700 })
   fs.writeFileSync(script, '#!/usr/bin/env node\nconsole.log("fixture")\n', { mode: 0o700 })
-  fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 'fixture-cli', version: '1.0.0', bin: { grok: options.bin || 'bin/fixture.js' } }), { mode: 0o600 })
-  const shim = path.join(bin, 'grok.cmd')
+  fs.writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: packageName, version: '1.18.32', bin: { [shimName]: options.bin || 'bin/fixture.js' } }), { mode: 0o600 })
+  const shim = path.join(bin, `${shimName}.cmd`)
   fs.writeFileSync(shim, options.source || npm10NodeShim('..\\fixture-cli\\bin\\fixture.js'), { mode: 0o700 })
   return { root, packageRoot, bin, shim, script }
 }
 
 async function nativeFixture(t, options = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-native-npm-shim-'))
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-windows-native-npm-shim-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const packageRoot = path.join(root, 'node_modules', 'fixture-cli')
   const bin = path.join(root, 'node_modules', '.bin')
@@ -53,6 +56,17 @@ async function currentNpmFixture(t) {
   const f = fixture(t)
   await cmdShim(f.script, f.shim.slice(0, -'.cmd'.length))
   return f
+}
+
+async function currentNpmNativeExecutableFixture(t) {
+  // This is the npm-generated .cmd shape used by the OpenCode native
+  // distribution: one declared `.exe` package bin, no Node command wrapper.
+  const f = fixture(t, { packageName: 'opencode-ai', shimName: 'opencode', bin: 'bin/opencode.exe' })
+  fs.rmSync(f.script)
+  const executable = path.join(f.packageRoot, 'bin', 'opencode.exe')
+  fs.writeFileSync(executable, Buffer.from('MZ fixture executable\n'), { mode: 0o700 })
+  await cmdShim(executable, f.shim.slice(0, -'.cmd'.length))
+  return { ...f, executable }
 }
 
 test('Windows npm10 cmd-shim resolves to exact Node plus declared package bin without cmd.exe', async t => {
@@ -75,7 +89,7 @@ test('Windows npm10 cmd-shim resolves to exact Node plus declared package bin wi
   assert.equal(probe.path, f.shim)
   assert.equal(probe.invocation.sha256, binding.invocation.sha256)
   assert.equal(native.executableRuntimePath(probe), f.script)
-  assert.ok(probe.portableRuntimeIdentity.files.some(([label]) => /^interpreter\/node(?:\.exe)?$/iu.test(label)),
+  assert.ok(probe.portableRuntimeIdentity.files.some(([label]) => label === `interpreter/${path.basename(process.execPath)}`),
     'the portable closure binds the verified Node interpreter, not /usr/bin/env')
   assert.ok(!probe.portableRuntimeIdentity.files.some(([label]) => label === 'interpreter/env'),
     'the env selector is never part of a shell-free shim launch')
@@ -84,12 +98,52 @@ test('Windows npm10 cmd-shim resolves to exact Node plus declared package bin wi
     'the probe must never dispatch the .cmd through a command shell')
 })
 
+test('Windows cmd-shim resolves npm-generated declared native executable without cmd.exe', async t => {
+  const f = await currentNpmNativeExecutableFixture(t)
+  const binding = native.locateExecutable({ provider: 'opencode', executable: f.shim, platform: 'win32' })
+  assert.equal(binding.path, f.shim)
+  assert.equal(binding.sha256, native.executableSha256(f.shim))
+  assert.equal(binding.invocation.kind, 'native-exe')
+  assert.equal(binding.invocation.executable.path, f.executable)
+  assert.equal(binding.invocation.executable.sha256, native.executableSha256(f.executable))
+  const launch = native.executableInvocation(binding, ['--version'])
+  assert.equal(launch.executable, f.executable)
+  assert.deepEqual(launch.argv, ['--version'])
+  assert.equal(native.executableRuntimePath(binding), f.executable)
+  const upperShim = path.join(f.bin, 'opencode.CMD')
+  fs.renameSync(f.shim, upperShim)
+  const upperBinding = native.locateExecutable({ provider: 'opencode', executable: upperShim, platform: 'win32' })
+  assert.equal(upperBinding.invocation.executable.path, f.executable)
+  fs.appendFileSync(f.executable, 'changed')
+  assert.throws(() => native.executableInvocation(upperBinding, ['--version']), { code: 'PROVIDER_IDENTITY_MISMATCH' })
+})
+
+test('Windows native-executable shim refuses suffixes, undeclared bins, and links', async t => {
+  const suffixed = await currentNpmNativeExecutableFixture(t)
+  fs.appendFileSync(suffixed.shim, '& echo foreign\r\n')
+  assert.throws(() => native.locateExecutable({ provider: 'opencode', executable: suffixed.shim, platform: 'win32' }), { code: 'PROVIDER_UNSUPPORTED' })
+
+  const undeclared = await currentNpmNativeExecutableFixture(t)
+  fs.writeFileSync(path.join(undeclared.packageRoot, 'package.json'), JSON.stringify({
+    name: 'opencode-ai', version: '1.18.32', bin: { opencode: 'bin/other.exe' },
+  }))
+  fs.writeFileSync(path.join(undeclared.packageRoot, 'bin', 'other.exe'), 'MZ other\n')
+  assert.throws(() => native.locateExecutable({ provider: 'opencode', executable: undeclared.shim, platform: 'win32' }), { code: 'PROVIDER_IDENTITY_MISMATCH' })
+
+  const linked = await currentNpmNativeExecutableFixture(t)
+  const replacement = path.join(linked.root, 'replacement.exe')
+  fs.writeFileSync(replacement, 'MZ replacement\n')
+  fs.rmSync(linked.executable)
+  fs.symlinkSync(replacement, linked.executable)
+  assert.throws(() => native.locateExecutable({ provider: 'opencode', executable: linked.shim, platform: 'win32' }), { code: 'PROVIDER_IDENTITY_MISMATCH' })
+})
+
 test('Windows npm cmd-shim resolves a declared native package bin without cmd.exe', async t => {
   const f = await nativeFixture(t)
   const binding = native.locateExecutable({ provider: 'grok', executable: f.shim, platform: 'win32' })
   assert.equal(binding.path, f.shim)
   assert.equal(binding.sha256, native.executableSha256(f.shim), 'the raw shim remains the executable identity')
-  assert.equal(binding.invocation.kind, 'native-executable')
+  assert.equal(binding.invocation.kind, 'native-exe')
   assert.equal(binding.invocation.executable.path, f.executable)
   assert.equal(binding.invocation.executable.sha256, native.executableSha256(f.executable))
   const launch = native.executableInvocation(binding, ['--version'])
@@ -164,4 +218,18 @@ test('Windows npm shim launch binding rejects malformed persisted invocation met
   const binding = native.locateExecutable({ provider: 'grok', executable: f.shim, platform: 'win32' })
   const tampered = { ...binding, invocation: { ...binding.invocation, node: { ...binding.invocation.node, path: 7 } } }
   assert.throws(() => native.executableInvocation(tampered, ['--help']), { code: 'PROVIDER_IDENTITY_MISMATCH' })
+})
+
+
+test('Windows npm shim admits extensionless Node bins only with the exact declared bin and plain Node shebang', async t => {
+  const f = fixture(t, { packageName: '@kilocode/cli', shimName: 'kilo', bin: 'bin/kilo' })
+  const script = path.join(f.packageRoot, 'bin', 'kilo')
+  fs.renameSync(f.script, script)
+  await cmdShim(script, f.shim.slice(0, -'.cmd'.length))
+  const binding = native.locateExecutable({ provider: 'kilo', executable: f.shim, platform: 'win32' })
+  assert.equal(binding.invocation.kind, 'node-script')
+  assert.equal(binding.invocation.script.path, script)
+  assert.deepEqual(native.executableInvocation(binding, ['--version']).argv, [script, '--version'])
+  fs.writeFileSync(script, '#!/usr/bin/env bun\nconsole.log("not Node")\n')
+  assert.throws(() => native.locateExecutable({ provider: 'kilo', executable: f.shim, platform: 'win32' }), { code: 'PROVIDER_UNSUPPORTED' })
 })

@@ -1,6 +1,6 @@
 {
   "name": "autoprompt-skill",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Autoprompt is a coding-agent skill for explicit routing, bounded delegation, and evidence-backed checks.",
   "license": "MIT",
   "publishConfig": {
@@ -27,6 +27,9 @@
     "scripts/wsl-runtime.ps1",
     "scripts/codex-runtime-identity.cjs",
     "scripts/local-only-safety.cjs",
+    "scripts/windows-git-bootstrap-config.cjs",
+    "scripts/darwin-command-sandbox.cjs",
+    "scripts/darwin-command-probe.cjs",
     "scripts/harness-provider-config.cjs",
     "scripts/harness-v2-*.cjs",
     "scripts/harness-v2-trust/",
@@ -96,6 +99,7 @@
     "tests/source/harness-v2-grok-sandbox.test.cjs",
     "tests/source/harness-v2-grok-adapter-native.test.cjs",
     "tests/source/reasonix-controlled-native.test.cjs",
+    "tests/helpers/native-platform.cjs",
     "tests/helpers/harness-native-service.cjs",
     "tests/helpers/harness-pi-native-service.cjs",
     "agents/hermes/",
@@ -123,7 +127,7 @@
     "prepublishOnly": "npm run verify && npm run benchmark:release-quality-gate",
     "test:reasonix": "node --test tests/source/reasonix-v2.test.cjs tests/source/reasonix-native.test.cjs tests/source/reasonix-native-credentials.test.cjs tests/source/reasonix-controlled-native.test.cjs tests/source/reasonix-native-todo.test.cjs",
     "test:harness-v2": "node scripts/run-harness-v2-source-tests.cjs",
-    "test:platform": "node --test tests/source/darwin-filesystem.test.cjs tests/source/darwin-filesystem-wrapper.test.cjs tests/source/darwin-runtime-setup.test.cjs tests/source/darwin-process.test.cjs tests/source/windows-filesystem.test.cjs tests/source/windows-filesystem-wrapper.test.cjs tests/source/windows-appcontainer.test.cjs tests/source/windows-appcontainer-resources.test.cjs tests/source/lima-runtime.test.cjs tests/source/lima-runtime-vscode-display.test.cjs tests/source/provider-closure.test.cjs tests/source/hermes-runtime-closure.test.cjs tests/source/wsl-runtime.test.cjs",
+    "test:platform": "node --test tests/source/darwin-filesystem.test.cjs tests/source/darwin-filesystem-wrapper.test.cjs tests/source/darwin-runtime-setup.test.cjs tests/source/darwin-process.test.cjs tests/source/windows-filesystem.test.cjs tests/source/windows-filesystem-wrapper.test.cjs tests/source/windows-filesystem-scale.test.cjs tests/source/windows-appcontainer.test.cjs tests/source/windows-appcontainer-resources.test.cjs tests/source/windows-compiler-staging.test.cjs tests/source/windows-job-helper.test.cjs tests/source/windows-job-adapter.test.cjs tests/source/windows-appcontainer-resource-scale.test.cjs tests/source/windows-appcontainer-resource-identity.test.cjs tests/source/windows-appcontainer-git-acl.test.cjs tests/source/lima-runtime.test.cjs tests/source/lima-runtime-vscode-display.test.cjs tests/source/provider-closure.test.cjs tests/source/hermes-runtime-closure.test.cjs tests/source/wsl-runtime.test.cjs tests/source/windows-bash-runtime.test.cjs tests/source/windows-command-cwd.test.cjs tests/source/harness-v2-native-platform.test.cjs tests/source/harness-v2-command-prerequisites.test.cjs tests/source/harness-v2-packed-tool-path.test.cjs tests/source/harness-v2-windows-private-storage.test.cjs tests/source/harness-v2-canary-diagnostics.test.cjs tests/source/windows-msys-namespace.test.cjs tests/source/windows-msys-pipe.test.cjs tests/source/windows-appcontainer-member-image.test.cjs tests/source/windows-appcontainer-node-pipes.test.cjs tests/source/windows-appcontainer-nul.test.cjs tests/source/windows-appcontainer-nul-capability.test.cjs tests/source/windows-null-capability-contract.test.cjs tests/source/windows-worker-capture.test.cjs tests/source/windows-worker-decoder.test.cjs tests/source/windows-worker-loader.test.cjs tests/source/windows-worker-command.test.cjs tests/source/windows-worker-acl.test.cjs tests/source/windows-worker-shell.test.cjs",
     "conformance:harness-v2": "node scripts/harness-v2-conformance.cjs"
   },
   "engines": {
@@ -194,6 +198,10 @@
     {
       "name": "Alexis-Fiolleau-LaPoste-BGPN",
       "url": "https://github.com/Alexis-Fiolleau-LaPoste-BGPN"
+    },
+    {
+      "name": "Oscar-Williams",
+      "url": "https://github.com/Oscar-Williams"
     }
   ]
 }

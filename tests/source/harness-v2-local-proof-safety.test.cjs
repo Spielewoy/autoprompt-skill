@@ -10,17 +10,56 @@ const test = require('node:test')
 const canary = require('../../scripts/harness-v2-canary.cjs')
 const hash = value => crypto.createHash('sha256').update(value).digest('hex')
 const ROOT = path.resolve(__dirname, '../..')
+test('OpenCode admission on each native host remains pending until all real capability observations pass', () => {
+  const evidence = JSON.parse(fs.readFileSync(path.join(ROOT, 'scripts/harness-v2-trust/evidence.json'), 'utf8'))
+  const policy = canary.selectPolicy(evidence, 'opencode')
+  const sources = new Set([policy.protocol, policy.canaryImplementation, ...Object.values(policy.capabilityCases).map(item => item.source)])
+  const installed = { payloadDigest: hash('fixture payload'), files: Object.fromEntries([...sources].map(source => [source, hash(fs.readFileSync(path.join(ROOT, source)))])) }
+  const implementation = fs.readFileSync(path.join(ROOT, 'scripts/harness-v2-canary.cjs'), 'utf8')
+  for (const platform of ['linux', 'win32', 'darwin']) for (const architecture of ['x64', 'arm64']) {
+    const context = { module: { exports: {} }, require, process: { platform, arch: architecture } }
+    require('node:vm').runInNewContext(implementation, context)
+    const verifier = context.module.exports
+    const nativeBody = { schemaVersion: 1, provider: 'opencode', platform, architecture, files: [['entrypoint/native', hash('unit fixture native')]] }
+    const executable = { sha256: nativeBody.files[0][1], version: 'unit fixture',
+      runtimeIdentity: { sha256: hash('local fixture'), fileCount: 1, packageCount: 0 },
+      portableRuntimeIdentity: { ...nativeBody, sha256: hash(JSON.stringify(nativeBody)), fileCount: 1, packageCount: 0 } }
+    const pending = verifier.verifyPolicy(policy, 'opencode', installed, executable)
+    assert.equal(pending.mode, 'local-canary-pending', `${platform}/${architecture}`)
+    assert.equal(Object.keys(pending.capabilityCases).length, 11)
+    for (const [capability, item] of Object.entries(pending.capabilityCases)) {
+      assert.equal(item.source, 'tests/source/harness-v2-opencode-capability-native.test.cjs')
+      assert.equal(item.testName, `opencode closed native capability: ${capability}`)
+      assert.equal(item.sha256, installed.files[item.source])
+    }
+    assert.throws(() => verifier.verifyObservations(pending, []), { code: 'REVIEWED_LOCAL_REJECTED' })
+    const missingFixture = { ...installed, files: { ...installed.files } }
+    delete missingFixture.files['tests/source/harness-v2-opencode-capability-native.test.cjs']
+    assert.throws(() => verifier.verifyPolicy(policy, 'opencode', missingFixture, executable), { code: 'REVIEWED_LOCAL_REJECTED' })
+  }
+})
+
 function write(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   fs.writeFileSync(file, typeof value === 'string' || Buffer.isBuffer(value) ? value : JSON.stringify(value), { mode: 0o600 })
 }
-function fixture(t, provider) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-local-proof-safety-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+function fixture(t, provider, usePolicy = false, nativeSnapshot = false) {
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-local-proof-safety-')))
+  if (!nativeSnapshot) t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const target = path.join(root, 'target')
   fs.mkdirSync(target)
   assert.equal(cp.spawnSync('git', ['init', '-b', 'fixture', target]).status, 0)
   const sources = ['scripts/local-only-safety.cjs', 'scripts/harness-v2-canary.cjs']
+  if (nativeSnapshot) {
+    const add = directory => {
+      for (const entry of fs.readdirSync(path.join(ROOT, directory), { withFileTypes:true })) {
+        const relative = `${directory}/${entry.name}`
+        if (entry.isDirectory() && directory.startsWith('agents/contracts')) add(relative)
+        else if (entry.isFile() && /\.(?:js|json|ps1)$/.test(entry.name)) sources.push(relative)
+      }
+    }
+    add('agents/codex/workflow'); add('agents/contracts')
+  }
   const files = Object.fromEntries(sources.map(file => [file, hash(fs.readFileSync(path.join(ROOT, file)))]))
   files['tests/native-fixture.cjs'] = hash('unit-only fixture')
   const portableBody = { schemaVersion:1, provider, platform:process.platform, architecture:process.arch,
@@ -37,9 +76,16 @@ function fixture(t, provider) {
     reviewer:{ issuer:'unit-only-not-release-authority', reviewId:'unit-fixture-12345' },
     issuedAt:new Date(Date.now() - 60000).toISOString(), expiresAt:new Date(Date.now() + 60000).toISOString() }
   review.reviewDigest = hash(canary.canonical(review))
-  const evidenceBytes = JSON.stringify({ schemaVersion:'harness-v2-live-conformance.v1', records:[], reviewedLocalRecords:[review] })
+  const policy = { schemaVersion: 'harness-v2-local-canary-policy.v1', provider,
+    platforms: ['linux', 'win32', 'darwin'], architectures: ['x64', 'arm64'],
+    protocol: sources[0], canaryImplementation: sources[1],
+    capabilityCases: Object.fromEntries(Object.entries(review.capabilityCases).map(([key, value]) =>
+      [key, { source: value.source, testName: value.testName }])) }
+  const evidenceBytes = JSON.stringify({ schemaVersion:'harness-v2-live-conformance.v1', records:[],
+    reviewedLocalRecords:[review], ...(usePolicy ? { localCanaryPolicies: [policy] } : {}) })
   files['scripts/harness-v2-trust/evidence.json'] = hash(evidenceBytes)
   const receipt = { schemaVersion:2, provider, contractVersion:'2.0.0', files, payloadDigest:hash(JSON.stringify(files)) }
+  if (usePolicy) Object.assign(review, canary.verifyPolicy(policy, provider, receipt, executable))
   receipt.payloadGeneration = `${provider}-v2.0.0-${receipt.payloadDigest.slice(0, 16)}`
   const bundle = path.join(root, '.autoprompt-private', 'bundles', receipt.payloadGeneration)
   for (const file of sources) write(path.join(bundle, file), fs.readFileSync(path.join(ROOT, file)))
@@ -53,14 +99,14 @@ function fixture(t, provider) {
   const profileSha256 = hash(fs.readFileSync(profilePath))
   const proof = { schemaVersion:1, provider, nativeExecutable:executable.path, profilePath, profileSha256,
     checkerProfilePath:profilePath, checkerProfileSha256:profileSha256, selectedProfile:'autoprompt', checkerSelectedProfile:'autoprompt-checker',
-    strictConfig:true, admissionTrust:{ kind:'reviewed-local-pending', reviewDigest:review.reviewDigest } }
+    strictConfig:true, admissionTrust:{ kind:usePolicy ? 'local-canary-pending' : 'reviewed-local-pending', reviewDigest:review.reviewDigest } }
   const proofPath = path.join(activationRoot, 'enforcement-proof.json')
   write(proofPath, proof)
   const proofSha256 = hash(fs.readFileSync(proofPath)), challenge = crypto.randomBytes(32).toString('base64url')
   const record = { schemaVersion:2, providerId:provider, activationId, activationRoot,
     payloadDigest:receipt.payloadDigest, createdAt:new Date(Date.now() - 10000).toISOString(),
     target:{ realpath:fs.realpathSync.native(target) }, executable, connectionSha256:hash('fixture connection'), request:{ sha256:hash('fixture request') },
-    capability:{ generation:1, expiresAt:new Date(Date.now() + 60000).toISOString() },
+    capability:{ generation:1, expiresAt:new Date(Date.now() + (nativeSnapshot ? 600000 : 60000)).toISOString() },
     activationBoundary:{ enforcementProof:{ sha256:proofSha256 } } }
   const artifacts = canary.REQUIRED.map(capability => {
     const item = review.capabilityCases[capability], file = path.join(activationRoot, 'reviewed-local-canary', 'generation-1', `${capability}.json`)
@@ -82,8 +128,52 @@ function fixture(t, provider) {
   const inspect = (repository = target) => safety.inspect(safety.discoverRepository(repository), 'fixture', env, { enforcementProof:proof }).channels.providerConnectorApiWriteToolDenial
   return { root, activationRoot, record, recordPath, inspect, artifacts }
 }
-for (const provider of ['claude', 'reasonix']) test(`${provider} safety reopens local proof and refuses changed generation or linked artifacts`, t => {
-  const f = fixture(t, provider)
+
+for (const worker of [false, true]) test(`Windows local canary safety admits only its live registered external ${worker ? 'worker workspace' : 'checker snapshot'}`, {
+  skip: process.platform !== 'win32', timeout: 600000,
+}, t => {
+  const f = fixture(t, 'claude', true, true)
+  const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
+  ensureWindowsPrivateAcl(f.activationRoot)
+  const run = require('../../agents/codex/workflow/run-record.js').createRunRecord({
+    targetPath:f.record.target.realpath, providerId:'claude', runId:f.record.activationId,
+    readOnly:true, exactTree:true, canonicalProviderPrivateRoot:path.join(f.activationRoot, 'r'), assertStartBoundary:false,
+  })
+  f.record.status = 'active'
+  f.record.supervisorRuntime = { runPath:run.runPath, runId:run.runId, targetIdentity:run.targetIdentity,
+    metadataSha256:hash(fs.readFileSync(path.join(run.runPath, 'metadata.json'))), createdAt:new Date().toISOString() }
+  write(f.recordPath, f.record)
+  const native = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
+  const { CleanupRegistry } = require('../../agents/codex/workflow/finalizer.js')
+  const { resolveCheckerSnapshotRoot, resolveWorkerWorkspaceRoot, createWindowsGitRootValidator } = require('../../agents/codex/workflow/windows-checker-root.js')
+  const registry = new CleanupRegistry({ ...run.paths.cleanupRegistry,
+    fsImpl:Object.assign(Object.create(fs), { windowsCapture:native, windowsMutations:native }),
+    allowedRoots:[f.activationRoot], controlBinding:{ activationId:f.record.activationId, generationId:1 },
+    externalRootValidator:createWindowsGitRootValidator({ owner:f.record.activationId }),
+  })
+  const checkerRoot = resolveCheckerSnapshotRoot({ snapshotRoot:path.join(f.activationRoot, 'checker-snapshots'),
+    cleanupRegistry:registry, owner:f.record.activationId })
+  const root = worker ? resolveWorkerWorkspaceRoot({ workspaceRoot:path.join(f.activationRoot, 'worker-workspaces', 'workspaces'),
+    cleanupRegistry:registry, owner:f.record.activationId }) : checkerRoot
+  t.after(() => {
+    try { registry.run(); assert.equal(fs.existsSync(root), false); assert.equal(fs.existsSync(checkerRoot), false) }
+    finally { fs.rmSync(f.root, { recursive:true, force:true }) }
+  })
+  const leaf = worker ? 'a'.repeat(40) : `${'b'.repeat(64)}-${'c'.repeat(16)}`
+  const snapshot = path.join(root, leaf)
+  fs.mkdirSync(snapshot)
+  assert.equal(cp.spawnSync('git', ['init', '-b', 'fixture', snapshot]).status, 0)
+  // Exact path and valid native proof alone do not confer cleanup authority.
+  assert.equal(f.inspect(snapshot).enforced, false)
+  registry.register({ path:snapshot, kind:worker ? 'worker-workspace' : 'checker-snapshot', owner:worker ? leaf : f.record.activationId })
+  const accepted = f.inspect(snapshot)
+  assert.equal(accepted.enforced, true, JSON.stringify(accepted))
+  f.record.capability.generation++
+  write(f.recordPath, f.record)
+  assert.equal(f.inspect(snapshot).enforced, false)
+})
+for (const provider of ['claude', 'reasonix']) for (const usePolicy of [false, true]) test(`${provider} ${usePolicy ? 'native policy' : 'release review'} safety reopens local proof and refuses changed generation or linked artifacts`, t => {
+  const f = fixture(t, provider, usePolicy)
   assert.equal(f.inspect().enforced, true, JSON.stringify(f.inspect()))
   f.record.capability.generation++
   write(f.recordPath, f.record)

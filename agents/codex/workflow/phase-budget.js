@@ -93,10 +93,12 @@ const {
   ProcessOwner,
   createPosixProcessAdapter,
   createWindowsJobAdapter,
+  createPlatformProcessAdapter,
   prepareProcessLaunchEnvironment,
   runOwnedProcessConformanceProbe,
 } = require('./process-owner.js')
 const { CleanupRegistry, Finalizer } = require('./finalizer.js')
+const { createWindowsGitRootValidator, resolveCheckerSnapshotRoot, resolveWorkerWorkspaceRoot } = require('./windows-checker-root.js')
 const { assertGenerationControlAuthority } = require('./generation-control.js')
 const { deriveProfileLimits, sealedProfileOverrides } = require('./codex-agent-profile.js')
 const {
@@ -111,8 +113,9 @@ const {
   declaredIgnoredWorkspaceNames,
   projectWorkspaceResources,
   WorkerWorkspaceManager,
+  retainWorkerWorkspaceForRecovery,
 } = require('./worker-workspace.js')
-const { auditPrivatePermissions, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
+const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow, pathIsInside, readFileNoFollow } = require('./safe-run-root.js')
 const { createDarwinFilesystemCapture, createDarwinFilesystemMutations } = require('./darwin-filesystem.js')
 const { validateJsonSchema } = require('./json-schema-validator.js')
 
@@ -4361,6 +4364,11 @@ function ensureSafeEnvironment(boundary) {
       gitEnforced: attestation && attestation.gitEnforced,
       mechanicallyEnforced: attestation && attestation.mechanicallyEnforced,
       invalidChannels,
+      invalidChannelReasons: Object.fromEntries(invalidChannels.map(name => [name,
+        (Array.isArray(attestation?.channels?.[name]?.residuals) ? attestation.channels[name].residuals : [])
+          .slice(0, 4).map(item => ({ code: String(item?.code || '').slice(0, 128),
+            message: String(item?.message || '').slice(0, 512) })),
+      ])),
     })
   }
   return Object.freeze({ environment, attestation })
@@ -9793,7 +9801,7 @@ function appendBoundedByteTail(current, bytes, maximumBytes) {
 
 function readBoundedRegularFileTail(absolutePath, maximumBytes, label) {
   if (!fs.existsSync(absolutePath)) {
-    return Object.freeze({ text: '', byteCount: 0, truncated: false })
+    return Object.freeze({ text: '', base64: '', sha256: crypto.createHash('sha256').update(Buffer.alloc(0)).digest('hex'), byteCount: 0, truncated: false })
   }
   let descriptor
   try {
@@ -9813,12 +9821,136 @@ function readBoundedRegularFileTail(absolutePath, maximumBytes, label) {
     }
     return Object.freeze({
       text: bytes.subarray(0, readTotal).toString('utf8'),
+      base64: bytes.subarray(0, readTotal).toString('base64'),
+      sha256: stat.size === readTotal ? crypto.createHash('sha256').update(bytes.subarray(0, readTotal)).digest('hex') : null,
       byteCount: stat.size,
       truncated: stat.size > readTotal,
     })
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor)
   }
+}
+
+function windowsTempDescriptorBody(descriptor) {
+  return { schemaVersion: descriptor.schemaVersion, path: descriptor.path, relativePath: descriptor.relativePath }
+}
+
+function validateWindowsTempDescriptorShape(descriptor) {
+  if (!descriptor || typeof descriptor !== 'object' || Array.isArray(descriptor) ||
+      Object.keys(descriptor).sort().join(',') !== 'path,relativePath,schemaVersion,sha256' ||
+      descriptor.schemaVersion !== 1 || typeof descriptor.path !== 'string' || !path.isAbsolute(descriptor.path) ||
+      typeof descriptor.relativePath !== 'string' || !/^temp-[a-f0-9]{32}$/.test(descriptor.relativePath) || path.isAbsolute(descriptor.relativePath) ||
+      !/^[a-f0-9]{64}$/.test(descriptor.sha256 || '') ||
+      hashText(JSON.stringify(windowsTempDescriptorBody(descriptor))) !== descriptor.sha256) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory descriptor is invalid')
+  }
+  return descriptor
+}
+
+function projectWindowsClaudeTempEnvironment({ descriptor, requestedCwd, effectiveCwd, environment, fsImpl = fs } = {}) {
+  validateWindowsTempDescriptorShape(descriptor)
+  if (typeof requestedCwd !== 'string' || !path.isAbsolute(requestedCwd) ||
+      typeof effectiveCwd !== 'string' || !path.isAbsolute(effectiveCwd) ||
+      !environment || typeof environment !== 'object' || Array.isArray(environment)) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory projection inputs are invalid')
+  }
+  const normalize = value => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value)
+  const requestedBefore = inspectPathNoFollow(requestedCwd, { fsImpl })
+  const temporaryBefore = inspectPathNoFollow(descriptor.path, { fsImpl })
+  const relative = path.relative(path.resolve(requestedCwd), path.resolve(descriptor.path))
+  const temporaryEnvironment = Object.entries(environment).filter(([key]) => ['TEMP', 'TMP', 'TMPDIR'].includes(key.toUpperCase()))
+  if (!requestedBefore.exists || !requestedBefore.identity || !temporaryBefore.exists || !temporaryBefore.identity ||
+      !relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) ||
+      relative !== descriptor.relativePath || normalize(path.join(requestedCwd, descriptor.relativePath)) !== normalize(descriptor.path) ||
+      temporaryEnvironment.length !== 3 || temporaryEnvironment.some(([key]) => !['TEMP', 'TMP', 'TMPDIR'].includes(key)) ||
+      ['TEMP', 'TMP', 'TMPDIR'].some(key => typeof environment[key] !== 'string' || normalize(environment[key]) !== normalize(descriptor.path))) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory is not bound to its requested cwd and environment')
+  }
+  let effectiveItem, effectiveReal, projectedItem, projectedReal
+  const projected = path.join(effectiveCwd, descriptor.relativePath)
+  try {
+    effectiveItem = fsImpl.lstatSync(effectiveCwd, { bigint: true })
+    effectiveReal = fsImpl.realpathSync.native(effectiveCwd)
+    projectedItem = fsImpl.lstatSync(projected, { bigint: true })
+    projectedReal = fsImpl.realpathSync.native(projected)
+  } catch {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude projected temporary directory is unavailable')
+  }
+  const requestedAfter = inspectPathNoFollow(requestedCwd, { fsImpl })
+  const temporaryAfter = inspectPathNoFollow(descriptor.path, { fsImpl })
+  const sameIdentity = (left, right) => Boolean(left && right && String(left.dev) === String(right.dev) && String(left.ino) === String(right.ino))
+  if ((!effectiveItem.isDirectory() && !effectiveItem.isSymbolicLink()) ||
+      normalize(effectiveReal) !== normalize(requestedBefore.realpath) || projected.length >= 248 ||
+      !projectedItem.isDirectory() || projectedItem.isSymbolicLink() ||
+      normalize(projectedReal) !== normalize(temporaryBefore.realpath) ||
+      !sameIdentity(temporaryBefore.identity, projectedItem) ||
+      !requestedAfter.exists || stableStringify(requestedAfter.identity) !== stableStringify(requestedBefore.identity) ||
+      !temporaryAfter.exists || stableStringify(temporaryAfter.identity) !== stableStringify(temporaryBefore.identity)) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude projected temporary directory changed identity or escaped its shallow cwd')
+  }
+  return { ...environment, TEMP: projected, TMP: projected, TMPDIR: projected }
+}
+
+function validateOwnedProxyNode(binding) {
+  if (binding === undefined || binding === null) return process.execPath
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding) ||
+      Object.keys(binding).sort().join(',') !== 'path,sha256' ||
+      !path.isAbsolute(binding.path || '') || !/^[a-f0-9]{64}$/.test(binding.sha256 || '')) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node binding is invalid')
+  }
+  const before = inspectPathNoFollow(binding.path, { mustBeDirectory: false })
+  if (!before.exists || before.realpath !== binding.path) {
+    throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node binding changed')
+  }
+  let descriptor
+  try {
+    descriptor = fs.openSync(binding.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+    const opened = fs.fstatSync(descriptor)
+    if (!opened.isFile() || String(opened.dev) !== before.identity.dev || String(opened.ino) !== before.identity.ino) {
+      throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node identity changed')
+    }
+    const bytes = fs.readFileSync(descriptor)
+    const after = fs.fstatSync(descriptor)
+    if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs ||
+        crypto.createHash('sha256').update(bytes).digest('hex') !== binding.sha256) {
+      throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node bytes changed')
+    }
+  } catch (error) {
+    if (error instanceof SupervisorIntegrationError) throw error
+    throw new SupervisorIntegrationError('CODEX_PROXY_BINDING_INVALID', 'owned Codex proxy Node binding is unavailable')
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor)
+  }
+  return binding.path
+}
+
+function validOwnedRelayAddress(value) {
+  if (typeof value !== 'string' || value.includes('\0')) return false
+  // Only this private, unguessable Grok pipe family is admitted on Windows.
+  // A pipe is a kernel endpoint, so POSIX filesystem socket checks do not apply.
+  return process.platform === 'win32'
+    ? /^\\\\\.\\pipe\\autoprompt-grok-[a-f0-9]{64}$/.test(value)
+    : path.isAbsolute(value)
+}
+
+function canonicalDarwinListeners(value) {
+  if (process.platform !== 'darwin') {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listener descriptors are not supported on this platform')
+  }
+  let listeners
+  try { listeners = require('./darwin-launchd-process.js').validateDarwinListeners(value) }
+  catch {
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listener descriptor is invalid')
+  }
+  return Object.freeze({
+    proxy: Object.freeze({ fd: listeners.proxy.fd, host: listeners.proxy.host, port: listeners.proxy.port }),
+    mcp: Object.freeze({ fd: listeners.mcp.fd, host: listeners.mcp.host, port: listeners.mcp.port }),
+  })
+}
+
+function sameDarwinListeners(left, right) {
+  return left.proxy.fd === right.proxy.fd && left.proxy.host === right.proxy.host && left.proxy.port === right.proxy.port &&
+    left.mcp.fd === right.mcp.fd && left.mcp.host === right.mcp.host && left.mcp.port === right.mcp.port
 }
 
 class OwnedCodexProxyRunner {
@@ -9840,6 +9972,8 @@ class OwnedCodexProxyRunner {
         'owned Codex proxy runner requires an activation and positive generation binding',
       )
     }
+    this.boundNode = options.boundNode === undefined ? null : Object.freeze({ ...options.boundNode })
+    validateOwnedProxyNode(this.boundNode)
     this.controlSequence = 0
     this.pollMs = options.pollMs || 20
     this.sessions = new Map()
@@ -9860,22 +9994,34 @@ class OwnedCodexProxyRunner {
       if (typeof spec.prepareLaunch !== 'function') throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned launch preparation must be a function')
       launchResource = await spec.prepareLaunch({ sessionRoot, sessionId: spec.sessionId, reservationId: spec.reservationId })
       if (!launchResource || typeof launchResource !== 'object' || Array.isArray(launchResource) ||
-          !launchResource.relayStdin || typeof launchResource.relayStdin.socketPath !== 'string' ||
-          !path.isAbsolute(launchResource.relayStdin.socketPath) || launchResource.relayStdin.socketPath.includes('\0') ||
+          !launchResource.relayStdin || typeof launchResource.relayStdin !== 'object' || Array.isArray(launchResource.relayStdin) ||
+          !validOwnedRelayAddress(launchResource.relayStdin.socketPath) ||
+          Object.keys(launchResource.relayStdin).length !== 1 ||
           (launchResource.cleanup !== undefined && typeof launchResource.cleanup !== 'function')) {
         try { await launchResource?.cleanup?.() } catch {}
         throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned launch preparation returned an invalid relay resource')
       }
-      const relayPath = launchResource.relayStdin.socketPath
-      let relayStat, realRelayPath
-      try { relayStat = fs.lstatSync(relayPath); realRelayPath = fs.realpathSync.native(relayPath) } catch { relayStat = null }
-      // A long Linux socket path may be addressed through its controller-held
-      // directory FD. Check the resolved socket remains inside this session.
-      const relativeRelayPath = realRelayPath ? path.relative(fs.realpathSync.native(sessionRoot), realRelayPath) : '..'
-      if (!relayStat || !relayStat.isSocket() || relativeRelayPath === '' || relativeRelayPath === '..' || relativeRelayPath.startsWith(`..${path.sep}`) || path.isAbsolute(relativeRelayPath) ||
-          (process.getuid && relayStat.uid !== process.getuid()) || (relayStat.mode & 0o077)) {
+      const resourceHasBinding = launchResource.launchBindingHash !== undefined
+      const resourceHasMarker = launchResource.markReservationEntered !== undefined
+      if (resourceHasBinding !== resourceHasMarker || (resourceHasBinding &&
+          (typeof launchResource.launchBindingHash !== 'string' || !/^[a-f0-9]{64}$/.test(launchResource.launchBindingHash) ||
+            typeof launchResource.markReservationEntered !== 'function' ||
+            (spec.launchBindingHash !== undefined && spec.launchBindingHash !== launchResource.launchBindingHash)))) {
         try { await launchResource.cleanup?.() } catch {}
-        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned relay socket is not a private session capability')
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned launch resource has an incomplete or conflicting lifecycle binding')
+      }
+      const relayPath = launchResource.relayStdin.socketPath
+      if (process.platform !== 'win32') {
+        let relayStat, realRelayPath
+        try { relayStat = fs.lstatSync(relayPath); realRelayPath = fs.realpathSync.native(relayPath) } catch { relayStat = null }
+        // A long Linux socket path may be addressed through its controller-held
+        // directory FD. Check the resolved socket remains inside this session.
+        const relativeRelayPath = realRelayPath ? path.relative(fs.realpathSync.native(sessionRoot), realRelayPath) : '..'
+        if (!relayStat || !relayStat.isSocket() || relativeRelayPath === '' || relativeRelayPath === '..' || relativeRelayPath.startsWith(`..${path.sep}`) || path.isAbsolute(relativeRelayPath) ||
+            (process.getuid && relayStat.uid !== process.getuid()) || (relayStat.mode & 0o077)) {
+          try { await launchResource.cleanup?.() } catch {}
+          throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned relay socket is not a private session capability')
+        }
       }
       if (launchResource.launch !== undefined && (!launchResource.launch || typeof launchResource.launch !== 'object' ||
           typeof launchResource.launch.executable !== 'string' || !Array.isArray(launchResource.launch.argv) ||
@@ -9886,11 +10032,49 @@ class OwnedCodexProxyRunner {
       }
     }
     const childSpec = launchResource?.launch || spec
+    const listenerCandidates = [
+      ...(Object.hasOwn(spec, 'darwinListeners') ? [spec.darwinListeners] : []),
+      ...(launchResource && Object.hasOwn(launchResource, 'darwinListeners') ? [launchResource.darwinListeners] : []),
+      ...(Object.hasOwn(childSpec, 'darwinListeners') ? [childSpec.darwinListeners] : []),
+    ]
+    let darwinListeners
+    if (listenerCandidates.length) {
+      if (!launchResource || !launchResource.relayStdin || this.processOwner?.adapter?.kind !== 'darwin-launchd-coalition') {
+        try { await launchResource?.cleanup?.() } catch {}
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listeners require a prepared relay and Darwin coalition ownership')
+      }
+      try {
+        darwinListeners = canonicalDarwinListeners(listenerCandidates[0])
+        if (listenerCandidates.slice(1).some(value => !sameDarwinListeners(darwinListeners, canonicalDarwinListeners(value)))) {
+          throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listener descriptors disagree across the launch resource')
+        }
+      } catch (error) {
+        try { await launchResource.cleanup?.() } catch {}
+        throw error
+      }
+    }
+    const windowsTempDirectory = childSpec.windowsTempDirectory
+    if (windowsTempDirectory !== undefined) {
+      if (process.platform !== 'win32') {
+        try { await launchResource?.cleanup?.() } catch {}
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory descriptor is not supported on this platform')
+      }
+      try { validateWindowsTempDescriptorShape(windowsTempDirectory) } catch (error) {
+        try { await launchResource?.cleanup?.() } catch {}
+        throw error
+      }
+    }
     const requestPath = path.join(sessionRoot, 'request.json')
     const stdoutPath = path.join(sessionRoot, 'stdout.jsonl')
     const stderrPath = path.join(sessionRoot, 'stderr.log')
     const statusPath = path.join(sessionRoot, 'status.json')
-    const argvHash = hashText(JSON.stringify({ executable: childSpec.executable, argv: childSpec.argv }))
+    const proxyFailurePath = path.join(sessionRoot, 'proxy-error.json')
+    const argvHash = hashText(JSON.stringify({
+      executable: childSpec.executable,
+      argv: childSpec.argv,
+      ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+      ...(darwinListeners ? { darwinListeners } : {}),
+    }))
     const sequence = ++this.controlSequence
     try { fs.writeFileSync(requestPath, `${JSON.stringify({
       schemaVersion: 2,
@@ -9899,6 +10083,8 @@ class OwnedCodexProxyRunner {
       sequence,
       executable: childSpec.executable,
       argv: childSpec.argv,
+      ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+      ...(darwinListeners ? { darwinListeners } : {}),
       argvHash,
       cwd: childSpec.cwd,
       stdin: childSpec.stdin || '',
@@ -9911,24 +10097,37 @@ class OwnedCodexProxyRunner {
       throw error
     }
     let owned
-    try { owned = await this.processOwner.launch({
-      executable: process.execPath,
-      argv: [__filename, '--owned-codex-proxy', requestPath],
-      cwd: childSpec.cwd,
-      env: childSpec.env,
-      shell: false,
-      stdin: 'ignore',
-      stdout: 'ignore',
-      stderr: 'ignore',
-      sessionId: spec.sessionId,
-      reservationId: spec.reservationId,
-      targetKey: this.targetKey,
-      forWork: false,
-    }) } catch (error) {
+    try {
+      const proxyExecutable = validateOwnedProxyNode(this.boundNode)
+      // Mark before entering the owner: even a rejected launch may leave a
+      // pending physical spawn. Cleanup must then require fresh owned drain.
+      if (launchResource?.markReservationEntered) {
+        const marked = launchResource.markReservationEntered()
+        if (marked && typeof marked.then === 'function') throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned launch entry marker must be synchronous')
+      }
+      owned = await this.processOwner.launch({
+        executable: proxyExecutable,
+        argv: [__filename, '--owned-codex-proxy', requestPath],
+        cwd: childSpec.cwd,
+        env: childSpec.env,
+        shell: false,
+        stdin: 'ignore',
+        stdout: 'ignore',
+        stderr: 'ignore',
+        ...(darwinListeners ? { darwinListeners } : {}),
+        sessionId: spec.sessionId,
+        reservationId: spec.reservationId,
+        targetKey: this.targetKey,
+        ...((launchResource?.launchBindingHash ?? spec.launchBindingHash) !== undefined
+          ? { launchBindingHash: launchResource?.launchBindingHash ?? spec.launchBindingHash } : {}),
+        forWork: false,
+        ...(windowsTempDirectory ? { requireShortCwd: true } : {}),
+      })
+    } catch (error) {
       try { await launchResource?.cleanup?.() } catch {}
       throw error
     }
-    const session = { ...owned, sessionRoot, statusPath, stopped: false }
+    const session = { ...owned, reservationId: spec.reservationId, sessionRoot, statusPath, stopped: false }
     this.sessions.set(spec.sessionId, session)
     let stdoutTail = Buffer.alloc(0)
     const stdoutHash = crypto.createHash('sha256')
@@ -9937,6 +10136,7 @@ class OwnedCodexProxyRunner {
     let stdoutDescriptor
     const stdoutDecoder = new StringDecoder('utf8')
     let status = null
+    let observedTermination = null
     let terminalRecord = null
     let missingStatusSince = null
     let stdoutLinesSinceYield = 0
@@ -10012,10 +10212,21 @@ class OwnedCodexProxyRunner {
             missingStatusSince ||= Date.now()
             if (Date.now() - missingStatusSince >= Math.max(100, this.pollMs * 5)) {
               if (fs.existsSync(statusPath)) status = readRegularJson(statusPath, 'owned Codex proxy status').parsed
-              if (!status) throw new SupervisorIntegrationError(
-                'CODEX_PROXY_STATUS_INVALID',
-                'owned Codex proxy exited before writing its durable terminal status',
-              )
+              if (!status) {
+                let proxyFailure = null
+                if (fs.existsSync(proxyFailurePath)) {
+                  const value = readRegularJson(proxyFailurePath, 'owned Codex proxy failure').parsed
+                  if (value?.schemaVersion === 1 && Object.keys(value).sort().join(',') === 'code,message,schemaVersion,sourceFrames' &&
+                      typeof value.code === 'string' && value.code.length <= 64 && typeof value.message === 'string' && value.message.length <= 512 &&
+                      Array.isArray(value.sourceFrames) && value.sourceFrames.length <= 8 && value.sourceFrames.every(frame => typeof frame === 'string' && frame.length <= 256)) proxyFailure = value
+                  else throw new SupervisorIntegrationError('CODEX_PROXY_STATUS_INVALID', 'owned Codex proxy failure diagnostic is invalid')
+                }
+                throw new SupervisorIntegrationError(
+                  'CODEX_PROXY_STATUS_INVALID',
+                  'owned Codex proxy exited before writing its durable terminal status',
+                  proxyFailure ? { proxyFailure } : undefined,
+                )
+              }
             }
           } else missingStatusSince = null
         }
@@ -10062,6 +10273,21 @@ class OwnedCodexProxyRunner {
           'owned Codex proxy lacks the exact terminal group-drain receipt',
         )
       }
+      // Read only after the exact owned group has drained: the proxy may
+      // publish a natural failure while stop() is in flight. Protocol-driven
+      // completion must not erase that durable native termination evidence.
+      if (session.stopped && fs.existsSync(statusPath)) {
+        const stoppedStatus = readRegularJson(statusPath, 'owned Codex proxy status').parsed
+        if (stoppedStatus.schemaVersion !== 2 || stoppedStatus.activationId !== this.activationId ||
+            stoppedStatus.generationId !== this.generationId || stoppedStatus.sequence !== sequence ||
+            stoppedStatus.argvHash !== argvHash || !Number.isSafeInteger(stoppedStatus.codexPid) || stoppedStatus.codexPid < 1 ||
+            !(stoppedStatus.code === null || Number.isSafeInteger(stoppedStatus.code) && stoppedStatus.code >= 0 && stoppedStatus.code <= 0xffffffff) ||
+            !(stoppedStatus.signal === null || typeof stoppedStatus.signal === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(stoppedStatus.signal)) ||
+            stoppedStatus.code === null && stoppedStatus.signal === null) {
+          throw new SupervisorIntegrationError('CODEX_PROXY_STATUS_INVALID', 'owned Codex proxy returned a foreign stopped status')
+        }
+        observedTermination = Object.freeze({ exitCode: stoppedStatus.code, signal: stoppedStatus.signal })
+      }
       const stderr = readBoundedRegularFileTail(
         stderrPath,
         CODEX_STDERR_TAIL_MAX_BYTES,
@@ -10071,16 +10297,20 @@ class OwnedCodexProxyRunner {
         status: session.stopped ? 0 : status.code,
         signal: session.stopped ? 'OWNED_STOP' : status.signal,
         stdout: stdoutTail.toString('utf8'),
+        stdoutBase64: stdoutTail.toString('base64'),
         stdoutByteCount: offset,
         stdoutSha256: stdoutHash.digest('hex'),
         stdoutTruncated: offset > stdoutTail.length,
         stderr: stderr.text,
+        stderrBase64: stderr.base64,
+        stderrSha256: stderr.sha256,
         stderrByteCount: stderr.byteCount,
         stderrTruncated: stderr.truncated,
         processOwned: true,
         exactArgv: true,
         drained: true,
         codexPid: status && status.codexPid,
+        ...(observedTermination ? { observedTermination } : {}),
       }
     } finally {
       if (stdoutDescriptor !== undefined) fs.closeSync(stdoutDescriptor)
@@ -10108,10 +10338,69 @@ class OwnedCodexProxyRunner {
           'Codex proxy cancellation did not return its exact terminal group receipt',
         )
       }
-      return { drained: true, terminal }
+      return {
+        drained: true,
+        terminal,
+        // Preserve the exact owner binding for callers that deliberately
+        // complete a protocol after the child has published its terminal
+        // result.  The receipt itself remains the authority for status.
+        ownershipId: session.ownershipId,
+        reservationId: session.reservationId,
+        groupIdentity: session.groupIdentity,
+      }
     })()
     return session.stopPromise
   }
+}
+
+const OWNED_PROXY_PHASE_BASENAME = 'proxy-phases.jsonl'
+const OWNED_PROXY_PHASE_LIMIT = 16
+const OWNED_PROXY_PHASES = new Set(['requestvalidated', 'outputopened', 'relayready', 'cwdbound', 'spawnrequested', 'spawned', 'stdinwritten', 'closed'])
+
+function createOwnedProxyPhaseJournal(requestPath) {
+  const journalPath = path.join(path.dirname(path.resolve(requestPath)), OWNED_PROXY_PHASE_BASENAME)
+  let identity = null
+  let size = 0
+  try {
+    const fd = fs.openSync(journalPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+      (fs.constants.O_NOFOLLOW || 0), 0o600)
+    try {
+      const stat = fs.fstatSync(fd)
+      if (!stat.isFile() || stat.isSymbolicLink?.() || stat.nlink !== 1 ||
+          (process.platform !== 'win32' && (stat.mode & 0o777) !== 0o600)) return null
+      identity = { dev: String(stat.dev), ino: String(stat.ino) }
+    } finally { fs.closeSync(fd) }
+  } catch { return null }
+  let sequence = 0
+  return Object.freeze({
+    path: journalPath,
+    record(stage) {
+      if (!identity || sequence >= OWNED_PROXY_PHASE_LIMIT || !OWNED_PROXY_PHASES.has(stage)) return false
+      let fd
+      try {
+        const before = fs.lstatSync(journalPath)
+        if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 ||
+            (process.platform !== 'win32' && (before.mode & 0o777) !== 0o600) ||
+            String(before.dev) !== identity.dev || String(before.ino) !== identity.ino || before.size !== size) return false
+        fd = fs.openSync(journalPath, fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW || 0))
+        const opened = fs.fstatSync(fd)
+        if (!opened.isFile() || opened.nlink !== 1 || String(opened.dev) !== identity.dev ||
+            String(opened.ino) !== identity.ino || opened.size !== size) return false
+        const bytes = Buffer.from(`${JSON.stringify({ schemaVersion: 1, sequence: sequence + 1, stage })}\n`, 'utf8')
+        let offset = 0
+        while (offset < bytes.length) {
+          const written = fs.writeSync(fd, bytes, offset, bytes.length - offset)
+          if (written <= 0) { identity = null; return false }
+          offset += written
+        }
+        fs.fsyncSync(fd)
+        size += bytes.length
+        sequence += 1
+        return true
+      } catch { identity = null; return false }
+      finally { if (fd !== undefined) { try { fs.closeSync(fd) } catch {} } }
+    },
+  })
 }
 
 async function runOwnedCodexProxy(requestPath) {
@@ -10123,17 +10412,95 @@ async function runOwnedCodexProxy(requestPath) {
       !Array.isArray(request.argv) || request.argv.some(value => typeof value !== 'string') ||
       typeof request.cwd !== 'string' || typeof request.stdin !== 'string' ||
       (request.relayStdin !== undefined && (!request.relayStdin || typeof request.relayStdin !== 'object' || Array.isArray(request.relayStdin) ||
-        Object.keys(request.relayStdin).length !== 1 || typeof request.relayStdin.socketPath !== 'string' || !path.isAbsolute(request.relayStdin.socketPath) || request.relayStdin.socketPath.includes('\0'))) ||
+        Object.keys(request.relayStdin).length !== 1 || !validOwnedRelayAddress(request.relayStdin.socketPath))) ||
       !/^[a-f0-9]{64}$/.test(request.argvHash || '')) {
     throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy request is invalid')
+  }
+  let windowsTempDirectory, darwinListeners
+  try {
+    if (request.windowsTempDirectory !== undefined) {
+      if (process.platform !== 'win32') {
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Windows Claude temporary directory descriptor is not supported on this platform')
+      }
+      windowsTempDirectory = validateWindowsTempDescriptorShape(request.windowsTempDirectory)
+    }
+    if (Object.hasOwn(request, 'darwinListeners')) {
+      darwinListeners = canonicalDarwinListeners(request.darwinListeners)
+      if (!request.relayStdin) throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'Darwin listener proxy requires its prepared relay')
+    }
+    const expectedArgvHash = hashText(JSON.stringify({
+      executable: request.executable,
+      argv: request.argv,
+      ...(windowsTempDirectory ? { windowsTempDirectory } : {}),
+      ...(darwinListeners ? { darwinListeners } : {}),
+    }))
+    if (expectedArgvHash !== request.argvHash) {
+      throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy executable request binding is invalid')
+    }
+  } catch (error) {
+    if (error instanceof SupervisorIntegrationError) throw error
+    throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy Windows temporary directory binding is invalid')
   }
   for (const outputPath of [request.stdoutPath, request.stderrPath, request.statusPath]) {
     if (path.dirname(path.resolve(outputPath)) !== path.dirname(path.resolve(requestPath))) {
       throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy output escaped its control directory')
     }
   }
+  const phaseJournal = createOwnedProxyPhaseJournal(requestPath)
+  const recordPhase = stage => { try { phaseJournal?.record(stage) } catch {} }
+  recordPhase('requestvalidated')
+  const proxyFailurePath = path.join(path.dirname(path.resolve(requestPath)), 'proxy-error.json')
+  const writeProxyFailure = error => {
+    const sourceFrames = String(error?.stack || '').split(/\r?\n/u)
+      .filter(line => line.includes(path.basename(__filename))).slice(0, 8)
+      .map(line => line.slice(line.lastIndexOf(path.basename(__filename)), line.length).slice(0, 256))
+    const value = { schemaVersion: 1, code: String(error?.code || 'RUNTIME_FAILURE').slice(0, 64),
+      message: String(error?.message || error || 'owned Codex proxy failure').replace(/[\r\n]+/gu, ' ').slice(0, 512), sourceFrames }
+    try { fs.writeFileSync(proxyFailurePath, `${JSON.stringify(value)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 }) } catch {}
+  }
   const stdoutHandle = fs.openSync(request.stdoutPath, 'wx', 0o600)
   const stderrHandle = fs.openSync(request.stderrPath, 'wx', 0o600)
+  recordPhase('outputopened')
+  let child = null
+  let settled = false
+  let effectiveCwd = request.cwd
+  let childEnvironment = process.env
+  const boundedFailure = error => Object.freeze({
+    type: String(error?.name || 'Error').slice(0, 64),
+    code: String(error?.code || 'RUNTIME_FAILURE').slice(0, 64),
+    message: String(error?.message || error || 'owned Codex proxy failure').replace(/[\r\n]+/gu, ' ').slice(0, 512),
+    requestedCwdLength: request.cwd.length,
+    effectiveCwdLength: typeof effectiveCwd === 'string' ? effectiveCwd.length : 0,
+  })
+  const finish = (code, signal, error = null) => {
+    if (settled) return
+    settled = true
+    recordPhase('closed')
+    relay?.destroy()
+    const failure = error ? boundedFailure(error) : null
+    if (failure) {
+      try { fs.writeSync(stderrHandle, `OWNED_CODEX_PROXY_FAILED:${JSON.stringify(failure)}\n`) } catch {}
+    }
+    for (const handle of [stdoutHandle, stderrHandle]) {
+      try { fs.fsyncSync(handle) } catch {}
+      try { fs.closeSync(handle) } catch {}
+    }
+    atomicWriteFile(request.statusPath, `${JSON.stringify({
+      schemaVersion: 2,
+      activationId: request.activationId,
+      generationId: request.generationId,
+      sequence: request.sequence,
+      argvHash: request.argvHash,
+      codexPid: child?.pid || process.pid,
+      code: code === null ? 1 : code,
+      signal: signal || null,
+      error: failure,
+    })}\n`, { mode: 0o600 })
+  }
+  const failBeforeChild = error => {
+    finish(1, null, error)
+    throw error
+  }
   // The relay path is a private controller capability, never an upstream API
   // credential. Connect it only inside the owned proxy and pass its already
   // opened descriptor to bwrap as stdin; the native child receives no path.
@@ -10144,41 +10511,65 @@ async function runOwnedCodexProxy(requestPath) {
     socket.once('connect', () => { clearTimeout(timeout); resolve(socket) })
     socket.once('error', error => { clearTimeout(timeout); reject(new SupervisorIntegrationError('CODEX_PROXY_RELAY_UNAVAILABLE', `owned relay connection failed: ${error.message}`)) })
   }) : null } catch (error) {
-    for (const handle of [stdoutHandle, stderrHandle]) { try { fs.closeSync(handle) } catch {} }
-    fs.writeFileSync(request.statusPath, `${JSON.stringify({ schemaVersion: 2, activationId: request.activationId, generationId: request.generationId, sequence: request.sequence, argvHash: request.argvHash, codexPid: process.pid, code: 1, signal: null, error: error.message })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-    throw error
+    failBeforeChild(error)
   }
-  const child = childProcess.spawn(request.executable, request.argv, {
-    cwd: request.cwd,
-    env: process.env,
-    shell: false,
-    windowsHide: true,
-    stdio: [relay || 'pipe', 'pipe', 'pipe'],
-  })
-  child.stdout.on('data', bytes => fs.writeSync(stdoutHandle, bytes))
-  child.stderr.on('data', bytes => fs.writeSync(stderrHandle, bytes))
-  let settled = false
+  recordPhase('relayready')
+  if (process.platform === 'win32') {
+    try {
+      if (!path.isAbsolute(request.cwd)) {
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy cwd is not absolute')
+      }
+      const before = inspectPathNoFollow(request.cwd)
+      effectiveCwd = process.cwd()
+      const inherited = fs.lstatSync(effectiveCwd)
+      const inheritedReal = fs.realpathSync.native(effectiveCwd)
+      const after = inspectPathNoFollow(request.cwd)
+      if (!before.exists || !after.exists ||
+          stableStringify(before.identity) !== stableStringify(after.identity) ||
+          (!inherited.isDirectory() && !inherited.isSymbolicLink()) ||
+          inheritedReal.toLowerCase() !== before.realpath.toLowerCase() || effectiveCwd.length >= 260) {
+        throw new SupervisorIntegrationError('CODEX_PROXY_REQUEST_INVALID', 'owned Codex proxy inherited cwd does not bind its requested physical directory')
+      }
+      if (windowsTempDirectory) {
+        childEnvironment = projectWindowsClaudeTempEnvironment({
+          descriptor: windowsTempDirectory,
+          requestedCwd: request.cwd,
+          effectiveCwd,
+          environment: process.env,
+        })
+      }
+    } catch (error) { failBeforeChild(error) }
+  }
+  recordPhase('cwdbound')
+  recordPhase('spawnrequested')
+  try {
+    child = childProcess.spawn(request.executable, request.argv, {
+      cwd: effectiveCwd,
+      env: childEnvironment,
+      shell: false,
+      windowsHide: true,
+      stdio: darwinListeners ? [relay || 'pipe', 'pipe', 'pipe', darwinListeners.proxy.fd, darwinListeners.mcp.fd] : [relay || 'pipe', 'pipe', 'pipe'],
+    })
+  } catch (error) { failBeforeChild(error) }
+  child?.once?.('spawn', () => recordPhase('spawned'))
+  if (!child || !child.stdout || !child.stderr || (!relay && !child.stdin)) {
+    const error = new SupervisorIntegrationError('CODEX_PROXY_LAUNCH_INVALID', 'owned Codex proxy child lacks its required streams')
+    if (!child) failBeforeChild(error)
+    child.once('error', () => {})
+    child.once('close', (code, signal) => finish(code === null || code === 0 ? 1 : code, signal, error))
+    try { child.kill() } catch {}
+    return
+  }
   let childError = null
-  const finish = (code, signal, error = null) => {
-    if (settled) return
-    settled = true
-    relay?.destroy()
-    for (const handle of [stdoutHandle, stderrHandle]) {
-      try { fs.fsyncSync(handle) } catch {}
-      try { fs.closeSync(handle) } catch {}
+  const writeOutput = (handle, bytes) => {
+    try { fs.writeSync(handle, bytes) } catch (error) {
+      childError ||= error
+      writeProxyFailure(error)
+      try { child.kill() } catch {}
     }
-    fs.writeFileSync(request.statusPath, `${JSON.stringify({
-      schemaVersion: 2,
-      activationId: request.activationId,
-      generationId: request.generationId,
-      sequence: request.sequence,
-      argvHash: request.argvHash,
-      codexPid: child.pid || 1,
-      code: code === null ? 1 : code,
-      signal: signal || null,
-      error: error ? error.message : null,
-    })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
   }
+  child.stdout.on('data', bytes => writeOutput(stdoutHandle, bytes))
+  child.stderr.on('data', bytes => writeOutput(stderrHandle, bytes))
   const stdin = relay || child.stdin
   stdin.on('error', error => {
     if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error && error.code)) {
@@ -10191,8 +10582,10 @@ async function runOwnedCodexProxy(requestPath) {
   // Publishing status there lets the owner freeze a transcript before the
   // provider's terminal usage line. `close` is the process-wide stdio drain
   // boundary; only then close/fsync the files and expose durable status.
-  child.once('close', (code, signal) => finish(code, signal, childError))
-  if (!relay) child.stdin.end(request.stdin)
+  child.once('close', (code, signal) => {
+    try { finish(code, signal, childError) } catch (error) { writeProxyFailure(error); process.exitCode = 2 }
+  })
+  if (!relay) child.stdin.end(request.stdin, error => { if (!error) recordPhase('stdinwritten') })
 }
 
 async function withTimeout(
@@ -29905,6 +30298,8 @@ function createCheckerSnapshotFactory(options) {
       }
     }
     const snapshotPath = path.join(options.snapshotRoot, `${hashText(checkerId)}-${crypto.randomBytes(8).toString('hex')}`)
+    fs.mkdirSync(snapshotPath, { mode: 0o700 })
+    options.cleanupRegistry.register({ path: snapshotPath, kind: 'checker-snapshot', owner: checkerId })
     const sourceEnvironment = options.gitEnvironment(sourcePath)
     const clone = childProcess.spawnSync('git', ['clone', '--no-local', '--no-hardlinks', '--', sourcePath, snapshotPath], {
       env: sourceEnvironment, encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024,
@@ -30032,7 +30427,6 @@ function createCheckerSnapshotFactory(options) {
         checkerId,
       })
     }
-    options.cleanupRegistry.register({ path: snapshotPath, kind: 'checker-snapshot', owner: checkerId })
     return projectionReceipt ? Object.freeze({ snapshotPath, projectionReceipt }) : snapshotPath
   }
 }
@@ -30045,8 +30439,10 @@ function createCheckerScratchFactory(options) {
   }
   const secret = crypto.randomBytes(32)
   const scratchRoot = path.resolve(options.scratchRoot)
+  const scratchRootExisted = fs.existsSync(scratchRoot)
   fs.mkdirSync(scratchRoot, { recursive: true, mode: 0o700 })
   if (process.platform !== 'win32') fs.chmodSync(scratchRoot, 0o700)
+  else if (!scratchRootExisted) ensureWindowsPrivateAcl(scratchRoot)
   try { auditPrivatePermissions(scratchRoot, { recurse: false }) } catch (error) {
     throw new SupervisorIntegrationError('CHECKER_SCRATCH_UNAVAILABLE', 'checker scratch authority root is not private and owner-only', { cause: error.message })
   }
@@ -30074,6 +30470,7 @@ function createCheckerScratchFactory(options) {
     } else {
       scratch = path.join(scratchRoot, `${hashText(checkerId)}-${crypto.randomBytes(8).toString('hex')}`)
       fs.mkdirSync(scratch, { recursive: false, mode: 0o700 })
+      ensureWindowsPrivateAcl(scratch)
       for (const child of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(scratch, child), { mode: 0o700 })
       options.cleanupRegistry.register({ path: scratch, kind: 'checker-scratch', owner: checkerId })
     }
@@ -30918,13 +31315,36 @@ function createDefaultRuntimeOptions(input) {
     activationId: activation.runId,
     generation,
   })
+  let windowsImmutableReadFiles
+  if (process.platform === 'win32' && (activation.providerId || 'codex') === 'codex') {
+    const sandboxIdentity = activationRecord.activationBoundary?.sandboxIdentity
+    const users = sandboxIdentity?.setupState?.users
+    const lease = sandboxIdentity?.networkLease
+    if (!users || !lease || users.sha256 !== lease.usersSha256) {
+      throw new SupervisorIntegrationError(
+        'PROVIDER_UNSUPPORTED', 'Windows Codex requires its activation-owned network lease',
+      )
+    }
+    require('./windows-codex-network-lease.js').verifyWindowsCodexNetworkLease({
+      activationRoot: activation.activationRoot,
+      activationId: activation.runId,
+      targetPath,
+    }, lease)
+    windowsImmutableReadFiles = [{ path: users.path, sha256: users.sha256 }]
+  }
   const processAdapter = context.processAdapter || (process.platform === 'win32'
     ? createWindowsJobAdapter({
         controlRoot: boundRecord.paths.processControl,
         providerPrivateOwnershipRoot: path.dirname(activation.activationRoot),
         trustedOwnershipRoots: [path.dirname(activation.activationRoot)],
+        immutableReadFiles: windowsImmutableReadFiles,
       })
-    : createPosixProcessAdapter())
+    : process.platform === 'darwin'
+      ? createPlatformProcessAdapter({ platform: 'darwin', darwin: {
+          controlRoot: boundRecord.paths.processControl,
+          providerPrivateOwnershipRoot: path.dirname(activation.activationRoot),
+        } })
+      : createPosixProcessAdapter())
   const processOwner = new ProcessOwner({
     adapter: processAdapter,
     registryPath: boundRecord.paths.processRegistry,
@@ -30991,6 +31411,14 @@ function createDefaultRuntimeOptions(input) {
       workerWorkspaceManager = new WorkerWorkspaceManager({
         targetRoot: targetPath,
         privateRoot: path.join(activation.activationRoot, 'worker-workspaces'),
+        ...(process.platform === 'win32' ? {
+          workspaceRoot: resolveWorkerWorkspaceRoot({
+            workspaceRoot: path.join(activation.activationRoot, 'worker-workspaces', 'workspaces'),
+            cleanupRegistry,
+            owner: activation.runId,
+          }),
+          cleanupRegistry,
+        } : {}),
         environment: targetGitEnvironment,
         runId: activation.runId,
         activationId: activation.runId,
@@ -31651,6 +32079,26 @@ function createDefaultRuntimeOptions(input) {
       processIdentity: processIdentityForPid(process.pid),
     },
     beforeMissionAcquire: async () => {
+      // Darwin command tools own independent launchd coalitions. They are not
+      // descendants of the provider runner, so generation recovery must drain
+      // their authenticated policy registries before admitting new work.
+      if (process.platform === 'darwin' && context.executionAdapterOptions?.nativeRoot !== undefined) {
+        const nativeRoot = context.executionAdapterOptions.nativeRoot
+        const provider = context.executionAdapterOptions.provider
+        const expectedNativeRoot = path.join(activation.activationRoot, 'native')
+        if (typeof nativeRoot !== 'string' || path.resolve(nativeRoot) !== path.resolve(expectedNativeRoot) ||
+            typeof provider !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(provider)) {
+          throw new SupervisorIntegrationError('PROCESS_OWNER_CONFIG_INVALID', 'Darwin command recovery requires the activation-bound native root and provider')
+        }
+        if (fs.existsSync(nativeRoot)) {
+          const discovery = require('./command-owner-discovery.js')
+          for (const recoveryGeneration of generation > 1 ? [generation - 1, generation] : [generation]) {
+            const binding = { provider, activationId: activation.runId, generation: recoveryGeneration }
+            const registryRoot = discovery.createDiscoveryRoot(nativeRoot, binding)
+            await discovery.drainAuthenticated(registryRoot, binding, { providerPrivateOwnershipRoot: nativeRoot })
+          }
+        }
+      }
       if (generation > 1) {
         await processOwner.recoverReservations()
         for (const owned of processOwner.listRecords().filter(item => item.status === 'RUNNING')) {
@@ -31742,6 +32190,18 @@ function createDefaultRuntimeOptions(input) {
         ...record.paths.cleanupRegistry,
         fsImpl: runtimeFs,
         allowedRoots: [activation.activationRoot],
+        ...(process.platform === 'win32' ? {
+          externalRootValidator: createWindowsGitRootValidator({ owner: activation.runId }),
+          retainEntry: entry => entry.kind === 'worker-workspace'
+            ? retainWorkerWorkspaceForRecovery({
+              targetRoot: targetPath,
+              privateRoot: path.join(activation.activationRoot, 'worker-workspaces'),
+              workspaceRoot: cleanupRegistry.getExternalRoot('windows-worker-workspaces')?.path,
+              cleanupRegistry,
+              runId: activation.runId,
+              activationId: activation.runId,
+            }, entry) : false,
+        } : {}),
         controlBinding: {
           activationId: activation.runId,
           generationId: generation,
@@ -32298,7 +32758,11 @@ function createDefaultRuntimeOptions(input) {
         adapterKind: processProbe.adapterKind,
         probeHash: processProbe.probeHash,
       })
-      const snapshotRoot = path.join(activation.activationRoot, 'checker-snapshots')
+      const snapshotRoot = resolveCheckerSnapshotRoot({
+        snapshotRoot: path.join(activation.activationRoot, 'checker-snapshots'),
+        cleanupRegistry,
+        owner: activation.runId,
+      })
       runtimeOptions.checkerSnapshotFactory = createCheckerSnapshotFactory({
         targetPath,
         snapshotRoot,
@@ -32318,6 +32782,10 @@ function createDefaultRuntimeOptions(input) {
         targetPath,
       })
       runtimeOptions.validateCheckerSnapshot = candidate => {
+        if (process.platform === 'win32' &&
+            cleanupRegistry.getExternalRoot('windows-checker-snapshots')?.path !== snapshotRoot) {
+          throw new SupervisorIntegrationError('CRASH_ADOPTION_CONFLICT', 'checker storage no longer has its registered physical authority')
+        }
         const resolved = path.resolve(candidate)
         const root = fs.realpathSync.native(snapshotRoot)
         const real = fs.realpathSync.native(resolved)
@@ -33683,6 +34151,7 @@ module.exports = {
   renderPlanArtifact,
   runSupervisorCli,
   runOwnedCodexProxy,
+  projectWindowsClaudeTempEnvironment,
   safeEnvironmentFactory,
   selectWorkRecipe,
   serializeError,

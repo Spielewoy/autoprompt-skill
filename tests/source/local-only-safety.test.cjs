@@ -131,6 +131,109 @@ function boundaryEnvironment(context) {
   })
 }
 
+test('native Git checker snapshots preserve exact bytes beyond Windows MAX_PATH under the local-only boundary', t => {
+  const context = makeRepo(t)
+  const target = fs.realpathSync.native(context.repo)
+  const file = path.join(target, 'candidate.txt')
+  fs.writeFileSync(file, 'committed candidate\n')
+  git(context, ['add', '--', 'candidate.txt'])
+  git(context, ['-c', 'user.name=Snapshot Test', '-c', 'user.email=snapshot@example.invalid',
+    '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'snapshot fixture'])
+  git(context, ['config', '--local', 'core.longpaths', 'false'])
+  const originalHead = git(context, ['rev-parse', 'HEAD']).stdout.trim()
+  const originalConfig = fs.readFileSync(path.join(target, '.git', 'config'))
+  fs.writeFileSync(file, 'exact dirty candidate\n')
+  let snapshotRoot = fs.realpathSync.native(context.sandbox)
+  while (snapshotRoot.length < 300) snapshotRoot = path.join(snapshotRoot, 'deep-checker-snapshot')
+  const options = { configIsolationPath: context.configIsolation, ghConfigDir: context.ghConfigDir }
+  const environment = createSafeChildGitEnvironment(target, context.env, options)
+  assert.equal(run('git', ['-C', target, 'config', '--get', 'core.longpaths'], { env: environment }).stdout.trim(), 'true')
+  const owner = 'native-deep-snapshot'
+  const { CleanupRegistry } = require('../../agents/codex/workflow/finalizer.js')
+  const { resolveCheckerSnapshotRoot, createWindowsCheckerRootValidator } = require('../../agents/codex/workflow/windows-checker-root.js')
+  const sandbox = fs.realpathSync.native(context.sandbox)
+  let runtimeFs = fs
+  if (process.platform === 'darwin') {
+    const python = process.env.AUTOPROMPT_REAL_DARWIN_PYTHON
+    assert.equal(typeof python, 'string', 'Darwin native filesystem tests require the pinned Python runtime')
+    const wrapper = require('../../agents/codex/workflow/darwin-filesystem.js')
+    const options = {
+      python,
+      helper: path.join(ROOT, 'agents/codex/workflow/darwin-filesystem.py'),
+    }
+    runtimeFs = Object.create(fs)
+    runtimeFs.darwinCapture = wrapper.createDarwinFilesystemCapture(options)
+    runtimeFs.darwinMutations = wrapper.createDarwinFilesystemMutations(options)
+  }
+  if (process.platform === 'win32') {
+    require('../../agents/codex/workflow/safe-run-root.js').ensureWindowsPrivateAcl(sandbox)
+    const native = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
+    runtimeFs = Object.assign(Object.create(fs), { windowsCapture: native, windowsMutations: native })
+  }
+  const cleanupRegistry = new CleanupRegistry({
+    registryPath: path.join(sandbox, 'snapshot-cleanup.json'), allowedRoots: [sandbox], fsImpl: runtimeFs,
+    controlBinding: { activationId: owner, generationId: 1 },
+    ...(process.platform === 'win32' ? { externalRootValidator: createWindowsCheckerRootValidator({ owner }) } : {}),
+  })
+  fs.mkdirSync(snapshotRoot, { recursive: true })
+  assert.ok(snapshotRoot.length >= 300)
+  const selectedRoot = resolveCheckerSnapshotRoot({ snapshotRoot, cleanupRegistry, owner })
+  const snapshotOptions = {
+    targetPath: target, snapshotRoot: selectedRoot, expectedBranch: EXPECTED_BRANCH,
+    runId: owner, generation: 1,
+    gitEnvironment: repository => createSafeChildGitEnvironment(repository, context.env, options),
+    enforcementProofPath: context.proofPath, safetyScriptPath: CHECKER, cleanupRegistry,
+  }
+  const { createCheckerSnapshotFactory } = require('../../agents/codex/workflow/phase-budget.js')
+  const factory = createCheckerSnapshotFactory(snapshotOptions)
+  let snapshot
+  try {
+    snapshot = factory('native-deep-checker', [])
+  } catch (error) {
+    t.diagnostic(`Native Git snapshot failure: ${JSON.stringify(error.details || {}).slice(0, 8192)} root=${selectedRoot}`)
+    throw error
+  }
+  assert.ok(process.platform === 'win32' ? snapshot.length < 220 : snapshot.length > 300)
+  assert.equal(fs.readFileSync(path.join(snapshot, 'candidate.txt'), 'utf8'), 'exact dirty candidate\n')
+  const head = run('git', ['-C', snapshot, 'rev-parse', 'HEAD'], { env: environment })
+  assert.equal(head.status, 0, head.stderr)
+  assert.equal(head.stdout.trim(), originalHead)
+  assert.deepEqual(fs.readFileSync(path.join(target, '.git', 'config')), originalConfig)
+  assert.equal(environment.GIT_ALLOW_PROTOCOL, 'file')
+  assert.equal(run('git', ['-C', snapshot, 'config', '--get', 'protocol.allow'], { env: environment }).stdout.trim(), 'never')
+  const registered = cleanupRegistry.load().entries.filter(entry => entry.kind === 'checker-snapshot')
+  assert.equal(registered.length, 1)
+  assert.equal(registered[0].path, snapshot)
+  assert.equal(registered[0].owner, 'native-deep-checker')
+  const failedFactory = createCheckerSnapshotFactory({ ...snapshotOptions, gitEnvironment: () => environment })
+  assert.throws(() => failedFactory('failed-clone-checker', [], path.join(sandbox, 'missing-source')), error =>
+    error.code === 'SNAPSHOT_CREATION_FAILED')
+  const failedClone = cleanupRegistry.load().entries.find(entry => entry.owner === 'failed-clone-checker')
+  assert.ok(failedClone, 'failed clone storage is registered before Git can write partial bytes')
+  assert.equal(failedClone.status, 'REGISTERED')
+  try { cleanupRegistry.run() } catch (error) {
+    const remaining = []
+    const visit = directory => {
+      for (const name of fs.readdirSync(directory)) {
+        if (remaining.length >= 128) return
+        const filename = path.join(directory, name), item = fs.lstatSync(filename, { bigint: true })
+        remaining.push({ path: path.relative(selectedRoot, filename), ino: String(item.ino),
+          mode: String(item.mode), links: String(item.nlink), bytes: String(item.size) })
+        if (item.isDirectory() && !item.isSymbolicLink()) visit(filename)
+      }
+    }
+    try { visit(selectedRoot) } catch {}
+    t.diagnostic(`Owned snapshot cleanup refused: ${JSON.stringify({ code: error.code,
+      expected: registered[0].targetIdentity, remaining }).slice(0, 8192)}`)
+    throw error
+  }
+  assert.equal(fs.existsSync(snapshot), false)
+  assert.equal(fs.existsSync(failedClone.path), false)
+  if (process.platform === 'win32') assert.equal(fs.existsSync(selectedRoot), false)
+  assert.equal(fs.readFileSync(file, 'utf8'), 'exact dirty candidate\n')
+  assert.deepEqual(fs.readFileSync(path.join(target, '.git', 'config')), originalConfig)
+})
+
 function invoke(context, expectedBranch = EXPECTED_BRANCH, extra = [], options = {}) {
   const environment = options.boundary === false ? context.env : boundaryEnvironment(context)
   const result = run(process.execPath, [

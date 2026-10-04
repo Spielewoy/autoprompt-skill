@@ -543,7 +543,10 @@ function inspectProvider(provider, options, evidenceRoot) {
         const value = (options.env || process.env)[key]
         if (typeof value === 'string') nativeEnv[key] = value
       }
-      const tested = capture(directory, 'native-tests', process.execPath, plan.argv, nativeEnv, options.spawnSync, 720000)
+      // Match the bounded Windows startup allowance used by closed canaries.
+      // The complete actual-provider suite may contain eleven cold owned Jobs.
+      const nativeTimeoutMs = process.platform === 'win32' ? 720000 + plan.cases.length * 120000 : 720000
+      const tested = capture(directory, 'native-tests', process.execPath, plan.argv, nativeEnv, options.spawnSync, nativeTimeoutMs)
       const counts = testSummary(tested.stdout)
       const cases = selectedCaseSummary(tested.stdout, plan.cases)
       const complete = suiteCompleted(tested, counts, cases)

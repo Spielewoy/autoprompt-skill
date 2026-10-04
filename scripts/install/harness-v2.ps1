@@ -45,18 +45,24 @@ function Uninstall-HarnessV2Lifecycle {
 }
 function Get-HarnessV2Status {
     param([string]$Client)
-    $det = Invoke-LibCapture -Call { Detect-Client -Name $Client }
-    $detected = if ($det.Code -eq 0) { 'yes' } else { 'no' }
-    $version = if ($det.Code -eq 0) { $det.Record -replace '^.*version=', '' } else { '-' }
-    $installed = 'no'; $verifies = 'no'; $reason = 'not-installed'
+    $detected = 'no'; $version = '-'
+    $installed = 'no'; $verifies = 'no'; $reason = 'not-installed'; $activation = 'unavailable'; $payload = 'unverified'; $message = ''
     try {
-        $root = Get-HarnessV2Root -Client $Client
+        $root = if ($Client -ceq 'reasonix') { Get-ConfigRoot -Client $Client } else { Get-HarnessV2Root -Client $Client }
         if (Test-Path -LiteralPath (Join-Path $root ".autoprompt-$Client-v2.json")) {
             $installed = 'yes'
-            & node (Join-Path $RepoRoot 'scripts/harness-v2-package.cjs') doctor $Client --root $root *> $null
-            if ($LASTEXITCODE -eq 0) { $verifies = 'yes'; $reason = '-' }
-            else { $reason = 'payload-invalid' }
-        }
+            $arguments = if ($Client -ceq 'reasonix') { @((Join-Path $RepoRoot 'scripts/reasonix-package.cjs'), 'doctor', '--root', $root) } else { @((Join-Path $RepoRoot 'scripts/harness-v2-package.cjs'), 'doctor', $Client, '--root', $root) }
+            $output = @(& node @arguments 2>$null)
+            $code = $LASTEXITCODE
+            try {
+                $result = ($output -join "`n") | ConvertFrom-Json -ErrorAction Stop
+                if ($result.payload -cne 'verified' -or $result.activation -cnotin @('unavailable','local-canary-required','static-ready;dynamic-preflight-required')) { throw 'Invalid doctor response' }
+                $detected = if ($result.detected -eq $true) { 'yes' } else { 'no' }
+                if ($result.nativeVersion -is [string] -and $result.nativeVersion -cmatch '^[A-Za-z0-9.+-]+$') { $version = $result.nativeVersion }
+                $payload = $result.payload; $activation = $result.activation; $reason = $result.reason; $message = $result.message
+                if ($code -eq 0 -and $activation -cne 'unavailable') { $verifies = 'yes' }
+            } catch { $reason = 'payload-invalid' }
+        } elseif (Get-Command $AutopromptClientBin[$Client] -ErrorAction SilentlyContinue) { $detected = 'yes' }
     } catch { $reason = 'invalid-root' }
-    return @{ Detected = $detected; Installed = $installed; Verifies = $verifies; Version = $version; Reason = $reason; Extras = $(if ($verifies -ceq 'yes') { 'complete' } else { 'missing' }); Mode = '-'; Support = 'degraded'; Activation = 'attestation-required' }
+    return @{ Detected = $detected; Installed = $installed; Verifies = $verifies; Version = $version; Reason = $reason; Extras = $(if ($payload -ceq 'verified') { 'complete' } else { 'missing' }); Mode = '-'; Support = 'degraded'; Activation = $activation; Payload = $payload; Message = $message }
 }

@@ -179,6 +179,49 @@ test('admission verifies a signed provider-scoped runtime fixture and binds non-
   assert.throws(f.verify, { code: 'PROVIDER_UNSUPPORTED' })
 })
 
+function activationPrivacyFixture(t) {
+  const f = signedFixture(t), root = fixture(t)
+  const packaging = require('../../scripts/harness-v2-package.cjs')
+  t.mock.method(packaging, 'verify', () => f.installed)
+  t.mock.method(native, 'probeExecutable', () => f.executable)
+  t.mock.method(native, 'connectionConfig', () => ({}))
+  t.mock.method(native, 'credentialEnvironment', () => ({}))
+  const activationId = `apv2-${'c'.repeat(32)}`
+  const parent = path.join(root, '.autoprompt-private', 'activations')
+  const activationRoot = path.join(parent, activationId)
+  return { parent, activationRoot, run: () => configure.prepareActivation({
+    provider: f.provider, root, target: root, activationId, missionArgs: ['private creation boundary'],
+  }) }
+}
+
+for (const boundary of ['parent', 'activationRoot']) test(`activation publishes no private data when ${boundary} ACL establishment fails`, t => {
+  const f = activationPrivacyFixture(t)
+  const privacy = require('../../agents/codex/workflow/safe-run-root.js')
+  const original = privacy.ensureWindowsPrivateAcl, calls = [], failure = new Error('private ACL establishment failed')
+  t.mock.method(privacy, 'ensureWindowsPrivateAcl', directory => {
+    calls.push(directory)
+    if (directory === f[boundary]) throw failure
+    return original(directory)
+  })
+  assert.throws(f.run, error => error === failure)
+  assert.deepEqual(calls, boundary === 'parent' ? [f.parent] : [f.parent, f.activationRoot])
+  assert.deepEqual(fs.readdirSync(f[boundary]), [])
+  if (boundary === 'parent') assert.equal(fs.existsSync(f.activationRoot), false)
+})
+
+test('activation collision cannot relabel or overwrite an existing owned root', t => {
+  const f = activationPrivacyFixture(t)
+  const privacy = require('../../agents/codex/workflow/safe-run-root.js')
+  fs.mkdirSync(f.activationRoot, { recursive: true, mode: 0o700 })
+  privacy.ensureWindowsPrivateAcl(f.parent)
+  const sentinel = path.join(f.activationRoot, 'sentinel')
+  fs.writeFileSync(sentinel, 'existing private state', { mode: 0o600 })
+  t.mock.method(privacy, 'ensureWindowsPrivateAcl', () => { throw new Error('existing storage must not be relabeled') })
+  assert.throws(f.run, { code: 'EEXIST' })
+  assert.deepEqual(fs.readdirSync(f.activationRoot), ['sentinel'])
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'existing private state')
+})
+
 test('explicit private import requires a reviewer-signed request digest and never mutates shipped trust', t => {
   const f = signedFixture(t)
   const requestSha256 = 'd'.repeat(64)

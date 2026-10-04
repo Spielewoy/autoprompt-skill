@@ -1,0 +1,108 @@
+'use strict'
+
+const fs = require('node:fs')
+const path = require('node:path')
+const { createPlatformProcessAdapter } = require('../../agents/codex/workflow/process-owner.js')
+const { ensureWindowsPrivateAcl } = require('../../agents/codex/workflow/safe-run-root.js')
+
+function privateDirectory(directory) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+  ensureWindowsPrivateAcl(directory)
+  return fs.realpathSync.native(directory)
+}
+
+function nativeProcessAdapter(registryPath, ownershipRoot = path.dirname(registryPath)) {
+  const controlRoot = path.join(path.dirname(registryPath), 'process-control')
+  const platform = process.platform
+  return createPlatformProcessAdapter({ platform,
+    ...(platform === 'win32' ? { windows: { controlRoot, providerPrivateOwnershipRoot: ownershipRoot, trustedOwnershipRoots: [ownershipRoot] } } : {}),
+    ...(platform === 'darwin' ? { darwin: { controlRoot, providerPrivateOwnershipRoot: ownershipRoot } } : {}),
+  })
+}
+
+// AppContainer deliberately exposes its verified copy of Node through PATH.
+// An absolute host executable would exercise the wrong resource boundary.
+// Base64 also preserves Windows backslashes and arbitrary fixture filenames
+// through both POSIX Bash and the restricted Git Bash command backend.
+function nodeCommand(source) {
+  const encoded = Buffer.from(source, 'utf8').toString('base64')
+  return `node -e "eval(Buffer.from('${encoded}','base64').toString('utf8'))"`
+}
+
+function readCommand(file) {
+  return nodeCommand(`process.stdout.write(require('node:fs').readFileSync(${JSON.stringify(file)}))`)
+}
+
+function withChallenge(command, challenge) {
+  return `${command} && ${nodeCommand(`process.stdout.write(${JSON.stringify(`\nCLOSED_CANARY_CHALLENGE:${challenge}\n`)})`)}`
+}
+
+function requiredNativeCli(provider) {
+  const variable = `AUTOPROMPT_${provider.toUpperCase()}_TEST_CLI`
+  const executable = process.env[variable]
+  if (process.env.AUTOPROMPT_REQUIRE_NATIVE_TESTS === '1' && !executable) throw new Error(`${variable} is required; native certification cannot skip`)
+  if (executable && (!path.isAbsolute(executable) || !fs.statSync(executable).isFile())) throw new Error(`${variable} must name an installed native executable`)
+  return executable
+}
+
+function nativeEnvironment() {
+  const environment = { PATH: process.env.PATH }
+  if (process.platform === 'win32') {
+    for (const wanted of ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT']) {
+      const key = Object.keys(process.env).find(name => name.toLowerCase() === wanted.toLowerCase())
+      if (key) environment[wanted] = process.env[key]
+    }
+  }
+  return environment
+}
+
+async function drainNativeCommandOwners(nativeRoot, provider, record) {
+  if (process.platform !== 'darwin') return { discovered: 0 }
+  if (!nativeRoot || !provider || !record?.activationId || !Number.isSafeInteger(record.generation) || record.generation < 1) {
+    throw new TypeError('Invalid native command-owner cleanup binding')
+  }
+  return require('../../scripts/harness-v2-command-owner-discovery.cjs').drainTrustedProviderRoot(nativeRoot, {
+    provider, activationId: record.activationId, generation: record.generation,
+  })
+}
+
+async function cleanupNativeFixture(fixture, provider, options = {}) {
+  let failure = null
+  try { await options.stop?.() } catch (error) { failure ||= error }
+  try { await drainNativeCommandOwners(fixture.nativeRoot, provider, fixture.record) } catch (error) { failure ||= error }
+  try { await options.close?.() } catch (error) { failure ||= error }
+  // Retain fixture state if authenticated secondary recovery could not finish.
+  if (failure) throw failure
+  fs.rmSync(fixture.root, { recursive: true, force: true })
+}
+
+async function waitForNativeObservation(pending, predicate, timeoutMs, description) {
+  if (!pending || typeof pending.then !== 'function' || typeof predicate !== 'function' ||
+      !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || typeof description !== 'string' || !description) {
+    throw new TypeError('Invalid native observation wait')
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false, timer
+    const deadline = performance.now() + timeoutMs
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      callback(value)
+    }
+    pending.then(() => {
+      finish(reject, new Error(`${description} settled before readiness was observed`))
+    }, error => finish(reject, error))
+    const check = () => {
+      if (settled) return
+      if (performance.now() >= deadline) { finish(reject, new Error(`Timed out waiting for ${description}`)); return }
+      let ready
+      try { ready = predicate() } catch (error) { finish(reject, error); return }
+      if (ready) { finish(resolve, true); return }
+      timer = setTimeout(check, 25)
+    }
+    timer = setTimeout(check, 0)
+  })
+}
+
+module.exports = { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, requiredNativeCli, nativeEnvironment, drainNativeCommandOwners, cleanupNativeFixture, waitForNativeObservation }

@@ -11,3 +11,26 @@ scripts/release/codex/** text eol=lf
 agents/contracts/** text eol=lf
 scripts/install/*.json text eol=lf
 scripts/install/codex-discovery-shim.md text eol=lf
+tests/fixtures/windows-msys/compiler-stage.sha256 text eol=lf
+
+# Descriptor proof sources and binding inputs require exact LF bytes.
+scripts/windows-msys/descriptor-proof/** text eol=lf
+
+# Frozen compiler-smoke source and its derivation hashes require identical bytes.
+scripts/windows-msys/diagnostic-smoke/** text eol=lf
+
+# Manual trace generators and hash-bound header inputs use exact LF bytes.
+scripts/windows-msys/pipe-io-trace/** text eol=lf
+
+# Exact corresponding-source archives are separate from installed runtime assets.
+release-source/**/*.gz -text
+release-source/**/*.xz -text
+release-source/**/*.part-* -text
+release-source/**/*.json text eol=lf
+
+# Preserve the exact bundled executable, compressed, and original notice bytes.
+agents/codex/workflow/windows-worker/bootstrap/*.exe -text
+agents/codex/workflow/windows-worker/bundle/assets/*.br -text
+agents/codex/workflow/windows-worker/notices/THIRD-PARTY-NOTICES.txt -text
+# Preserve authenticated native Mach-O helper bytes.
+agents/codex/workflow/darwin-coalition-runtime/coalition-helper-* -text

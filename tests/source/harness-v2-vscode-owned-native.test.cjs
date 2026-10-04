@@ -10,37 +10,193 @@ const test = require('node:test')
 const native = require('../../scripts/harness-v2-native.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter } = require('../../agents/codex/workflow/process-owner.js')
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { privateDirectory, nativeProcessAdapter, nativeEnvironment, nodeCommand, cleanupNativeFixture, drainNativeCommandOwners } = require('../helpers/native-platform.cjs')
 const enabled = Boolean(process.env.AUTOPROMPT_VSCODE_TEST_CLI)
 
+function boundedProxyFile(file) {
+  try {
+    const stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 32 * 1024) return null
+    return { bytes: stat.size, base64: fs.readFileSync(file).toString('base64') }
+  } catch { return null }
+}
+const VSCODE_PROXY_MARKERS = Object.freeze([
+  ['lm-part', '[LM] report response PART'],
+  ['lm-done', '[LM] report response DONE'],
+  ['chat-started', '[CHAT] request STARTED'],
+  ['chat-failed', '[CHAT] request FAILED'],
+  ['chat-part', '[CHAT] request PART'],
+  ['chat-done', '[CHAT] request DONE'],
+  ['chat-stream-error', '[CHAT] extension request ERRORED in STREAM'],
+  ['chat-extension-done', '[CHAT] extension request DONE'],
+  ['chat-extension-error', '[CHAT] extension request ERRORED'],
+])
+function boundedProxyStdout(file) {
+  const maximum = 256 * 1024
+  let descriptor
+  try {
+    const before = fs.lstatSync(file, { bigint: true })
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) return null
+    descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+    const opened = fs.fstatSync(descriptor, { bigint: true })
+    if (!opened.isFile() || opened.nlink !== 1n || !sameProxyIdentity(before, opened)) return null
+    const length = Number(opened.size > BigInt(maximum) ? BigInt(maximum) : opened.size)
+    const buffer = Buffer.alloc(length)
+    const offset = opened.size - BigInt(length)
+    let read = 0
+    while (read < length) {
+      const count = fs.readSync(descriptor, buffer, read, length - read, Number(offset) + read)
+      if (!count) break
+      read += count
+    }
+    const after = fs.lstatSync(file, { bigint: true })
+    if (!sameProxyIdentity(opened, after)) return null
+    const counts = Object.fromEntries(VSCODE_PROXY_MARKERS.map(([name]) => [name, 0]))
+    const text = buffer.subarray(0, read).toString('utf8')
+    for (const line of text.split(/\r?\n/u)) {
+      for (const [name, marker] of VSCODE_PROXY_MARKERS) if (line.includes(marker)) counts[name]++
+    }
+    return { bytes: Number(opened.size), tailBytes: read, truncated: opened.size > BigInt(read), lines: text.split(/\r?\n/u).length, markers: counts }
+  } catch { return null } finally { if (descriptor !== undefined) try { fs.closeSync(descriptor) } catch {} }
+}
+function sameProxyIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
+}
+function proxyDiagnostic(runner) {
+  const directories = fs.readdirSync(runner.controlRoot, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && /^[a-f0-9]{32}$/.test(entry.name))
+    .map(entry => path.join(runner.controlRoot, entry.name))
+  return directories.map(directory => ({
+    stdout: boundedProxyStdout(path.join(directory, 'stdout.jsonl')),
+    stderr: boundedProxyFile(path.join(directory, 'stderr.log')),
+    status: boundedProxyFile(path.join(directory, 'status.json')),
+    proxyError: boundedProxyFile(path.join(directory, 'proxy-error.json')),
+  }))
+}
+function boundedHostLog(file) {
+  try {
+    const stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 2 * 1024 * 1024) return null
+    const bytes = fs.readFileSync(file)
+    const tail = bytes.subarray(Math.max(0, bytes.length - 128 * 1024)).toString('utf8')
+    const lines = tail.split(/\r?\n/).filter(line =>
+      /AUTOPROMPT_SESSION_DRIVER|AUTOPROMPT_OWNED_SESSION|AUTOPROMPT_EVENT|Extension host test runner|Test runner|Eager extensions activated|\[(?:error|warn)\]|(?:^|\s)Error:/.test(line))
+      .slice(-64)
+      .map(line => line.slice(0, 1024))
+    return lines.length ? lines : null
+  } catch { return null }
+}
+const VSCODE_TRACE_STAGES = Object.freeze([
+  ['lm-part', '[LM] report response PART'],
+  ['lm-done', '[LM] report response DONE'],
+  ['chat-started', '[CHAT] request STARTED'],
+  ['chat-failed', '[CHAT] request FAILED'],
+  ['chat-part', '[CHAT] request PART'],
+  ['chat-done', '[CHAT] request DONE'],
+  ['chat-stream-error', '[CHAT] extension request ERRORED in STREAM'],
+  ['chat-extension-done', '[CHAT] extension request DONE'],
+  ['chat-extension-error', '[CHAT] extension request ERRORED'],
+])
+function boundedVscodeTrace(file) {
+  let descriptor
+  try {
+    const before = fs.lstatSync(file, { bigint: true })
+    if (!before.isFile() || before.isSymbolicLink()) return null
+    descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+    const opened = fs.fstatSync(descriptor, { bigint: true })
+    if (!opened.isFile() || before.dev !== opened.dev || before.ino !== opened.ino) return null
+    if (opened.size > BigInt(Number.MAX_SAFE_INTEGER)) return null
+    const maximum = 256 * 1024
+    const length = Number(opened.size > BigInt(maximum) ? BigInt(maximum) : opened.size)
+    const bytes = Buffer.alloc(length)
+    const offset = opened.size - BigInt(length)
+    let read = 0
+    while (read < bytes.length) {
+      const count = fs.readSync(descriptor, bytes, read, bytes.length - read, Number(offset) + read)
+      if (!count) break
+      read += count
+    }
+    const after = fs.lstatSync(file, { bigint: true })
+    if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || after.mtimeNs !== opened.mtimeNs || after.ctimeNs !== opened.ctimeNs) return null
+    const counts = Object.fromEntries(VSCODE_TRACE_STAGES.map(([stage]) => [stage, 0]))
+    const requests = new Map()
+    for (const line of bytes.subarray(0, read).toString('utf8').split(/\r?\n/)) {
+      const matched = VSCODE_TRACE_STAGES.find(([, marker]) => line.includes(marker))
+      if (!matched) continue
+      const [stage, marker] = matched
+      counts[stage]++
+      const suffix = line.slice(line.indexOf(marker) + marker.length)
+      const requestId = suffix.match(/(?:^|\s)(\d{1,10})(?=\s|$)/)?.[1]
+      if (!requestId || (!requests.has(requestId) && requests.size >= 64)) continue
+      const stages = requests.get(requestId) || []
+      if (stages.length < 16) stages.push(stage)
+      requests.set(requestId, stages)
+    }
+    const observed = Object.values(counts).reduce((sum, count) => sum + count, 0)
+    return observed ? {
+      bytes: Number(opened.size),
+      tailBytes: read,
+      truncated: opened.size > BigInt(read),
+      counts,
+      requests: [...requests].map(([requestId, stages]) => ({ requestId, stages })),
+    } : null
+  } catch { return null } finally { if (descriptor !== undefined) try { fs.closeSync(descriptor) } catch {} }
+}
+function vscodeHostDiagnostic(nativeRoot, record) {
+  // The runner only captures VS Code's parent stdout. Extension-host console
+  // output, including the fixed session-driver markers, is written here.
+  // Build the exact launch root from authenticated fixture identities rather
+  // than walking an arbitrary private tree.
+  const root = path.join(nativeRoot, 'vscode', native.sha256(record.sessionId), native.sha256(record.reservationId), 'home', 'user-data', 'logs')
+  let entries
+  try {
+    const stat = fs.lstatSync(root)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return []
+    entries = fs.readdirSync(root, { withFileTypes: true })
+  } catch { return [] }
+  return entries.filter(entry => entry.isDirectory() && /^\d{8}T\d{6}$/.test(entry.name)).sort((a, b) => b.name.localeCompare(a.name)).slice(0, 2).flatMap(entry => {
+    const relativeLogs = ['main.log', 'window1/renderer.log', 'window1/exthost/exthost.log']
+    return relativeLogs.flatMap(relative => {
+      const file = path.join(root, entry.name, ...relative.split('/'))
+      const trace = boundedVscodeTrace(file)
+      const lines = boundedHostLog(file)
+      return trace || lines ? [{ log: `${entry.name}/${relative}`, ...(trace ? { trace } : {}), ...(lines ? { lines } : {}) }] : []
+    })
+  })
+}
 function closedBinding() {
   const names = ['AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT', 'AUTOPROMPT_CLOSED_CANARY_PROVIDER', 'AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID', 'AUTOPROMPT_CLOSED_CANARY_GENERATION', 'AUTOPROMPT_CLOSED_CANARY_CHALLENGE']
   const value = Object.fromEntries(names.map(name => [name, process.env[name]]))
   if (!names.some(name => value[name] !== undefined)) return null
   if (names.some(name => typeof value[name] !== 'string' || !value[name]) || value.AUTOPROMPT_CLOSED_CANARY_PROVIDER !== 'vscode' || !path.isAbsolute(value.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT) || !/^\d+$/.test(value.AUTOPROMPT_CLOSED_CANARY_GENERATION) || !/^[A-Za-z0-9_-]{43}$/.test(value.AUTOPROMPT_CLOSED_CANARY_CHALLENGE)) throw new Error('closed canary VS Code binding is invalid')
-  return { root: value.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT, activationId: value.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID, generation: Number(value.AUTOPROMPT_CLOSED_CANARY_GENERATION), challenge: value.AUTOPROMPT_CLOSED_CANARY_CHALLENGE }
+  const root = privateDirectory(value.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT), stat = fs.statSync(root)
+  if (!stat.isDirectory() || (process.platform !== 'win32' && (stat.mode & 0o077))) throw new Error('closed canary VS Code ownership root is not private')
+  return { root, activationId: value.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID, generation: Number(value.AUTOPROMPT_CLOSED_CANARY_GENERATION), challenge: value.AUTOPROMPT_CLOSED_CANARY_CHALLENGE }
 }
 
 async function fixture(t, options = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-vscode-owned-'))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'ap-vscode-owned-')))
   const target = path.join(root, 'target'), controller = path.join(root, 'controller'), nativeRoot = path.join(controller, 'native')
-  for (const dir of [target, controller, nativeRoot]) fs.mkdirSync(dir, { mode: 0o700 })
+  for (const dir of [target, controller, nativeRoot]) privateDirectory(dir)
   const closed = closedBinding()
   const projection = core.createCanonicalMissionProjection('Read the assigned candidate and return {"ok":true}.')
   const record = { activationId: closed?.activationId || 'vscode-owned-native', generation: closed?.generation || 1, workItemId: 'read', sessionId: crypto.randomUUID(), reservationId: crypto.randomUUID(), logicalRole: 'worker', providerRole: 'ap-worker', physicalRole: 'ap-worker', canonicalMission: projection.canonicalMission, workingDirectory: target, dispatch: { requestPointer: { hash: native.sha256('native vscode assignment') } } }
   record.missionBinding = core.bindCanonicalMissionForChild(projection, { ...record, sourceRequestHash: projection.sourceRequestHash, requestEnvelopeHash: record.dispatch.requestPointer.hash })
   record.physicalExecutionPolicy = { logicalRole: 'worker', providerRole: 'ap-worker', physicalRole: 'ap-worker', sandboxMode: 'read-only' }
-  record.environment = Object.fromEntries(['PATH', 'DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR'].filter(name => process.env[name]).map(name => [name, process.env[name]]))
+  const environment = { ...nativeEnvironment(), ...Object.fromEntries(['DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR'].filter(name => process.env[name]).map(name => [name, process.env[name]])) }
   const scratch = path.join(nativeRoot, 'vscode', native.sha256(record.sessionId), native.sha256(record.reservationId), 'scratch')
   const schema = path.join(controller, 'schema.json')
   fs.writeFileSync(schema, JSON.stringify({ type: 'object', properties: { ok: { const: true } }, required: ['ok'], additionalProperties: false }))
-  const binding = native.probeExecutable({ provider: 'vscode', executable: process.env.AUTOPROMPT_VSCODE_TEST_CLI })
-  const adapter = createPosixProcessAdapter()
-  const registrationRoot = closed ? path.join(closed.root, `vscode-${crypto.randomUUID()}`) : controller
-  if (closed) { fs.mkdirSync(registrationRoot, { mode: 0o700 }); fs.writeFileSync(path.join(registrationRoot, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'vscode', activationId: closed.activationId, generation: closed.generation, challenge: closed.challenge, registryPath: path.join(registrationRoot, 'processes.json') }), { flag: 'wx', mode: 0o600 }) }
-  const owner = new ProcessOwner({ adapter, registryPath: path.join(registrationRoot, 'processes.json'), pollMs: 10 })
-  const proxy = path.join(controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+  const binding = native.probeExecutable({ provider: 'vscode', executable: process.env.AUTOPROMPT_VSCODE_TEST_CLI, env: environment })
+  const registrationRoot = closed ? privateDirectory(path.join(closed.root, `vscode-${crypto.randomUUID()}`)) : controller
+  if (closed) { fs.writeFileSync(path.join(registrationRoot, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'vscode', activationId: closed.activationId, generation: closed.generation, challenge: closed.challenge, registryPath: path.join(registrationRoot, 'processes.json') }), { flag: 'wx', mode: 0o600 }) }
+  const registryPath = path.join(registrationRoot, 'processes.json')
+  const adapter = nativeProcessAdapter(registryPath, path.dirname(registryPath))
+  record.environment = prepareProcessLaunchEnvironment(adapter, record.reservationId, environment)
+  const owner = new ProcessOwner({ adapter, registryPath, pollMs: 10 })
+  const proxy = privateDirectory(path.join(controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'vscode-owned', pollMs: 10 })
   const requests = [], errors = []
   const server = http.createServer(async (req, res) => {
@@ -48,13 +204,34 @@ async function fixture(t, options = {}) {
       let text = ''; for await (const chunk of req) text += chunk
       const body = JSON.parse(text); requests.push(body)
       assert.equal(req.headers.authorization, 'Bearer local-fixture')
+      if (process.platform === 'darwin' && requests.length === 1) {
+        const contexts = path.join(nativeRoot, 'vscode')
+        const directories = parent => fs.readdirSync(parent).filter(name => /^[a-f0-9]{64}$/.test(name)).map(name => path.join(parent, name))
+        let proved = 0
+        for (const context of directories(contexts)) for (const launchRoot of directories(context)) {
+          const file = path.join(launchRoot, 'vscode-ipc-alias.json')
+          if (!fs.existsSync(file)) continue
+          const journal = require('../../agents/codex/workflow/event-log.js').readChecksummedJson(file)
+          if (journal.state !== 'RESERVATION_ENTERED') continue
+          const sockets = fs.readdirSync(journal.target.path).filter(name => name.endsWith('-main.sock'))
+          if (!sockets.length) continue // A concurrent sibling can still be starting.
+          assert.equal(sockets.length, 1)
+          assert.equal(fs.realpathSync.native(journal.link.path), path.join(launchRoot, 'home', 'user-data'))
+          assert.equal(fs.lstatSync(path.join(journal.target.path, sockets[0])).isSocket(), true)
+          assert.ok(Buffer.byteLength(path.join(journal.link.path, sockets[0])) < 103)
+          assert.ok(Buffer.byteLength(path.join(journal.target.path, sockets[0])) >= 103)
+          proved++
+        }
+        assert.ok(proved > 0, 'real VS Code must expose its main IPC socket in deep private user-data')
+        t.diagnostic('Real macOS VS Code main IPC is socket-bound through the short alias into deep private storage')
+      }
       if (options.gate) await options.gate(requests.length)
       if (typeof options.respond === 'function') {
         await options.respond({ req, res, body, requests, root, target, controller, nativeRoot, scratch })
         return
       }
       const first = requests.length === 1 && !options.noTools
-      const command = `cat ${quote(path.join(target, 'candidate.txt'))}; printf checked > ${quote(path.join(scratch, 'checked.txt'))}; if printf wrong > ${quote(path.join(target, 'candidate.txt'))} 2>/dev/null; then exit 19; fi; if cat ${quote(path.join(controller, 'private.txt'))} 2>/dev/null; then exit 20; fi`
+      const command = nodeCommand(`const fs=require('node:fs');const candidate=${JSON.stringify(path.join(target, 'candidate.txt'))};process.stdout.write(fs.readFileSync(candidate));fs.writeFileSync(${JSON.stringify(path.join(scratch, 'checked.txt'))},'checked');try{fs.writeFileSync(candidate,'wrong');process.exitCode=19}catch{};try{fs.readFileSync(${JSON.stringify(path.join(controller, 'private.txt'))});process.exitCode=20}catch{}`)
       res.writeHead(200, { 'content-type': 'application/json' })
       const structured = body.response_format?.json_schema
       if (structured) assert.deepEqual(structured, { name: 'autoprompt_result', strict: true, schema: { type: 'object', properties: { canonicalJson: { type: 'string' } }, required: ['canonicalJson'], additionalProperties: false } })
@@ -63,14 +240,24 @@ async function fixture(t, options = {}) {
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const execution = new HarnessExecAdapter({ provider: 'vscode', runner, nativeRoot, executableBinding: binding, targetPath: target,
-    connection: { model: 'fixture', baseUrl: `http://127.0.0.1:${server.address().port}/v1`, maxTokens: 128, maxSteps: 4, ...(options.structured ? { supportsStructuredOutput: true } : {}) }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-fixture' }, rolePrompt: () => 'Use the owned tools and return JSON.', outputSchemaResolver: () => schema })
+    connection: { model: 'fixture', baseUrl: `http://127.0.0.1:${server.address().port}/v1`, maxTokens: 128, maxSteps: 4, logLevel: 'trace', ...(options.structured ? { supportsStructuredOutput: true } : {}) }, credentialEnvironment: { OPENROUTER_API_KEY: 'local-fixture' }, rolePrompt: () => 'Use the owned tools and return JSON.', outputSchemaResolver: () => schema })
   t.after(async () => {
-    await owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 })
-    server.closeAllConnections(); await new Promise(resolve => server.close(resolve))
-    if (process.env.AUTOPROMPT_VSCODE_TEST_KEEP) t.diagnostic(root)
-    else fs.rmSync(root, { recursive: true, force: true })
+    if (process.env.AUTOPROMPT_VSCODE_TEST_KEEP) {
+      await owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 })
+      await execution.recoverResources({ requireDrained: true })
+      await drainNativeCommandOwners(nativeRoot, 'vscode', record)
+      server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); t.diagnostic(root); return
+    }
+    await cleanupNativeFixture({ root, nativeRoot, record }, 'vscode', {
+      stop: async () => {
+        await owner.cancelAll({ reason: 'VS Code native test cleanup', graceMs: 0, killMs: 2000 })
+        await execution.recoverResources({ requireDrained: true })
+      },
+      close: async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) },
+    })
   })
-  return { root, target, controller, scratch, nativeRoot, record, requests, errors, runner, execution }
+  return { root, target, controller, scratch, nativeRoot, record, requests, errors, runner, execution,
+    proxyDiagnostic: () => ({ proxy: proxyDiagnostic(runner), extensionHost: vscodeHostDiagnostic(nativeRoot, record) }) }
 }
 
 if (require.main === module) test('real VS Code owned BYOK session executes controlled tools, bills exact usage, and resumes privately', { skip: !enabled, timeout: 150000 }, async t => {
@@ -99,7 +286,7 @@ if (require.main === module) test('real VS Code owned BYOK session executes cont
   assert.ok(f.requests.every(request => request.response_format?.json_schema?.strict === true), 'Every native request must carry the opted-in strict schema')
 })
 
-module.exports = { fixture }
+module.exports = { fixture, vscodeHostDiagnostic }
 
 if (require.main === module) test('real VS Code zero-tool reservation advertises no tools', { skip: !enabled, timeout: 90000 }, async t => {
   const f = await fixture(t, { noTools: true })

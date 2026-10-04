@@ -12,22 +12,22 @@ const readline = require('node:readline')
 const test = require('node:test')
 const toml = require('@iarna/toml')
 const native = require('../../agents/reasonix/workflow/native.js')
-const { ReasonixEventStream, ReasonixExecAdapter, prepareReasonixBoundary } = require('../../agents/reasonix/workflow/transport.js')
+const { ReasonixEventStream, ReasonixExecAdapter, prepareReasonixBoundary, reasonixProcessEnvironment } = require('../../agents/reasonix/workflow/transport.js')
 const core = require('../../agents/codex/workflow/phase-budget.js')
 const { validateJsonSchema } = require('../../agents/codex/workflow/json-schema-validator.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const controlled = require('../../scripts/harness-v2-controlled-tools.cjs')
-const { isolatedEnvironment } = require('../../scripts/harness-v2-conformance.cjs')
+const { privateDirectory, nativeProcessAdapter, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 const enabled = Boolean(process.env.AUTOPROMPT_REASONIX_TEST_CLI)
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`
 
 function fixture(t, readOnly = true, cleanup = true) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reasonix-controlled-native-'))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'reasonix-controlled-native-')))
   if (cleanup) t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const env = isolatedEnvironment(root)
+  const env = nativeEnvironment()
   const target = path.join(root, 'target'), controller = path.join(root, 'controller'), nativeRoot = path.join(controller, 'native')
-  for (const dir of [target, controller, nativeRoot]) fs.mkdirSync(dir, { mode: 0o700 })
+  for (const dir of [target, controller, nativeRoot]) privateDirectory(dir)
   const challenge = process.env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE || crypto.randomBytes(32).toString('base64url')
   const activationId = process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID || 'reasonix-local-test'
   const generation = Number(process.env.AUTOPROMPT_CLOSED_CANARY_GENERATION || 1)
@@ -82,17 +82,21 @@ async function realFixture(t, actions, options = {}) {
   const f = fixture(t, options.readOnly !== false, false)
   let owner, server
   t.after(async () => {
-    if (owner) await owner.cancelAll({ reason: 'Reasonix controlled test cleanup', graceMs: 0, killMs: 2000 })
-    server?.closeAllConnections?.()
-    if (server?.listening) await new Promise(resolve => server.close(resolve))
-    fs.rmSync(f.root, { recursive: true, force: true })
+    await cleanupNativeFixture(f, 'reasonix', {
+      stop: () => owner?.cancelAll({ reason: 'Reasonix controlled test cleanup', graceMs: 0, killMs: 2000 }),
+      close: async () => { server?.closeAllConnections?.(); if (server?.listening) await new Promise(resolve => server.close(resolve)) },
+    })
   })
   const executable = native.probeExecutable({ executable: process.env.AUTOPROMPT_REASONIX_TEST_CLI, env: f.env })
-  const requests = [], events = [], errors = [], deltas = [], authenticated = [], providerEvents = []
+  const requests = [], events = [], errors = [], deltas = [], authenticated = [], providerEvents = [], endpointRequests = []
+  const nativeDiagnostic = { stdout: [], stderr: '', result: null }
   const credential = options.credential || 'fixture'
   server = http.createServer(async (req, res) => {
+    const endpointRequest = { method: req.method, path: req.url, bytes: null }
+    endpointRequests.push(endpointRequest)
     try {
       let text = ''; for await (const chunk of req) text += chunk
+      endpointRequest.bytes = Buffer.byteLength(text)
       const body = JSON.parse(text)
       requests.push(body)
       const requestNumber = requests.length
@@ -117,21 +121,40 @@ async function realFixture(t, actions, options = {}) {
       } })}\n\ndata: [DONE]\n\n`)
     } catch (error) { errors.push(error.message); res.writeHead(500); res.end() }
   })
-  const processAdapter = createPosixProcessAdapter()
   let registryPath = path.join(f.controller, 'process-registry.json')
   const ownershipRoot = process.env.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT
   if (ownershipRoot) {
     if (!path.isAbsolute(ownershipRoot) || process.env.AUTOPROMPT_CLOSED_CANARY_PROVIDER !== 'reasonix') throw new Error('invalid native canary owner binding')
-    const directory = path.join(ownershipRoot, `reasonix-${crypto.randomUUID()}`)
-    fs.mkdirSync(directory, { mode: 0o700 })
+    const directory = privateDirectory(path.join(ownershipRoot, `reasonix-${crypto.randomUUID()}`))
     registryPath = path.join(directory, 'processes.json')
     fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider: 'reasonix', activationId: f.record.activationId,
       generation: f.record.generation, challenge: f.challenge, registryPath }), { mode: 0o600, flag: 'wx' })
   }
+  let processAdapter
+  try { processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath)) } catch (error) {
+    // Setup runs before launch's diagnostic guard. Preserve the native ACL
+    // audit phase and subprocess result so a startup timeout is distinguishable
+    // from an actual ownership or permissions rejection.
+    t.diagnostic(JSON.stringify({ reasonixSetupFailure: { code: error.code || null,
+      message: error.message, details: error.details || null } }).slice(0, 16384))
+    throw error
+  }
   owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
-  const proxy = path.join(f.controller, 'proxy')
-  fs.mkdirSync(proxy, { mode: 0o700 })
+  const proxy = privateDirectory(path.join(f.controller, 'proxy'))
   const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: 'reasonix-controlled-native', pollMs: 10 })
+  const ownedRun = runner.run.bind(runner)
+  runner.run = async spec => {
+    nativeDiagnostic.stdout = []; nativeDiagnostic.stderr = ''; nativeDiagnostic.result = null
+    const result = await ownedRun({ ...spec, onStdoutLine: line => {
+      nativeDiagnostic.stdout.push(String(line).slice(-8192))
+      if (nativeDiagnostic.stdout.length > 16) nativeDiagnostic.stdout.shift()
+      return spec.onStdoutLine?.(line)
+    } })
+    nativeDiagnostic.stderr = String(result.stderr || '').slice(-16384)
+    nativeDiagnostic.result = { status: result.status, signal: result.signal || null, processOwned: result.processOwned,
+      exactArgv: result.exactArgv, drained: result.drained }
+    return result
+  }
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const adapter = new ReasonixExecAdapter({ runner, nativeRoot: f.nativeRoot, executableBinding: executable, targetPath: f.target,
     connection: typeof options.connection === 'function' ? options.connection(server.address().port) : options.connection || { default_model: 'fixture', providers: [{ name: 'fixture', kind: 'openai', model: 'fixture', base_url: `http://127.0.0.1:${server.address().port}/v1`, api_key_env: 'FIXTURE_KEY' }] },
@@ -153,26 +176,36 @@ async function realFixture(t, actions, options = {}) {
         return supplied?.(evidence)
       }
     }
+    let launchDeadlineFired = false
+    const failureDiagnostic = (failure, phase) => {
+      const toolRoot = path.join(f.launchRoot, 'tools')
+      const toolFiles = fs.existsSync(toolRoot) ? fs.readdirSync(toolRoot, { recursive: true }) : []
+      const locks = toolFiles.filter(file => file.endsWith('server.lock')).map(file => {
+        const lock = JSON.parse(fs.readFileSync(path.join(toolRoot, file), 'utf8'))
+        let alive = true
+        try { process.kill(lock.pid, 0) } catch (error) { alive = error.code !== 'ESRCH' }
+        return { ...lock, alive }
+      })
+      const diagnostic = { reasonixFixtureFailure: String(failure?.code || failure?.message || phase).slice(0, 1024), phase,
+        cause: String(failure?.cause?.code || failure?.cause?.message || '').slice(0, 1024), runner: nativeDiagnostic.result,
+        stderr: nativeDiagnostic.stderr, stdout: [...nativeDiagnostic.stdout], endpointRequests: [...endpointRequests],
+        eventKinds: events.slice(-32).map(event => ({ kind: event.kind || event.type, tool: event.tool?.name || null })),
+        toolFiles: toolFiles.slice(0, 128), locks }
+      while (Buffer.byteLength(JSON.stringify(diagnostic)) > 65536 && diagnostic.stdout.length) diagnostic.stdout.shift()
+      while (Buffer.byteLength(JSON.stringify(diagnostic)) > 65536 && diagnostic.eventKinds.length) diagnostic.eventKinds.shift()
+      const text = JSON.stringify(diagnostic)
+      if (launchDeadlineFired && phase === 'launch-failure') process.stderr.write(`# ${text}\n`)
+      else t.diagnostic(text)
+    }
     const timeout = new AbortController()
-    const timer = setTimeout(() => timeout.abort(), 30000)
+    const timer = setTimeout(() => { launchDeadlineFired = true; try { failureDiagnostic(null, 'launch-deadline') } catch (error) { t.diagnostic(`Failure diagnostic unavailable: ${error.code || error.message}`) } finally { timeout.abort() } }, process.platform === 'win32' ? 300000 : 30000)
     record.signal = overrides.signal || timeout.signal
     try { return await adapter.launch(record) } catch (error) {
-      if (process.env.AUTOPROMPT_REASONIX_TEST_DEBUG) {
-        const toolRoot = path.join(f.launchRoot, 'tools')
-        const toolFiles = fs.existsSync(toolRoot) ? fs.readdirSync(toolRoot, { recursive: true }) : []
-        const locks = toolFiles.filter(file => file.endsWith('server.lock')).map(file => {
-          const lock = JSON.parse(fs.readFileSync(path.join(toolRoot, file), 'utf8'))
-          let alive = true
-          try { process.kill(lock.pid, 0) } catch (failure) { alive = failure.code !== 'ESRCH' }
-          return { ...lock, alive }
-        })
-        t.diagnostic(JSON.stringify({ code: error.code, cause: error.cause?.code,
-          events: events.filter(event => event.tool || event.type === 'result'), root: f.root, toolFiles, locks }))
-      }
+      try { failureDiagnostic(error, 'launch-failure') } catch (diagnosticError) { t.diagnostic(`Failure diagnostic unavailable: ${diagnosticError.code || diagnosticError.message}`) }
       throw error
     } finally { clearTimeout(timer) }
   }
-  return { ...f, requests, events, errors, deltas, authenticated, providerEvents, adapter, runner, owner, launch }
+  return { ...f, requests, events, errors, deltas, authenticated, providerEvents, endpointRequests, nativeDiagnostic, adapter, runner, owner, launch }
 }
 
 function assertNativeSurface(f) {
@@ -235,6 +268,39 @@ if (require.main === module) {
       '--policy', prepared.policyPath, '--sha256', prepared.policySha256])
     assert.equal(config.sandbox.bash, 'enforce'); assert.equal(config.sandbox.network, false)
     for (const name of native.CONTROLLED_TOOLS) assert.ok(controlled.decodeToolName('reasonix', name))
+  })
+
+  test('Reasonix Windows reservations share one private OS cache for native workspace leases', t => {
+    const f = fixture(t)
+    const first = reasonixProcessEnvironment({ environment: { PATH: 'fixture', LocalAppData: 'C:\\ambient-user-cache' }, credentials: { FIXTURE_KEY: 'secret' },
+      home: path.join(f.root, 'home-one'), sessionRoot: path.join(f.root, 'session-one'), nativeRoot: f.nativeRoot, platform: 'win32' })
+    const second = reasonixProcessEnvironment({ environment: { PATH: 'fixture', LOCALAPPDATA: 'C:\\other-ambient-cache' },
+      home: path.join(f.root, 'home-two'), sessionRoot: path.join(f.root, 'session-two'), nativeRoot: f.nativeRoot, platform: 'win32' })
+    assert.equal(first.LOCALAPPDATA, path.join(f.nativeRoot, 'windows-user-cache'))
+    assert.equal(second.LOCALAPPDATA, first.LOCALAPPDATA)
+    assert.equal(Object.keys(first).some(name => name !== 'LOCALAPPDATA' && name.toUpperCase() === 'LOCALAPPDATA'), false)
+    assert.equal(fs.realpathSync.native(first.LOCALAPPDATA), first.LOCALAPPDATA)
+    assert.equal(first.REASONIX_HOME, path.join(f.root, 'home-one'))
+    assert.equal(first.FIXTURE_KEY, 'secret')
+  })
+
+  test('Reasonix Windows writable leaves have protected ACLs and retain native-root identity', {
+    skip: process.platform !== 'win32', timeout: 120000,
+  }, t => {
+    const f = fixture(t)
+    const nativeRootBefore = fs.lstatSync(f.nativeRoot)
+    const scratch = path.join(f.nativeRoot, 'session', 'reservation', 'scratch')
+    native.privateWindowsLeaf(scratch)
+    const environment = reasonixProcessEnvironment({ environment: { PATH: process.env.PATH }, credentials: {},
+      home: path.join(f.nativeRoot, 'session', 'home'), sessionRoot: path.join(f.nativeRoot, 'session'), nativeRoot: f.nativeRoot })
+    const { auditPrivatePermissions } = require('../../agents/codex/workflow/safe-run-root.js')
+    for (const leaf of [scratch, environment.LOCALAPPDATA]) {
+      assert.equal(auditPrivatePermissions(leaf, { recurse: false }).valid, true, `${leaf} must have a protected private DACL`)
+    }
+    const nativeRootAfter = fs.lstatSync(f.nativeRoot)
+    assert.equal(nativeRootAfter.dev, nativeRootBefore.dev)
+    assert.equal(nativeRootAfter.ino, nativeRootBefore.ino)
+    assert.equal(auditPrivatePermissions(f.nativeRoot, { recurse: false }).valid, true)
   })
 
   test('Reasonix projects a closed six-capability call envelope for the generic native proxy', () => {

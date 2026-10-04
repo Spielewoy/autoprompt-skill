@@ -15,18 +15,24 @@ const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { HarnessExecAdapter } = require('../../scripts/harness-v2-transport.cjs')
 const core = require('../../agents/codex/workflow/phase-budget.js')
-const { ProcessOwner, createPosixProcessAdapter, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { ProcessOwner, prepareProcessLaunchEnvironment } = require('../../agents/codex/workflow/process-owner.js')
+const { auditPrivatePermissions } = require('../../agents/codex/workflow/safe-run-root.js')
 const { piModelService } = require('../helpers/harness-pi-native-service.cjs')
+const { privateDirectory, nativeProcessAdapter, nodeCommand, readCommand, withChallenge, nativeEnvironment, cleanupNativeFixture } = require('../helpers/native-platform.cjs')
 
 const CLIS = Object.freeze({ prime: process.env.AUTOPROMPT_PRIME_TEST_CLI, omp: process.env.AUTOPROMPT_OMP_TEST_CLI })
+if (process.env.AUTOPROMPT_REQUIRE_NATIVE_TESTS === '1' && !CLIS.prime && !CLIS.omp) throw new Error('AUTOPROMPT_PRIME_TEST_CLI or AUTOPROMPT_OMP_TEST_CLI is required; native certification cannot skip')
 // Each scenario still creates an independent service, owner, adapter, and
 // native launch. The executable probe itself is immutable for one exact
 // provider/CLI pair, while HarnessExecAdapter.launch reopens the executable
 // and complete runtime dependency identity before every individual launch.
 // Cache only a completed probe: a failed probe must remain retryable.
 const probeBindings = new Map()
-const quote = value => `'${value.replaceAll("'", "'\\''")}'`
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+// Native Windows AppContainer admission and per-tool materialization take
+// 80–130 seconds in CI110. Keep explicit aborts for cancellation scenarios,
+// while allowing ordinary native calls the same bound as OpenCode/DeepSeek.
+const NATIVE_CALL_TIMEOUT_MS = process.platform === 'win32' ? 300000 : 90000
 
 function probeBinding(provider, cli) {
   const key = `${provider}\0${cli}`
@@ -38,7 +44,7 @@ function probeBinding(provider, cli) {
   return immutable
 }
 
-async function waitForNativeRequest(service, pending, timeoutMs = 30000) {
+async function waitForNativeRequest(service, pending, timeoutMs = process.platform === 'win32' ? 120000 : 30000) {
   let settled = false, failure
   // Observe rejection immediately, even while another native sibling starts.
   pending.then(() => { settled = true }, error => { settled = true; failure = error })
@@ -57,10 +63,14 @@ function ownershipRegistry(provider, f) {
       !path.isAbsolute(supplied.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT) || !/^[A-Za-z0-9_-]{43}$/.test(supplied.AUTOPROMPT_CLOSED_CANARY_CHALLENGE)) {
     throw new Error('closed canary ownership registration is invalid')
   }
-  const root = path.resolve(supplied.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT), stat = fs.statSync(root)
-  if (!stat.isDirectory() || stat.mode & 0o077) throw new Error('closed canary ownership root is not private')
-  const directory = path.join(root, `${provider}-${crypto.randomUUID()}`)
-  fs.mkdirSync(directory, { mode: 0o700 })
+  // The closed-canary launcher has already established this shared root's
+  // private ACL. Re-audit it before use, but do not synchronously rewrite the
+  // DACL; the process adapter performs its own authoritative pre-launch audit.
+  const root = path.resolve(supplied.AUTOPROMPT_CLOSED_CANARY_OWNERSHIP_ROOT)
+  auditPrivatePermissions(root, { recurse: false })
+  const stat = fs.lstatSync(root)
+  if (!stat.isDirectory() || (process.platform !== 'win32' && (stat.mode & 0o077))) throw new Error('closed canary ownership root is not private')
+  const directory = privateDirectory(path.join(root, `${provider}-${crypto.randomUUID()}`))
   const registryPath = path.join(directory, 'processes.json')
   fs.writeFileSync(path.join(directory, 'registration.json'), JSON.stringify({ schemaVersion: 1, provider, activationId: f.record.activationId,
     generation: f.record.generation, challenge: supplied.AUTOPROMPT_CLOSED_CANARY_CHALLENGE, registryPath }), { flag: 'wx', mode: 0o600 })
@@ -68,9 +78,9 @@ function ownershipRegistry(provider, f) {
 }
 
 function fixture(provider) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), `${provider}-closed-capability-`))
+  const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), `${provider}-closed-capability-`)))
   const target = path.join(root, 'target'), controller = path.join(root, 'controller'), nativeRoot = path.join(controller, 'native')
-  for (const directory of [target, controller, nativeRoot]) fs.mkdirSync(directory, { mode: 0o700 })
+  for (const directory of [target, controller, nativeRoot]) privateDirectory(directory)
   const suppliedChallenge = process.env.AUTOPROMPT_CLOSED_CANARY_CHALLENGE
   if (suppliedChallenge !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(suppliedChallenge)) throw new Error('AUTOPROMPT_CLOSED_CANARY_CHALLENGE must be one base64url nonce')
   const suppliedActivationId = process.env.AUTOPROMPT_CLOSED_CANARY_ACTIVATION_ID
@@ -90,7 +100,10 @@ function fixture(provider) {
     resourceSets: { read: [], write: [], exclusive: [] } }
   const schema = path.join(controller, 'result.schema.json')
   fs.writeFileSync(schema, JSON.stringify({ type: 'object', properties: { ok: { const: true }, marker: { type: ['string', 'null'] } }, required: ['ok', 'marker'], additionalProperties: false }), { mode: 0o600 })
-  return { root, target, controller, nativeRoot, challenge, projection, record, schema }
+  // Keep diagnostic buffers reference-stable: scenario() returns a shallow
+  // copy of this fixture, so replacing these fields later would hide events
+  // from failure diagnostics.
+  return { root, target, controller, nativeRoot, challenge, projection, record, schema, nativeEvents: [], nativeStderr: '' }
 }
 
 function connection(service) {
@@ -98,6 +111,40 @@ function connection(service) {
     models: [{ id: 'controller-fixture', name: 'Controller fixture', reasoning: true, input: ['text'], contextWindow: 32768, maxTokens: 2048,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, compat: { supportsUsageInStreaming: true, supportsDeveloperRole: false, supportsReasoningEffort: true, maxTokensField: 'max_completion_tokens' } }],
   } } }
+}
+
+function fixtureFailureDiagnostic(f, error) {
+  // Preserve the synthetic provider events and native stderr before cleanup
+  // drains the child. This is bounded fixture data, not an ambient log dump.
+  const output = { fixtureFailure: String(error.code || error.message).slice(0, 1024),
+    failureDetails: error.details?.proxyFailure || null,
+    setupDetails: error.details ? JSON.stringify(error.details).slice(0, 4096) : null,
+    stderr: String(f.nativeStderr || '').slice(-8192), events: [...(f.nativeEvents || [])] }
+  const proxy = path.join(f.controller, 'proxy')
+  output.proxy = []
+  for (const name of fs.existsSync(proxy) ? fs.readdirSync(proxy, { recursive: true }) : []) {
+    if (!/(?:^|[\\/])(?:stdout\.log|stdout\.jsonl|stderr\.log|stderr\.jsonl|status\.json|proxy-error\.json)$/.test(name)) continue
+    const file = path.join(proxy, name), stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) continue
+    output.proxy.push({ name, text: fs.readFileSync(file, 'utf8').slice(-4096) })
+    if (output.proxy.length >= 4) break
+  }
+  const nativeDiagnostics = []
+  const visitDiagnostics = directory => {
+    for (const item of fs.existsSync(directory) ? fs.readdirSync(directory, { withFileTypes: true }) : []) {
+      const file = path.join(directory, item.name)
+      if (item.isDirectory()) visitDiagnostics(file)
+      else if (/^pi-handler-[a-f0-9]{32}\.jsonl$/.test(item.name)) {
+        const stat = fs.lstatSync(file)
+        if (stat.isFile() && stat.nlink === 1 && stat.size <= 65536) nativeDiagnostics.push(fs.readFileSync(file, 'utf8'))
+      }
+      if (nativeDiagnostics.length >= 4) return
+    }
+  }
+  visitDiagnostics(f.nativeRoot)
+  output.piHandlers = nativeDiagnostics
+  while (Buffer.byteLength(JSON.stringify(output)) > 65536) output.events.shift()
+  console.error(JSON.stringify(output))
 }
 
 function sibling(f, label) {
@@ -137,36 +184,47 @@ async function scenario(t, provider, options = {}) {
   const candidate = path.join(f.target, 'candidate.txt'), secret = path.join(f.controller, 'private.txt'), marker = `${provider}-native-capability-${crypto.randomUUID()}`
   fs.writeFileSync(candidate, marker, { mode: 0o600 }); fs.writeFileSync(secret, 'PRIVATE_CONTROLLER_MUST_NOT_BE_VISIBLE', { mode: 0o600 })
   fs.writeFileSync(path.join(f.target, 'AGENTS.md'), 'AMBIENT_PROJECT_INSTRUCTIONS_MUST_NOT_AUTOLOAD', { mode: 0o600 })
-  const base = typeof options.command === 'function' ? options.command({ ...f, provider, candidate, secret, marker, scratch: scratchFor({ ...f, provider }) }) : options.command || `cat ${quote(candidate)}`
-  const calls = options.calls || [{ id: 'owned-command', name: 'autoprompt_owned_bash', args: { command: `${base}; printf '\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(f.challenge)}` } }]
+  const base = typeof options.command === 'function' ? options.command({ ...f, provider, candidate, secret, marker, scratch: scratchFor({ ...f, provider }) }) : options.command || readCommand(candidate)
+  const calls = options.calls || [{ id: 'owned-command', name: 'autoprompt_owned_bash', args: { command: withChallenge(base, f.challenge) } }]
   let service, owner
   try {
     service = await piModelService(calls, { marker, ...(options.serviceOptions || {}) })
     const binding = probeBinding(provider, cli)
-    const processAdapter = createPosixProcessAdapter(), registryPath = ownershipRegistry(provider, f)
+    const registryPath = ownershipRegistry(provider, f), processAdapter = nativeProcessAdapter(registryPath, path.dirname(registryPath))
     owner = new ProcessOwner({ adapter: processAdapter, registryPath, pollMs: 10 })
-    const proxy = path.join(f.controller, 'proxy'); fs.mkdirSync(proxy, { mode: 0o700 })
+    const proxy = privateDirectory(path.join(f.controller, 'proxy'))
     const runner = new core.OwnedCodexProxyRunner({ processOwner: owner, controlRoot: proxy, targetKey: `${provider}-closed-native-canary`, pollMs: 10 })
+    const ownedRun = runner.run.bind(runner)
+    runner.run = async spec => {
+      f.nativeEvents.length = 0; f.nativeStderr = ''
+      const result = await ownedRun({ ...spec, onStdoutLine: line => {
+        f.nativeEvents.push(String(line).slice(-8192))
+        if (f.nativeEvents.length > 16) f.nativeEvents.shift()
+        return spec.onStdoutLine?.(line)
+      } })
+      f.nativeStderr = result.stderr
+      return result
+    }
     const adapter = new HarnessExecAdapter({ provider, runner, nativeRoot: f.nativeRoot, executableBinding: binding, targetPath: f.target, connection: connection(service),
       credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>', OPENROUTER_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema,
       rolePrompt: () => 'Use only assigned controller tools and return exactly one JSON object.' })
     const run = async (overrides = {}) => {
       const record = { ...f.record, ...overrides }
-      record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, { PATH: process.env.PATH })
-      record.signal = overrides.signal || AbortSignal.timeout(90000)
-      return adapter.launch(record)
+      record.environment = prepareProcessLaunchEnvironment(processAdapter, record.reservationId, nativeEnvironment())
+      record.signal = overrides.signal || AbortSignal.timeout(NATIVE_CALL_TIMEOUT_MS)
+      try { return await adapter.launch(record) }
+      catch (error) { fixtureFailureDiagnostic(f, error); throw error }
     }
     let closed = false
     t.after(async () => {
       if (closed) return
       closed = true
-      try { await owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }) }
-      finally { try { await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
+      await cleanupNativeFixture(f, provider, { stop: () => owner.cancelAll({ reason: `${provider} capability cleanup`, graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service.close() })
     })
     return { ...f, provider, cli, candidate, secret, marker, calls, service, binding, processAdapter, registryPath, owner, runner, adapter, run }
   } catch (error) {
-    try { if (owner) await owner.cancelAll({ reason: `${provider} capability setup failure`, graceMs: 0, killMs: 2000, waitForPending: true }) }
-    finally { try { if (service) await service.close() } finally { fs.rmSync(f.root, { recursive: true, force: true }) } }
+    fixtureFailureDiagnostic(f, error)
+    try { await cleanupNativeFixture(f, provider, { stop: () => owner?.cancelAll({ reason: `${provider} capability setup failure`, graceMs: 0, killMs: 2000, waitForPending: true }), close: () => service?.close() }) } catch {}
     throw error
   }
 }
@@ -179,7 +237,7 @@ function successful(result) {
   assert.match(result.toolBoundaryEvidence.policySha256, /^[a-f0-9]{64}$/)
 }
 
-const options = { skip: process.platform === 'win32' || (!CLIS.prime && !CLIS.omp), timeout: 240000 }
+const options = { skip: !CLIS.prime && !CLIS.omp, timeout: process.platform === 'win32' ? 900000 : 240000 }
 for (const provider of ['prime', 'omp']) {
   const providerOptions = { ...options, skip: options.skip || !CLIS[provider] }
 
@@ -197,7 +255,7 @@ for (const provider of ['prime', 'omp']) {
         { id: 'search', name: 'autoprompt_owned_search', args: { path: f.target, text: f.marker } },
         { id: 'write', name: 'autoprompt_owned_write', args: { path: scratchFile, content: 'before' } },
         { id: 'edit', name: 'autoprompt_owned_edit', args: { path: scratchFile, oldText: 'before', newText: 'after' } },
-        { id: 'bash', name: 'autoprompt_owned_bash', args: { command: `cat ${quote(f.candidate)}; if printf forbidden > ${quote(f.candidate)} 2>/dev/null; then exit 18; fi; if cat ${quote(f.secret)} 2>/dev/null; then exit 20; fi; ${quote(process.execPath)} -e ${quote(network)}; printf '\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(f.challenge)}` } },
+        { id: 'bash', name: 'autoprompt_owned_bash', args: { command: withChallenge(`${readCommand(f.candidate)}; ${nodeCommand(`try { require('node:fs').writeFileSync(${JSON.stringify(f.candidate)}, 'forbidden'); process.exit(18) } catch {} ; try { require('node:fs').readFileSync(${JSON.stringify(f.secret)}); process.exit(20) } catch {} ; ${network}`)}`, f.challenge) } },
       )
       const result = await f.run({}); successful(result)
       assert.equal(fs.readFileSync(f.candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(scratchFile, 'utf8'), 'after'); assert.equal(contacted, false)
@@ -216,7 +274,7 @@ for (const provider of ['prime', 'omp']) {
 
   test(`${provider} closed native capability: private and ambient configuration are absent from actual model requests`, providerOptions, async t => {
     const f = await scenario(t, provider)
-    fs.mkdirSync(path.join(f.target, provider === 'prime' ? '.prime' : '.omp'), { mode: 0o700 })
+    privateDirectory(path.join(f.target, provider === 'prime' ? '.prime' : '.omp'))
     fs.writeFileSync(path.join(f.target, provider === 'prime' ? '.prime/settings.json' : '.omp/config.yml'), 'AMBIENT_HOOK_MUST_NOT_LOAD', { mode: 0o600 })
     const result = await f.run({}); successful(result)
     const wire = JSON.stringify(f.service.requests)
@@ -233,7 +291,7 @@ for (const provider of ['prime', 'omp']) {
   })
 
   test(`${provider} closed native capability: exact output bytes are committed in the controller receipt`, providerOptions, async t => {
-    const f = await scenario(t, provider, { command: ({ candidate }) => `printf exact:; cat ${quote(candidate)}` })
+    const f = await scenario(t, provider, { command: ({ candidate }) => `${nodeCommand("process.stdout.write('exact:')")}; ${readCommand(candidate)}` })
     const result = await f.run({}); successful(result)
     const receipts = findReceipts(f, result)
     assert.equal(receipts.length, 1)
@@ -243,7 +301,7 @@ for (const provider of ['prime', 'omp']) {
   })
 
   test(`${provider} closed native capability: overlapping siblings retain unique contexts and drain`, providerOptions, async t => {
-    const f = await scenario(t, provider, { command: ({ candidate }) => `sleep 1; cat ${quote(candidate)}` })
+    const f = await scenario(t, provider, { command: ({ candidate }) => `${nodeCommand("setTimeout(()=>{},1000)")}; ${readCommand(candidate)}` })
     let peak = 0; const monitor = setInterval(() => { peak = Math.max(peak, f.owner.ownershipIdentities().length) }, 5)
     let values
     try { values = await Promise.all([f.run(sibling(f, 'sibling-a')), f.run(sibling(f, 'sibling-b'))]) } finally { clearInterval(monitor) }
@@ -254,9 +312,9 @@ for (const provider of ['prime', 'omp']) {
     const f = await scenario(t, provider), first = await f.run({}); successful(first)
     const before = f.service.requests.length, resumed = await f.run({ reservationId: crypto.randomUUID(), continuationId: first.contextId }); successful(resumed)
     assert.equal(resumed.contextId, first.contextId); assert.ok(f.service.requests.slice(before).some(request => JSON.stringify(request.body.messages).includes('FIRST_CONTEXT_SENTINEL')))
-    const foreign = path.join(f.root, 'foreign'); fs.mkdirSync(foreign, { mode: 0o700 })
-    await assert.rejects(f.adapter.launch({ ...f.record, reservationId: crypto.randomUUID(), continuationId: first.contextId, workingDirectory: foreign,
-      environment: prepareProcessLaunchEnvironment(f.processAdapter, crypto.randomUUID(), { PATH: process.env.PATH }), signal: AbortSignal.timeout(30000) }), { code: 'SESSION_ID_MISMATCH' })
+    const foreign = privateDirectory(path.join(f.root, 'foreign')), foreignReservation = crypto.randomUUID()
+    await assert.rejects(f.adapter.launch({ ...f.record, reservationId: foreignReservation, continuationId: first.contextId, workingDirectory: foreign,
+      environment: prepareProcessLaunchEnvironment(f.processAdapter, foreignReservation, nativeEnvironment()), signal: AbortSignal.timeout(30000) }), { code: 'SESSION_ID_MISMATCH' })
   })
 
   test(`${provider} closed native capability: held child cancels while a fast sibling remains alive and drained`, providerOptions, async t => {
@@ -273,18 +331,21 @@ for (const provider of ['prime', 'omp']) {
 
   test(`${provider} closed native capability: checker sees frozen candidate but writes only authenticated scratch`, providerOptions, async t => {
     const f = await scenario(t, provider)
-    const frozen = path.join(f.root, 'frozen'), scratch = path.join(f.root, 'checker-scratch')
-    fs.mkdirSync(frozen, { mode: 0o700 }); fs.mkdirSync(scratch, { mode: 0o700 }); for (const name of ['tmp', 'output', 'cache']) fs.mkdirSync(path.join(scratch, name), { mode: 0o700 })
+    const frozen = privateDirectory(path.join(f.root, 'frozen')), scratch = privateDirectory(path.join(f.root, 'checker-scratch'))
+    for (const name of ['tmp', 'output', 'cache']) privateDirectory(path.join(scratch, name))
     const candidate = path.join(frozen, 'candidate.txt'); fs.writeFileSync(candidate, f.marker, { mode: 0o600 })
     const checker = { schemaVersion: 1, capability: native.sha256(`${provider}:checker`), runId: `${provider}-closed-checker`, checkerId: `${provider}-closed-native`, candidateHash: native.sha256(f.marker), frozenCandidateRoot: frozen,
       writableScratchRoot: scratch, temporaryRoot: path.join(scratch, 'tmp'), outputRoot: path.join(scratch, 'output'), cacheRoot: path.join(scratch, 'cache') }
-    f.calls[0].args.command = `cat ${quote(candidate)}; printf checked > ${quote(path.join(scratch, 'checker.txt'))}; if printf forbidden > ${quote(candidate)} 2>/dev/null; then exit 19; fi; printf '\\nCLOSED_CANARY_CHALLENGE:%s\\n' ${quote(f.challenge)}`
+    f.calls[0].args.command = withChallenge(`${readCommand(candidate)}; ${nodeCommand(`require('node:fs').writeFileSync(${JSON.stringify(path.join(scratch, 'checker.txt'))}, 'checked'); try { require('node:fs').writeFileSync(${JSON.stringify(candidate)}, 'forbidden'); process.exit(19) } catch {}`)}`, f.challenge)
     const record = { ...f.record, logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', workingDirectory: scratch, canonicalTargetPath: frozen,
       candidateHash: checker.candidateHash, checkerScratchBoundary: checker, physicalExecutionPolicy: { logicalRole: 'independent-checker', physicalRole: 'ap-independent-checker', providerRole: 'ap-independent-checker', sandboxMode: 'read-only', canDispatch: false, resourceSets: { read: [], write: [], exclusive: [] } } }
     const adapter = new HarnessExecAdapter({ provider, runner: f.runner, nativeRoot: f.nativeRoot, executableBinding: f.binding, targetPath: scratch, connection: connection(f.service),
       credentialEnvironment: { OPENAI_API_KEY: '<local-test-only>' }, outputSchemaResolver: () => f.schema, rolePrompt: () => 'Use only controller checker tools.', checkerScratchVerifier: () => checker })
-    record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, { PATH: process.env.PATH }); record.signal = AbortSignal.timeout(90000)
-    const result = await adapter.launch(record); successful(result); assert.equal(fs.readFileSync(candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(scratch, 'checker.txt'), 'utf8'), 'checked')
+    record.environment = prepareProcessLaunchEnvironment(f.processAdapter, record.reservationId, nativeEnvironment()); record.signal = AbortSignal.timeout(NATIVE_CALL_TIMEOUT_MS)
+    let result
+    try { result = await adapter.launch(record) }
+    catch (error) { fixtureFailureDiagnostic(f, error); throw error }
+    successful(result); assert.equal(fs.readFileSync(candidate, 'utf8'), f.marker); assert.equal(fs.readFileSync(path.join(scratch, 'checker.txt'), 'utf8'), 'checked')
   })
 
   test(`${provider} closed native capability: crash recovery drains the durable owned child`, providerOptions, async t => {
@@ -292,7 +353,7 @@ for (const provider of ['prime', 'omp']) {
     try {
     await waitForNativeRequest(f.service, pending)
     assert.equal(f.owner.ownershipIdentities().length, 1, 'native process was not durably registered')
-    const recovered = new ProcessOwner({ adapter: createPosixProcessAdapter(), registryPath: f.registryPath, pollMs: 10 })
+    const recovered = new ProcessOwner({ adapter: nativeProcessAdapter(f.registryPath, path.dirname(f.registryPath)), registryPath: f.registryPath, pollMs: 10 })
     await recovered.cancelAll({ reason: 'simulated controller crash recovery', graceMs: 0, killMs: 2000, waitForPending: true })
     await assert.rejects(pending, error => ['CHILD_CANCELLED', 'CHILD_RUNTIME_FAILURE', 'PROCESS_DRAIN_TIMEOUT'].includes(error.code) ||
       /durable terminal status|controller child/i.test(error.message)); assert.deepEqual(recovered.ownershipIdentities(), [])

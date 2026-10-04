@@ -20,7 +20,8 @@ function fixture(t, privateAcl = false) {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-nt-handle-')))
   if (privateAcl) {
     const script = '$ErrorActionPreference = "Stop"; $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User; $acl = New-Object Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); foreach ($id in @($sid.Value,"S-1-5-18","S-1-5-32-544")) { $principal = New-Object Security.Principal.SecurityIdentifier($id); $rule = New-Object Security.AccessControl.FileSystemAccessRule($principal,"FullControl","ContainerInherit,ObjectInherit","None","Allow"); $acl.AddAccessRule($rule) }; [IO.Directory]::SetAccessControl($env:AUTOPROMPT_PRIVATE_FIXTURE,$acl)'
-    const result = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env: { ...process.env, AUTOPROMPT_PRIVATE_FIXTURE: root } })
+    const result = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 60000, env: { ...process.env, AUTOPROMPT_PRIVATE_FIXTURE: root } })
+    assert.ifError(result.error)
     assert.equal(result.status, 0, result.stderr)
   }
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -68,7 +69,10 @@ function writableMapping(file, stopPath) {
     '$mapping.Dispose()',
   ].join('; ')
   const child = cp.spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-    stdio: ['pipe', 'pipe', 'pipe'],
+    // This owner is stopped by its marker file. An unused open stdin pipe can
+    // keep Windows PowerShell waiting after the command has finished.
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 60000,
     env: { ...process.env, AUTOPROMPT_WINDOWS_CAPTURE_MAPPING_PATH: file, AUTOPROMPT_WINDOWS_CAPTURE_MAPPING_STOP: stopPath },
   })
   const state = { stdout: '', stderr: '' }
@@ -179,13 +183,46 @@ function usnRaceRunner(root) {
   return runner
 }
 
-async function stopMapping(mapper) {
-  if (mapper.child.exitCode === null) {
-    if (mapper.stopPath) fs.writeFileSync(mapper.stopPath, 'stop')
-    else mapper.child.stdin.end('\n')
-    await once(mapper.child, 'exit')
+async function stopMapping(mapper, timeoutMs = 10000) {
+  const child = mapper.child
+  if (child.exitCode !== null || child.signalCode !== null) return
+  const exited = once(child, 'exit')
+  if (mapper.stopPath) fs.writeFileSync(mapper.stopPath, 'stop')
+  else child.stdin.end('\n')
+  let timer
+  try {
+    await Promise.race([exited, new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`mapping owner did not stop: ${mapper.state?.stderr || ''}`)), timeoutMs)
+    })])
+  } catch (error) {
+    // Fail the fixture, but release the mapping so subsequent native cases run.
+    child.kill('SIGKILL')
+    try { await once(child, 'close', { signal: AbortSignal.timeout(5000) }) }
+    catch {
+      child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); child.unref()
+    }
+    throw error
+  } finally {
+    clearTimeout(timer)
   }
 }
+
+test('mapped-view fixture teardown kills an unresponsive owner and reports the failure', { timeout: 30000 }, async t => {
+  const child = cp.spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => {}, 1000)'], { stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000 })
+  t.after(() => { child.kill('SIGKILL'); child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy(); child.unref() })
+  await once(child.stdout, 'data', { signal: AbortSignal.timeout(10000) })
+  await assert.rejects(stopMapping({ child, state: { stderr: 'fixture diagnostic' } }, 100), /mapping owner did not stop: fixture diagnostic/)
+  assert.notEqual(child.signalCode, null)
+})
+
+test('mapped-view fixture teardown stops a marker-controlled owner with closed stdin', { timeout: 30000 }, async t => {
+  const stopPath = path.join(fixture(t), 'stop')
+  const child = cp.spawn(process.execPath, ['-e', 'process.stdout.write("ready"); setInterval(() => { if (require("node:fs").existsSync(process.argv[1])) process.exit(0) }, 10)', stopPath], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000 })
+  t.after(() => { child.kill('SIGKILL'); child.stdout?.destroy(); child.stderr?.destroy(); child.unref() })
+  await once(child.stdout, 'data', { signal: AbortSignal.timeout(10000) })
+  await stopMapping({ child, stopPath })
+  assert.equal(child.exitCode, 0)
+})
 
 test('Windows HANDLE capture reads bounded bytes and returns a stable content digest', { skip: !windows }, t => {
   const root = fixture(t)
@@ -379,12 +416,15 @@ test('Windows terminal publication is exclusive, byte-bound, and cleans only its
   fs.writeFileSync(residue, 'not owned by this invocation')
   backend.recoverRecordPublication(filename)
   assert.equal(fs.readFileSync(residue, 'utf8'), 'not owned by this invocation')
-  const dead = cp.spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' })
+  const dead = cp.spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8', timeout: 15000 })
+  assert.ifError(dead.error)
   assert.equal(dead.status, 0)
   const makeResidue = pid => {
     const name = `.terminal.json.${pid}.0123456789abcdef.create`, target = path.join(root, name)
     fs.writeFileSync(target, 'partial publication')
-    const owner = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference = "Stop"; $acl = Get-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE; $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE -AclObject $acl'], { encoding: 'utf8', env: { ...process.env, AUTOPROMPT_RESIDUE: target } })
+    const environment = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.toLowerCase() !== 'psmodulepath'))
+    const owner = cp.spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference = "Stop"; $acl = Get-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE; $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User); Set-Acl -LiteralPath $env:AUTOPROMPT_RESIDUE -AclObject $acl'], { encoding: 'utf8', timeout: 60000, env: { ...environment, AUTOPROMPT_RESIDUE: target } })
+    assert.ifError(owner.error)
     assert.equal(owner.status, 0, owner.stderr)
     return name
   }
@@ -398,7 +438,9 @@ test('Windows terminal publication is exclusive, byte-bound, and cleans only its
 
 test('Windows owned cleanup binds the target, validates the entire tree, and proves final absence', { skip: !windows }, t => {
   const root = fixture(t, true), target = path.join(root, 'scratch'), nested = path.join(target, 'nested')
+  const readonly = path.join(nested, 'readonly-object')
   fs.mkdirSync(nested, { recursive: true }); fs.writeFileSync(path.join(target, 'keep-until-validation'), 'a'); fs.writeFileSync(path.join(nested, 'data'), 'b')
+  fs.writeFileSync(readonly, 'git-style readonly object'); fs.chmodSync(readonly, 0o444)
   const backend = require('../../agents/codex/workflow/windows-filesystem.js').createWindowsFilesystemCapture()
   const owned = backend.inspectOwnedTarget(target)
   assert.equal(owned.parentIdentity.ino, String(fs.lstatSync(root, { bigint: true }).ino))
@@ -408,6 +450,8 @@ test('Windows owned cleanup binds the target, validates the entire tree, and pro
   fs.linkSync(path.join(nested, 'data'), path.join(nested, 'hardlink'))
   assert.throws(() => backend.removeOwnedTarget(target, owned.parentIdentity, owned.targetIdentity), { code: 'PREIMAGE_UNSAFE' })
   assert.equal(fs.readFileSync(path.join(target, 'keep-until-validation'), 'utf8'), 'a')
+  assert.equal(fs.statSync(readonly).mode & 0o200, 0, 'refused validation must not clear a read-only child')
+  assert.equal(fs.readFileSync(readonly, 'utf8'), 'git-style readonly object')
   fs.unlinkSync(path.join(nested, 'hardlink'))
   assert.equal(backend.removeOwnedTarget(target, owned.parentIdentity, owned.targetIdentity).removed, true)
   assert.equal(fs.existsSync(target), false)
@@ -415,6 +459,18 @@ test('Windows owned cleanup binds the target, validates the entire tree, and pro
   assert.throws(() => backend.removeOwnedTarget(target, { ...owned.parentIdentity, ino: String(BigInt(owned.parentIdentity.ino) + 1n) }, owned.targetIdentity), { code: 'PREIMAGE_UNSAFE' })
   assert.throws(() => backend.captureFileBytes(path.join(root, 'missing')), { code: 'ENOENT' })
   assert.throws(() => backend.captureFileBytes(path.join(root, 'missing-parent', 'missing')), { code: 'PREIMAGE_UNSAFE' })
+  const emptyRoot = path.join(root, 'external-root')
+  fs.mkdirSync(emptyRoot)
+  const emptyOwned = backend.inspectOwnedTarget(emptyRoot)
+  const residue = path.join(emptyRoot, 'unregistered.txt')
+  fs.writeFileSync(residue, 'must remain')
+  assert.throws(() => backend.removeOwnedEmptyDirectory(emptyRoot, emptyOwned.parentIdentity, emptyOwned.targetIdentity), { code: 'PREIMAGE_UNSAFE' })
+  assert.equal(fs.readFileSync(residue, 'utf8'), 'must remain')
+  fs.unlinkSync(residue)
+  assert.throws(() => backend.removeOwnedEmptyDirectory(emptyRoot, emptyOwned.parentIdentity,
+    { ...emptyOwned.targetIdentity, ino: String(BigInt(emptyOwned.targetIdentity.ino) + 1n) }), { code: 'PREIMAGE_UNSAFE' })
+  assert.equal(backend.removeOwnedEmptyDirectory(emptyRoot, emptyOwned.parentIdentity, emptyOwned.targetIdentity).removed, true)
+  assert.equal(backend.removeOwnedEmptyDirectory(emptyRoot, emptyOwned.parentIdentity, emptyOwned.targetIdentity).removed, false)
 })
 
 test('Windows transaction operations durably create, copy readonly projection, and rename without replacement', { skip: !windows }, t => {

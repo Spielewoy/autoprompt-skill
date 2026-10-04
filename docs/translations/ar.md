@@ -32,7 +32,7 @@
 ### 1. تثبيت CLI
 
 ```bash
-npm install -g https://github.com/Spielewoy/autoprompt-skill/releases/download/v2.0.0/autoprompt-skill-2.0.0.tgz
+npm install -g https://github.com/Spielewoy/autoprompt-skill/releases/download/v2.1.0/autoprompt-skill-2.1.0.tgz
 ```
 
 ### 2. تشغيل المثبت

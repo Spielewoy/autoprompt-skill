@@ -13,7 +13,7 @@ const LEGACY = require('./install/harness-v2-legacy.json').providers
 const primeMigration = require('./harness-v2-prime-migration.cjs')
 const ROOT = path.resolve(__dirname, '..')
 const PROVIDERS = Object.freeze(['claude', 'opencode', 'kilo', 'vscode', 'prime', 'omp', 'deepseek', 'hermes', 'grok'])
-const REQUIRED = ['scripts/harness-v2-package.cjs', 'scripts/harness-v2-configure.cjs', 'scripts/harness-v2-native.cjs', 'scripts/harness-v2-transport.cjs', 'scripts/harness-v2-native-wire-projection.cjs', 'scripts/harness-v2-request-quota.cjs', 'scripts/harness-v2-quota-relay.cjs', 'scripts/harness-v2-quota-connection.cjs', 'scripts/harness-v2-admission.cjs', 'scripts/harness-v2-trust/evidence.json', 'scripts/harness-v2-trust/trusted-public-keys.json', 'scripts/local-only-safety.cjs', 'scripts/install/operation-lock.cjs', 'scripts/install/harness-v2-legacy.json']
+const REQUIRED = ['scripts/harness-v2-package.cjs', 'scripts/harness-v2-configure.cjs', 'scripts/harness-v2-native.cjs', 'scripts/harness-v2-transport.cjs', 'scripts/harness-v2-native-wire-projection.cjs', 'scripts/harness-v2-request-quota.cjs', 'scripts/harness-v2-quota-relay.cjs', 'scripts/harness-v2-quota-connection.cjs', 'scripts/harness-v2-admission.cjs', 'scripts/harness-v2-trust/evidence.json', 'scripts/harness-v2-trust/trusted-public-keys.json', 'scripts/local-only-safety.cjs', 'scripts/windows-git-bootstrap-config.cjs', 'scripts/install/operation-lock.cjs', 'scripts/install/harness-v2-legacy.json']
 // These are the closed actual-binary conformance suites invoked by the public
 // diagnostic. They are runtime assets, not the general source test suite.
 const CONFORMANCE_ASSETS = Object.freeze([
@@ -37,9 +37,19 @@ const CONFORMANCE_ASSETS = Object.freeze([
   'tests/source/reasonix-controlled-native.test.cjs',
   'tests/helpers/harness-native-service.cjs',
   'tests/helpers/harness-pi-native-service.cjs',
+  'tests/helpers/native-platform.cjs',
 ])
 const HASH = /^[a-f0-9]{64}$/
+const DARWIN_EXECUTABLES = new Set([
+  'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-x64',
+  'agents/codex/workflow/darwin-coalition-runtime/coalition-helper-arm64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-x64',
+  'agents/codex/workflow/darwin-listener-runtime/listener-supervisor-arm64',
+])
 function fail(code, message) { throw new PackageError(code, message) }
+function setPackagedMode(relative, target) {
+  if (process.platform !== 'win32' && DARWIN_EXECUTABLES.has(relative)) fs.chmodSync(target, 0o700)
+}
 function providerCheck(provider) { if (!PROVIDERS.includes(provider)) fail('INVALID_INPUT', `Unknown v2 provider: ${provider}`); return provider }
 function exists(file) { try { fs.lstatSync(file); return true } catch (error) { if (error.code === 'ENOENT') return false; throw error } }
 function absoluteRoot(root) {
@@ -129,6 +139,9 @@ function sourceInventory(provider, sourceRoot = ROOT) {
   // receipts before their transactional upgrade can run.
   helpers.push('scripts/install/prime-settings.cjs')
   if (path.resolve(sourceRoot) === ROOT || fs.existsSync(path.join(sourceRoot, 'scripts/darwin-runtime-setup.cjs'))) helpers.push('scripts/darwin-runtime-setup.cjs')
+  if (path.resolve(sourceRoot) === ROOT || fs.existsSync(path.join(sourceRoot, 'scripts/darwin-command-sandbox.cjs'))) {
+    helpers.push('scripts/darwin-command-sandbox.cjs', 'scripts/darwin-command-probe.cjs')
+  }
   for (const entry of scriptEntries) if (entry.isDirectory() && entry.name.startsWith('harness-v2-')) trees.push(`scripts/${entry.name}`)
   // Lifecycle fault fixtures intentionally contain only the runtime closure.
   // Only those explicit alternate source roots may omit diagnostic assets;
@@ -342,7 +355,8 @@ function install(provider, root, sourceRoot = ROOT) {
       for (const [file, hash] of Object.entries(receipt.files)) {
         const bytes = readBound(sourcePath(sourceRoot, file))
         if (sha256(bytes) !== hash) fail('PAYLOAD_INVALID', 'Source changed during installation')
-        tx.put(`bundle/${file}`, bytes)
+        const staged = tx.put(`bundle/${file}`, bytes)
+        setPackagedMode(file, staged)
       }
       tx.put('bundle/package.json', bundleMetadata(provider))
       const stagedReceipt = tx.put('receipt.json', `${JSON.stringify(receipt, null, 2)}\n`)
@@ -390,6 +404,37 @@ function uninstall(provider, root) {
     return { status: 'uninstalled', provider, root, runHistoryRetained: true, legacyQuarantineRetained: true }
   } finally { release(lease) }
 }
+// Payload integrity and activation readiness are different checks. This probe
+// uses the same exact native identity and admission precedence as activation,
+// but never creates an activation, runs a canary, or contacts a model.
+function doctorPrerequisites(provider, root, options = {}) {
+  const installed = verify(provider, root)
+  const result = { ...installed, payload: 'verified', detected: false, activation: 'unavailable', reason: 'activation-prerequisites-unavailable' }
+  try {
+    const native = require('./harness-v2-native.cjs')
+    const admission = require('./harness-v2-admission.cjs')
+    const executable = native.probeExecutable({ provider, env: options.env || process.env, executable: options.executable })
+    result.detected = true; result.nativeVersion = executable.version
+    if (native.descriptor(provider).blockers.length) fail('PROVIDER_UNSUPPORTED', `${provider} has unresolved native capabilities`)
+    const imported = require('./harness-v2-configure.cjs').importedAdmission(root, provider)
+    let pending = null
+    try { admission.verifyAdmission(provider, installed, executable, imported || {}) }
+    catch (error) {
+      if (imported) throw error
+      const evidence = JSON.parse(readBound(path.join(installed.bundle, admission.EVIDENCE)))
+      const ring = JSON.parse(readBound(path.join(installed.bundle, admission.KEY_RING)))
+      if (ring.schemaVersion !== 'harness-v2-trusted-keys.v1' || !Array.isArray(ring.keys) ||
+          evidence.schemaVersion !== 'harness-v2-live-conformance.v1' || !Array.isArray(evidence.records) ||
+          evidence.records.some(record => record?.provider === provider)) throw error
+      pending = admission.reviewedLocalPending(provider, installed, executable, { now: options.now })
+      if (!pending) throw error
+    }
+    require('./harness-v2-tool-boundary.cjs').assertCommandSandboxPrerequisites({ env: options.env || process.env })
+    return { ...result, activation: pending ? 'local-canary-required' : 'static-ready;dynamic-preflight-required', reason: '-', nativeVersion: executable.version }
+  } catch (error) {
+    return { ...result, reason: String(error.code || 'RUNTIME_FAILURE').toLowerCase().replaceAll('_', '-'), message: error.message }
+  }
+}
 function run(argv = process.argv.slice(2), options = {}) {
   const [action, provider, flag, value] = argv
   if (!['install', 'verify', 'doctor', 'uninstall', 'plan'].includes(action) || !PROVIDERS.includes(provider) ||
@@ -398,10 +443,11 @@ function run(argv = process.argv.slice(2), options = {}) {
   if (action === 'plan') return { status: 'planned', root, launcher: launcherPath(provider, root), ...sourceInventory(provider, options.sourceRoot) }
   if (action === 'install') return install(provider, root, options.sourceRoot)
   if (action === 'uninstall') return uninstall(provider, root)
+  if (action === 'doctor') return doctorPrerequisites(provider, root, options)
   return verify(provider, root)
 }
 if (require.main === module) {
-  try { const result = run(); process.stdout.write(`${JSON.stringify({ status: result.status, provider: result.provider, root: result.root, bundle: result.bundle, launcher: result.launcher, payloadGeneration: result.payloadGeneration, legacySettingsBackup: result.legacySettingsBackup })}\n`) }
+  try { const result = run(); process.stdout.write(`${JSON.stringify({ status: result.status, provider: result.provider, root: result.root, bundle: result.bundle, launcher: result.launcher, payloadGeneration: result.payloadGeneration, legacySettingsBackup: result.legacySettingsBackup, payload: result.payload, detected: result.detected, activation: result.activation, reason: result.reason, message: result.message, nativeVersion: result.nativeVersion })}\n`); if (result.activation === 'unavailable') process.exitCode = 1 }
   catch (error) { process.stderr.write(`${error.code || 'RUNTIME_FAILURE'}: ${error.message}\n`); process.exitCode = 1 }
 }
-module.exports = { PROVIDERS, ROOT, PackageError, CONFORMANCE_ASSETS, rootCandidate, resolveRoot, receiptName, launcherPath, launcherRelative, launcher, publicFiles, bundlePath, sourceInventory, readReceipt, install, verify, doctor: verify, uninstall, run, walk, assertNoResumableActivation }
+module.exports = { PROVIDERS, ROOT, PackageError, CONFORMANCE_ASSETS, rootCandidate, resolveRoot, receiptName, launcherPath, launcherRelative, launcher, publicFiles, bundlePath, sourceInventory, readReceipt, install, verify, doctor: doctorPrerequisites, doctorPrerequisites, uninstall, run, walk, assertNoResumableActivation }

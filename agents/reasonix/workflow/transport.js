@@ -3,7 +3,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const {
-  CONTROLLED_CAPABILITIES, CONTROLLED_NATIVE_TOOLS, CONTROLLED_PROXY, CONTROLLED_SERVER, CONTROLLED_TOOLS, ReasonixError, inside, nativeUsage, parseTerminal, privateDirectory, readBound, renderConfig, renderCredentials, sha256, validateNativeTodoWrite, writePrivate,
+  CONTROLLED_CAPABILITIES, CONTROLLED_NATIVE_TOOLS, CONTROLLED_PROXY, CONTROLLED_SERVER, CONTROLLED_TOOLS, ReasonixError, inside, nativeUsage, parseTerminal, privateDirectory, privateWindowsLeaf, readBound, renderConfig, renderCredentials, sha256, validateNativeTodoWrite, writePrivate,
 } = require('./native.js')
 const core = require('../../codex/workflow/phase-budget.js')
 const { validateJsonSchema } = require('../../codex/workflow/json-schema-validator.js')
@@ -357,19 +357,28 @@ class ReasonixEventStream {
   }
 }
 
-function nativeContextRoot(nativeRoot, record, targetPath) {
+function executableBindingIdentity(binding) {
+  if (!binding || typeof binding.path !== 'string' || !/^[a-f0-9]{64}$/.test(binding.sha256 || '')) {
+    throw new ReasonixError('PROVIDER_IDENTITY_MISMATCH', 'Reasonix context requires an exact executable binding')
+  }
+  return { path: binding.path, sha256: binding.sha256, invocationSha256: binding.invocation?.sha256 || null }
+}
+
+function nativeContextRoot(nativeRoot, record, targetPath, executableBinding) {
   if (!record.continuationId) return path.join(nativeRoot, sha256(record.sessionId))
   const saved = JSON.parse(readBound(path.join(nativeRoot, 'contexts', `${sha256(record.continuationId)}.json`)))
   if (saved.sessionId !== record.continuationId || saved.providerRole !== record.providerRole ||
-      saved.targetPath !== targetPath || !/^[a-f0-9]{64}$/.test(saved.rootKey || '')) {
+      saved.targetPath !== targetPath || !/^[a-f0-9]{64}$/.test(saved.rootKey || '') ||
+      (executableBinding && JSON.stringify(saved.executableBinding) !== JSON.stringify(executableBindingIdentity(executableBinding)))) {
     throw new ReasonixError('SESSION_ID_MISMATCH', 'Continuation differs from its original native role or workspace')
   }
   return path.join(nativeRoot, saved.rootKey)
 }
 
-function persistNativeContext(nativeRoot, sessionRoot, record, targetPath, sessionId) {
+function persistNativeContext(nativeRoot, sessionRoot, record, targetPath, sessionId, executableBinding) {
   const file = path.join(nativeRoot, 'contexts', `${sha256(sessionId)}.json`)
-  const saved = { sessionId, providerRole: record.providerRole, targetPath, rootKey: path.basename(sessionRoot) }
+  const saved = { sessionId, providerRole: record.providerRole, targetPath, rootKey: path.basename(sessionRoot),
+    ...(executableBinding ? { executableBinding: executableBindingIdentity(executableBinding) } : {}) }
   if (fs.existsSync(file)) {
     if (JSON.stringify(JSON.parse(readBound(file))) !== JSON.stringify(saved)) throw new ReasonixError('SESSION_ID_MISMATCH', 'Native session identity was already bound to another assignment')
   } else writePrivate(file, JSON.stringify(saved))
@@ -387,13 +396,40 @@ function prepareReasonixBoundary({ nativeRoot, launchRoot, record, targetPath, s
     }
   }
   const toolRoot = path.join(launchRoot, 'tools')
-  privateDirectory(toolRoot)
-  return boundary.prepareBoundary({ provider: 'reasonix', root: toolRoot, policy: {
-    schemaVersion: 1, activationId: record.activationId, sessionId: record.sessionId, reservationId: record.reservationId,
+  privateWindowsLeaf(toolRoot)
+  const darwinCommandOwner = process.platform === 'darwin'
+    ? { manifestRoot: require('../../../scripts/harness-v2-command-owner-discovery.cjs').createDiscoveryRoot(nativeRoot, { provider: 'reasonix', activationId: record.activationId, generation: record.generation }), providerPrivateOwnershipRoot: nativeRoot }
+    : undefined
+  const prepared = boundary.prepareBoundary({ provider: 'reasonix', root: toolRoot, darwinCommandOwner, policy: {
+    schemaVersion: 1, activationId: record.activationId, generation: record.generation, sessionId: record.sessionId, reservationId: record.reservationId,
     readOnly, toolFree: record.providerToolCallLimit === 0, targetPath: candidate, scratchPath,
     readableRoots: [candidate, scratchPath], writableRoots: readOnly ? [scratchPath] : [candidate, scratchPath],
     nestedDispatch: false, commandBoundary: true, externalWrites: false,
   } })
+  if (prepared.darwinCommandOwner) require('../../../scripts/harness-v2-command-owner-discovery.cjs').registerCanaryDiscovery(
+    prepared.policyPath, prepared.policySha256, prepared.darwinCommandOwner)
+  return prepared
+}
+
+function reasonixProcessEnvironment({ environment = {}, credentials = {}, home, sessionRoot, nativeRoot, platform = process.platform }) {
+  const projected = Object.fromEntries(Object.entries({ ...environment, ...credentials })
+    .filter(([name]) => platform !== 'win32' || name.toUpperCase() !== 'LOCALAPPDATA'))
+  Object.assign(projected, {
+    HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'xdg-config'),
+    XDG_STATE_HOME: path.join(sessionRoot, 'xdg-state'), XDG_CACHE_HOME: path.join(sessionRoot, 'xdg-cache'),
+    REASONIX_HOME: home, REASONIX_STATE_HOME: path.join(sessionRoot, 'state'), REASONIX_CACHE_HOME: path.join(sessionRoot, 'cache'),
+  })
+  if (platform === 'win32') {
+    // Reasonix v1.30 deliberately resolves its cross-process workspace lease
+    // through Go's OS user-cache lookup, ignoring REASONIX_CACHE_HOME. The
+    // isolated child has no ambient LocalAppData, so provide one shared by all
+    // Reasonix reservations in this private controller root. The native CLI
+    // appends its own reasonix/workspace-leases subtree.
+    const windowsUserCache = path.join(nativeRoot, 'windows-user-cache')
+    privateWindowsLeaf(windowsUserCache)
+    projected.LOCALAPPDATA = windowsUserCache
+  }
+  return projected
 }
 
 class ReasonixExecAdapter {
@@ -410,8 +446,11 @@ class ReasonixExecAdapter {
     // a reservation-scoped identity in the controller's ownership registry.
     const processSessionId = `native-reasonix-${sha256(JSON.stringify([record.sessionId, record.reservationId]))}`
     const binding = this.executableBinding
-    if (sha256(readBound(binding.path)) !== binding.sha256) throw new ReasonixError('PROVIDER_UNSUPPORTED', 'Reasonix executable changed after activation')
-    const actualRuntime = require('../../../scripts/harness-v2-native.cjs').runtimeDependencyIdentity(binding.path, record.environment || process.env)
+    const sharedNative = require('../../../scripts/harness-v2-native.cjs')
+    // This checks the raw shim, declared package bin and (for Node shims) the
+    // interpreter before any continuation state or provider process is used.
+    sharedNative.executableInvocation(binding)
+    const actualRuntime = sharedNative.runtimeDependencyIdentity(sharedNative.executableRuntimePath(binding), record.environment || process.env, binding.invocation)
     if (!binding.runtimeIdentity || JSON.stringify(actualRuntime) !== JSON.stringify(binding.runtimeIdentity)) {
       throw new ReasonixError('PROVIDER_IDENTITY_MISMATCH', 'Reasonix native dependencies changed after activation')
     }
@@ -421,15 +460,15 @@ class ReasonixExecAdapter {
     }
     const targetPath = path.resolve(record.workingDirectory || record.cwd || this.targetPath)
     const readOnly = execution.sandboxMode === 'read-only'
-    const sessionRoot = nativeContextRoot(this.nativeRoot, record, targetPath)
+    const sessionRoot = nativeContextRoot(this.nativeRoot, record, targetPath, binding)
     const launchRoot = path.join(sessionRoot, sha256(record.reservationId))
     const checkerScratch = record.checkerScratchBoundary ? this.checkerScratchVerifier?.(record) : null
     if (record.checkerScratchBoundary && !checkerScratch) throw new ReasonixError('CHECKER_SCRATCH_BOUNDARY_INVALID', 'Missing authenticated checker scratch boundary')
     const scratchPath = checkerScratch ? targetPath : path.join(launchRoot, 'scratch')
     if (record.externalLocalBoundary || record.externalOperation) throw new ReasonixError('EXTERNAL_WRITE_BOUNDARY_UNAVAILABLE', 'Reasonix controlled tools support only the assigned candidate and checker scratch')
     const cwd = path.join(sessionRoot, 'cwd')
-    privateDirectory(scratchPath)
-    privateDirectory(cwd)
+    privateWindowsLeaf(scratchPath)
+    privateWindowsLeaf(cwd)
     const toolBoundary = prepareReasonixBoundary({ nativeRoot: this.nativeRoot, launchRoot, record, targetPath, scratchPath, readOnly, checkerScratch })
     const schema = core.codexProviderCanonicalOutputSchema(record, JSON.parse(readBound(this.outputSchemaResolver(record)).toString('utf8')))
     const outcomeProjection = nativeOutcomeDescriptionProjection(record, schema)
@@ -457,6 +496,7 @@ class ReasonixExecAdapter {
       JSON.stringify(wireSchema),
     ].join('\n')
     const home = path.join(launchRoot, 'home')
+    privateWindowsLeaf(home)
     const quotaEnabled = record.providerTokenLimit !== undefined
     if (quotaEnabled && (!Number.isSafeInteger(record.providerTokenLimit) || record.providerTokenLimit <= 0)) {
       throw new ReasonixError('BUDGET_CONFIG_INVALID', 'Reasonix quota requires a positive safe token allowance')
@@ -466,7 +506,7 @@ class ReasonixExecAdapter {
     if (record.assignment?.effort) argv.push('--effort', record.assignment.effort)
     if (record.continuationId) argv.push('--resume', record.continuationId)
     const stream = new ReasonixEventStream({ ...record, ...(quotaEnabled ? { onUsageDelta: undefined } : {}), toolBoundary, readOnly, onSessionIdentified: (sessionId, evidence) => {
-      persistNativeContext(this.nativeRoot, sessionRoot, record, targetPath, sessionId)
+      persistNativeContext(this.nativeRoot, sessionRoot, record, targetPath, sessionId, binding)
       record.onSessionIdentified?.(sessionId, evidence)
     } })
     let streamError
@@ -482,10 +522,8 @@ class ReasonixExecAdapter {
       dispatch: core.modelVisibleDispatch(record.dispatch, { canonicalAssignment: Boolean(record.canonicalAssignment), canonicalMission: mission, missionBinding: record.missionBinding }),
       assignment: record.canonicalAssignment,
     })
-    const environment = { ...record.environment, ...this.credentialEnvironment,
-      HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, 'xdg-config'),
-      XDG_STATE_HOME: path.join(sessionRoot, 'xdg-state'), XDG_CACHE_HOME: path.join(sessionRoot, 'xdg-cache'),
-      REASONIX_HOME: home, REASONIX_STATE_HOME: path.join(sessionRoot, 'state'), REASONIX_CACHE_HOME: path.join(sessionRoot, 'cache') }
+    const environment = reasonixProcessEnvironment({ environment: record.environment, credentials: this.credentialEnvironment,
+      home, sessionRoot, nativeRoot: this.nativeRoot })
     const signal = record.signal || record.abortSignal
     const abort = () => stop(new ReasonixError('CHILD_CANCELLED', 'Reasonix execution was aborted'))
     if (signal?.aborted) throw new ReasonixError('CHILD_CANCELLED', 'Reasonix execution was aborted before launch')
@@ -502,8 +540,9 @@ class ReasonixExecAdapter {
       writePrivate(path.join(home, 'config.toml'), renderConfig({ connection: projectedConnection, systemPrompt, targetPath, scratchPath, readOnly, checkerScratch: Boolean(checkerScratch), toolBoundary }))
       writePrivate(path.join(home, '.env'), renderCredentials(projectedConnection, environment))
       runnerStarted = true
+      const invocation = sharedNative.executableInvocation(binding, argv)
       result = await this.runner.run({
-        executable: binding.path, argv, cwd, env: environment, stdin: input, shell: false,
+        executable: invocation.executable, argv: invocation.argv, cwd, env: environment, stdin: input, shell: false,
         sessionId: processSessionId, reservationId: record.reservationId,
         onTransportActivity: record.onTransportActivity,
         onStdoutLine: line => {
@@ -522,6 +561,7 @@ class ReasonixExecAdapter {
       if (quotaRelay) {
         try { await quotaRelay.close() } catch (error) { stop(error) }
       }
+      try { await require('../../../scripts/harness-v2-tool-boundary.cjs').drainDarwinCommandOwner(toolBoundary) } catch (error) { stop(error) }
     }
     if (stopPromise) {
       let stopped
@@ -576,4 +616,4 @@ class ReasonixExecAdapter {
   }
 }
 
-module.exports = { ReasonixEventStream, ReasonixExecAdapter, controlledToolProtocolProjection, nativeContextRoot, persistNativeContext, prepareReasonixBoundary, reasonixQuotaConnection }
+module.exports = { ReasonixEventStream, ReasonixExecAdapter, controlledToolProtocolProjection, nativeContextRoot, persistNativeContext, prepareReasonixBoundary, reasonixProcessEnvironment, reasonixQuotaConnection }

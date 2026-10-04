@@ -1,0 +1,4 @@
+# Unified-diff context retains upstream whitespace; check the applied source.
+libuv-appcontainer-pipes.patch -text whitespace=-blank-at-eol,-space-before-tab
+*.ps1 text eol=lf
+*.json text eol=lf

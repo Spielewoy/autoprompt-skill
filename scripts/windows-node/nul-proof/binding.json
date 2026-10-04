@@ -1,0 +1,28 @@
+{
+  "sourceCommit": "71b8b174857e25106d39b61a9e6f30d927da8b01",
+  "nodeVersion": "24.20.0",
+  "nativeExecution": "pending",
+  "patchSha256": "297b296df5a256429f9adc0e369c48bd5c8054834c2bd9e7cacea49caab3e679",
+  "files": {
+    "deps/uv/src/win/internal.h": {
+      "originalSha256": "28de9aed84ec2dbb75e7eb18f270fa6fa3f080b16034e6a3d0b349a7d14bfe1a",
+      "candidateSha256": "57ee42b19bb1e26c61be736dbf29648442600c895d69bf0be5ef5aaca0786879"
+    },
+    "deps/uv/src/win/process-stdio.c": {
+      "originalSha256": "7367280da2315b8cf16d42870a972164763b1967f8e39bd141b27726237872d8",
+      "candidateSha256": "394f549b75e580f98ba5d8b8238798d280ac6ad25d1943b6bac2ac5d766c9c37"
+    },
+    "deps/uv/src/win/process.c": {
+      "originalSha256": "3613437d5b1511789fe4ea9ba6c3ab228c9d42a8d2eec56227f6d6919e917d91",
+      "candidateSha256": "aad03639ada008fbadea0a4c841acb89c8148a5c1041a0132d874739744704be"
+    },
+    "deps/uv/src/win/nul-capability.h": {
+      "originalSha256": null,
+      "candidateSha256": "febc21f7a31c7b40f9a6e3b6e498ccd7cdf36a7946c3027c382141b937f32cc1"
+    }
+  },
+  "sourceArchive": {
+    "url": "https://nodejs.org/dist/v24.20.0/node-v24.20.0.tar.xz",
+    "sha256": "2732fc3f588dd335cd6779c06864f7cd424bb1b5ff9a1743059a66c54f9ca4a1"
+  }
+}

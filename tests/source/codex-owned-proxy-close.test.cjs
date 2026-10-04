@@ -2,6 +2,7 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const cp = require('node:child_process')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
@@ -30,6 +31,166 @@ async function waitFor(predicate, timeoutMs, description) {
   }
   assert.fail(`timed out waiting for ${description}`)
 }
+
+function stoppedStatus(request, code, overrides = {}) {
+  return {
+    schemaVersion: 2,
+    activationId: request.activationId,
+    generationId: request.generationId,
+    sequence: request.sequence,
+    argvHash: request.argvHash,
+    codexPid: 417,
+    code,
+    signal: null,
+    ...overrides,
+  }
+}
+
+for (const [title, foreign] of [['preserves a durable nonzero status published during stop', false], ['refuses a foreign durable status published during stop', true]]) test(`owned runner ${title}`, async t => {
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-owned-proxy-stop-status-')))
+  fs.mkdirSync(path.join(directory, 'control'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const sessionId = 'stop-status-session', reservationId = crypto.randomUUID(), ownershipId = 'owned-stop-status', groupIdentity = 'group-stop-status'
+  let request, publish
+  const owner = {
+    async launch(spec) {
+      request = JSON.parse(fs.readFileSync(spec.argv.at(-1), 'utf8'))
+      return { ownershipId, groupIdentity }
+    },
+    async cancelGroup(receivedOwnershipId, options) {
+      assert.equal(receivedOwnershipId, ownershipId)
+      assert.equal(options.terminalStatus, 'DONE')
+      // Let the runner leave its 2 ms polling loop while stop is still
+      // pending. A status read before the drain would miss this publication.
+      await new Promise(resolve => setTimeout(resolve, 30))
+      publish()
+      return { ownershipId, groupIdentity, sessionId, status: 'DONE' }
+    },
+  }
+  const runner = new OwnedCodexProxyRunner({ processOwner: owner, controlRoot: path.join(directory, 'control'), targetKey: 'stop-status-target', pollMs: 2 })
+  const running = runner.run({ executable: process.execPath, argv: ['-e', ''], cwd: directory, env: {}, stdin: '', sessionId, reservationId })
+  running.catch(() => {})
+  await waitFor(() => request !== undefined, 1_000, 'the fake owner launch request')
+  publish = () => fs.writeFileSync(request.statusPath, `${JSON.stringify(stoppedStatus(request, 23,
+    foreign ? { activationId: 'foreign-activation' } : {}))}\n`, { mode: 0o600 })
+  const stopped = await runner.stop({ sessionId, reason: 'completion', terminalStatus: 'DONE' })
+  assert.equal(stopped.drained, true)
+  assert.equal(stopped.ownershipId, ownershipId)
+  assert.equal(stopped.groupIdentity, groupIdentity)
+  assert.equal(stopped.reservationId, reservationId)
+  if (foreign) {
+    await assert.rejects(running, { code: 'CODEX_PROXY_STATUS_INVALID' })
+  } else {
+    const result = await running
+    assert.equal(result.status, 0)
+    assert.equal(result.signal, 'OWNED_STOP')
+    assert.deepEqual(result.observedTermination, { exitCode: 23, signal: null })
+  }
+})
+
+test('owned Codex proxy durably records a synchronous nested spawn refusal', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-owned-proxy-spawn-refusal-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const preload = path.join(directory, 'refuse-spawn.cjs')
+  fs.writeFileSync(preload, [
+    "'use strict'",
+    "const childProcess = require('node:child_process')",
+    'childProcess.spawn = () => {',
+    "  const error = new Error('forced synchronous nested spawn refusal')",
+    "  error.code = 'ENAMETOOLONG'",
+    '  throw error',
+    '}',
+    '',
+  ].join('\n'))
+  const executable = process.execPath
+  const argv = ['fixture-child.cjs']
+  const request = {
+    schemaVersion: 2,
+    activationId: 'spawn-refusal-activation',
+    generationId: 7,
+    sequence: 3,
+    executable,
+    argv,
+    argvHash: crypto.createHash('sha256').update(JSON.stringify({ executable, argv })).digest('hex'),
+    cwd: directory,
+    stdin: '',
+    stdoutPath: path.join(directory, 'stdout.jsonl'),
+    stderrPath: path.join(directory, 'stderr.log'),
+    statusPath: path.join(directory, 'status.json'),
+  }
+  const requestPath = path.join(directory, 'request.json')
+  fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`)
+  const foreignPhaseJournal = path.join(directory, 'proxy-phases.jsonl')
+  fs.writeFileSync(foreignPhaseJournal, 'foreign-phase-authority\n', { mode: 0o600 })
+  const result = cp.spawnSync(process.execPath, ['--require', preload,
+    path.join(WORKFLOW, 'phase-budget.js'), '--owned-codex-proxy', requestPath], {
+    cwd: directory, encoding: 'utf8', timeout: 30_000,
+  })
+  assert.ifError(result.error)
+  assert.equal(result.status, 2)
+  const status = JSON.parse(fs.readFileSync(request.statusPath, 'utf8'))
+  assert.deepEqual(Object.fromEntries(Object.entries(status).filter(([key]) => !['codexPid', 'error'].includes(key))), {
+    schemaVersion: 2,
+    activationId: request.activationId,
+    generationId: request.generationId,
+    sequence: request.sequence,
+    argvHash: request.argvHash,
+    code: 1,
+    signal: null,
+  })
+  assert.ok(Number.isSafeInteger(status.codexPid) && status.codexPid > 0)
+  assert.deepEqual(status.error, {
+    type: 'Error',
+    code: 'ENAMETOOLONG',
+    message: 'forced synchronous nested spawn refusal',
+    requestedCwdLength: directory.length,
+    effectiveCwdLength: directory.length,
+  })
+  assert.equal(fs.readFileSync(request.stdoutPath, 'utf8'), '')
+  assert.equal(fs.readFileSync(request.stderrPath, 'utf8'),
+    `OWNED_CODEX_PROXY_FAILED:${JSON.stringify(status.error)}\n`)
+  assert.equal(fs.readFileSync(foreignPhaseJournal, 'utf8'), 'foreign-phase-authority\n',
+    'an unavailable diagnostic journal must neither overwrite foreign bytes nor change the primary refusal')
+})
+
+test('owned Codex proxy records fixed private phases through actual spawn and drain', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-owned-proxy-phases-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const executable = process.execPath
+  const argv = ['-e', "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('owned-proxy-complete\\n'))"]
+  const request = {
+    schemaVersion: 2,
+    activationId: 'phase-diagnostic-activation',
+    generationId: 2,
+    sequence: 1,
+    executable,
+    argv,
+    argvHash: crypto.createHash('sha256').update(JSON.stringify({ executable, argv })).digest('hex'),
+    cwd: directory,
+    stdin: 'bounded-input',
+    stdoutPath: path.join(directory, 'stdout.jsonl'),
+    stderrPath: path.join(directory, 'stderr.log'),
+    statusPath: path.join(directory, 'status.json'),
+  }
+  const requestPath = path.join(directory, 'request.json')
+  fs.writeFileSync(requestPath, `${JSON.stringify(request)}\n`, { mode: 0o600 })
+  const result = cp.spawnSync(process.execPath,
+    [path.join(WORKFLOW, 'phase-budget.js'), '--owned-codex-proxy', requestPath],
+    { cwd: directory, encoding: 'utf8', timeout: 30_000 })
+  assert.ifError(result.error)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(fs.readFileSync(request.stdoutPath, 'utf8'), 'owned-proxy-complete\n')
+  assert.equal(JSON.parse(fs.readFileSync(request.statusPath, 'utf8')).code, 0)
+  const phasePath = path.join(directory, 'proxy-phases.jsonl'), phaseStat = fs.lstatSync(phasePath)
+  assert.equal(phaseStat.isFile(), true); assert.equal(phaseStat.isSymbolicLink(), false); assert.equal(phaseStat.nlink, 1)
+  if (process.platform !== 'win32') assert.equal(phaseStat.mode & 0o777, 0o600)
+  const records = fs.readFileSync(phasePath, 'utf8').trim().split(/\r?\n/u).map(JSON.parse)
+  assert.deepEqual(records.map(record => record.stage), [
+    'requestvalidated', 'outputopened', 'relayready', 'cwdbound', 'spawnrequested', 'spawned', 'stdinwritten', 'closed',
+  ])
+  assert.deepEqual(records.map(record => record.sequence), [1, 2, 3, 4, 5, 6, 7, 8])
+  for (const record of records) assert.deepEqual(Object.keys(record).sort(), ['schemaVersion', 'sequence', 'stage'])
+})
 
 test('owned Codex proxy publishes status only after inherited output closes and retains final usage', {
   timeout: 30_000,
@@ -66,6 +227,7 @@ test('owned Codex proxy publishes status only after inherited output closes and 
     "    { type: 'turn.completed', usage: { input_tokens: 13, cached_input_tokens: 5, output_tokens: 3, reasoning_output_tokens: 2 } },",
     '  ]',
     "  fs.writeSync(1, `${events.map(JSON.stringify).join('\\n')}\\n`)",
+    '  fs.writeSync(2, Buffer.from([255, 0, 10]))',
     '}',
     'function awaitRootExit() {',
     '  if (rootIsAlive()) { setTimeout(awaitRootExit, 5); return }',
@@ -109,6 +271,7 @@ test('owned Codex proxy publishes status only after inherited output closes and 
   })
   const sessionId = 'delayed-output-session'
   const reservationId = crypto.randomUUID()
+  const launchBindingHash = crypto.createHash('sha256').update(`ipc-alias:${reservationId}`).digest('hex')
   let request = null
   const launchOwned = owner.launch.bind(owner)
   owner.launch = async spec => {
@@ -137,6 +300,7 @@ test('owned Codex proxy publishes status only after inherited output closes and 
     stdin: '',
     sessionId,
     reservationId,
+    launchBindingHash,
     onStdoutLine(line) {
       lineCount += 1
       accumulator.push(line, lineCount)
@@ -160,6 +324,9 @@ test('owned Codex proxy publishes status only after inherited output closes and 
   assert.equal(fs.existsSync(request.statusPath), true)
   assert.equal(execution.status, 0)
   assert.equal(execution.drained, true)
+  assert.deepEqual(Buffer.from(execution.stderrBase64, 'base64'), Buffer.from([255, 0, 10]))
+  assert.equal(execution.stderrSha256, crypto.createHash('sha256').update(Buffer.from([255, 0, 10])).digest('hex'))
+  assert.equal(execution.stdoutSha256, crypto.createHash('sha256').update(Buffer.from(execution.stdoutBase64, 'base64')).digest('hex'))
   assert.equal(lineCount, 3)
   assert.deepEqual(parsed.output, finalOutput)
   assert.deepEqual(parsed.usage, {
@@ -170,4 +337,7 @@ test('owned Codex proxy publishes status only after inherited output closes and 
   })
   await owner.assertTargetDrained('delayed-output-target')
   await owner.assertDrained()
+  const binding = { sessionId, reservationId, targetKey: 'delayed-output-target', launchBindingHash }
+  const receipt = await owner.issueBoundDrainReceipt(binding)
+  assert.equal(owner.verifyBoundDrainReceipt(receipt, binding), true)
 })

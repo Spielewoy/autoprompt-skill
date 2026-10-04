@@ -6,7 +6,7 @@ const childProcess = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 const { atomicWriteFile, atomicWriteJson, canonicalize, readChecksummedJson, stableStringify } = require('./event-log.js')
-const { auditPrivatePermissions, ensureWindowsPrivateAcl, inspectPathNoFollow, pathIsInside } = require('./safe-run-root.js')
+const { auditPrivatePermissions, createWindowsCompilerDirectory, ensureWindowsPrivateAcl, inspectPathNoFollow, pathIsInside, windowsControllerEnvironment } = require('./safe-run-root.js')
 
 const PROCESS_REGISTRY_SCHEMA_VERSION = 4
 const REQUIRED_PROCESS_ADAPTER_METHODS = Object.freeze([
@@ -18,6 +18,12 @@ const REQUIRED_PROCESS_CAPABILITIES = Object.freeze([
   'persistentIdentity', 'reservationRecovery',
 ])
 const POSIX_RESERVATION_ENV = 'AUTOPROMPT_OWNERSHIP_RESERVATION'
+const SHA256 = /^[a-f0-9]{64}$/
+const BOUND_DRAIN_RECEIPTS = new WeakMap()
+
+function isSha256(value) {
+  return typeof value === 'string' && SHA256.test(value)
+}
 
 function hasExactNulDelimitedEntry(environment, entry) {
   if (!Buffer.isBuffer(environment) || typeof entry !== 'string' || !entry || entry.includes('\0')) return false
@@ -78,7 +84,7 @@ function validateAdapter(adapter, options = {}) {
   for (const field of REQUIRED_PROCESS_CAPABILITIES) {
     if (capabilities[field] !== true) fail('PROVIDER_UNSUPPORTED', `process adapter lacks ${field}`)
   }
-  if (!['posix-process-group', 'windows-job-object', 'test'].includes(adapter.kind)) {
+  if (!['posix-process-group', 'windows-job-object', 'darwin-launchd-coalition', 'test'].includes(adapter.kind)) {
     fail('PROVIDER_UNSUPPORTED', 'process adapter kind is not a supported ownership primitive')
   }
   if (adapter.kind === 'test' && options.allowTestAdapter !== true) {
@@ -106,6 +112,21 @@ function prepareProcessLaunchEnvironment(adapter, reservationId, environment = {
   return adapter?.kind === 'windows-job-object'
     ? normalizeWindowsChildEnvironment(environment, controls)
     : Object.freeze({ ...environment, ...controls })
+}
+
+function validateDarwinLaunchListeners(value) {
+  let listeners
+  try { listeners = require('./darwin-launchd-process.js').validateDarwinListeners(value) }
+  catch (error) {
+    if (error && error.code === 'LAUNCH_SPEC_INVALID') throw error
+    fail('LAUNCH_SPEC_INVALID', 'Darwin listener descriptor is invalid')
+  }
+  // Do not retain a caller-owned nested object across any asynchronous owner
+  // boundary, even when the adapter returned an immutable canonical view.
+  return Object.freeze({
+    proxy: Object.freeze({ fd: listeners.proxy.fd, host: listeners.proxy.host, port: listeners.proxy.port }),
+    mcp: Object.freeze({ fd: listeners.mcp.fd, host: listeners.mcp.host, port: listeners.mcp.port }),
+  })
 }
 
 const WINDOWS_CANONICAL_ENVIRONMENT_KEYS = Object.freeze(new Map([
@@ -167,11 +188,22 @@ function selectWindowsLiveStatusPids(status, isAlive) {
     if (status.ready !== true || status.assigned !== true || currentPids.length !== 0) {
       fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job EXITED status does not prove zero assigned membership')
     }
+    if (status.cwdBridgeRequired === true && status.cwdBridgeCleaned !== true) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job EXITED status did not prove cwd bridge cleanup')
+    }
     return []
+  }
+  if (status.status === 'CLEANING' &&
+      (status.ready !== true || status.assigned !== true || currentPids.length !== 0 ||
+       status.cwdBridgeRequired !== true || status.cwdBridgeCleaned !== false)) {
+    fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job CLEANING status does not prove zero assigned membership')
   }
   const helperAlive = Number.isSafeInteger(status.helperPid) && status.helperPid > 0 &&
     isAlive(status.helperPid)
-  const terminal = ['EXITED', 'FAILED'].includes(status.status)
+  const terminal = ['CLEANING', 'EXITED', 'FAILED'].includes(status.status)
+  if (terminal && status.cwdBridgeRequired === true && status.cwdBridgeCleaned !== true && !helperAlive && currentPids.length === 0) {
+    fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job terminal status retained an unowned cwd bridge')
+  }
   // observedPids is historical evidence, not a durable process identity. Once
   // the Job helper has published a terminal state, KILL_ON_JOB_CLOSE owns the
   // descendant boundary and a later process may reuse one of those PIDs. Only
@@ -223,6 +255,7 @@ class ProcessOwner {
     // caller-facing watchdog fires, so a late physical spawn can never become
     // detached from ownership merely because its JavaScript call timed out.
     this.spawnOperationFences = new Map()
+    BOUND_DRAIN_RECEIPTS.set(this, new WeakMap())
     this._restoreRegistry()
     this.onOwnershipChange(this.ownershipIdentities())
   }
@@ -446,12 +479,25 @@ class ProcessOwner {
     if (spec.shell === true && spec.explicitShellMode !== true) {
       fail('LAUNCH_SPEC_INVALID', 'shell launch requires explicitShellMode')
     }
+    if (spec.requireShortCwd !== undefined && typeof spec.requireShortCwd !== 'boolean') {
+      fail('LAUNCH_SPEC_INVALID', 'short cwd requirement must be boolean')
+    }
+    let darwinListeners
+    if (Object.hasOwn(spec, 'darwinListeners')) {
+      if (this.adapter.kind !== 'darwin-launchd-coalition') {
+        fail('LAUNCH_SPEC_INVALID', 'Darwin listener descriptors require the Darwin coalition adapter')
+      }
+      darwinListeners = validateDarwinLaunchListeners(spec.darwinListeners)
+    }
     if (spec.env !== undefined && (!spec.env || typeof spec.env !== 'object' || Array.isArray(spec.env) ||
         Object.entries(spec.env).some(([name, value]) => !name || name.includes('\0') ||
           typeof value !== 'string' || value.includes('\0')))) {
       fail('LAUNCH_SPEC_INVALID', 'launch env must be an exact string-to-string map without NUL bytes')
     }
     if (typeof spec.targetKey !== 'string' || !spec.targetKey) fail('LAUNCH_SPEC_INVALID', 'launch requires targetKey')
+    if (spec.launchBindingHash !== undefined && !isSha256(spec.launchBindingHash)) {
+      fail('LAUNCH_SPEC_INVALID', 'launch binding hash must be an exact lowercase SHA-256 digest')
+    }
     if (this.adapter.kind !== 'test' && !path.isAbsolute(spec.executable)) {
       fail('LAUNCH_SPEC_INVALID', 'owned executable must be an absolute path; child PATH resolution is forbidden')
     }
@@ -503,6 +549,7 @@ class ProcessOwner {
       startupDeadlineAt,
       reservationIdentity,
       reservationBinding,
+      ...(spec.launchBindingHash !== undefined ? { launchBindingHash: spec.launchBindingHash } : {}),
       status: 'RESERVED',
       rootExit: null,
       terminal: null,
@@ -543,6 +590,8 @@ class ProcessOwner {
         stdin: spec.stdin,
         stdout: spec.stdout,
         stderr: spec.stderr,
+        ...(darwinListeners ? { darwinListeners } : {}),
+        ...(spec.requireShortCwd === true ? { requireShortCwd: true } : {}),
       })
     } catch (error) {
       // Once the durable reservation admits the physical operation, neither a
@@ -960,6 +1009,7 @@ class ProcessOwner {
       startupDeadlineAt: record.startupDeadlineAt,
       reservationIdentity: record.reservationIdentity,
       reservationBinding: record.reservationBinding,
+      launchBindingHash: record.launchBindingHash ?? null,
       status: record.status,
       rootExit: record.rootExit,
       terminal: record.terminal,
@@ -1173,6 +1223,80 @@ class ProcessOwner {
     return evidence
   }
 
+  _boundDrainExpected(expected) {
+    const fields = ['reservationId', 'sessionId', 'targetKey', 'launchBindingHash']
+    if (!expected || typeof expected !== 'object' || Array.isArray(expected) ||
+        Object.keys(expected).sort().join('\0') !== fields.slice().sort().join('\0') ||
+        fields.slice(0, 3).some(field => typeof expected[field] !== 'string' || !expected[field] || expected[field].includes('\0')) ||
+        !isSha256(expected.launchBindingHash)) {
+      fail('PROCESS_IDENTITY_INVALID', 'bound drain request has an invalid exact launch binding')
+    }
+    return Object.freeze(canonicalize(Object.fromEntries(fields.map(field => [field, expected[field]]))))
+  }
+
+  async issueBoundDrainReceipt(expected, options = {}) {
+    const binding = this._boundDrainExpected(expected)
+    if (!options || typeof options !== 'object' || Array.isArray(options) ||
+        Object.keys(options).some(key => key !== 'drainRunning') ||
+        (options.drainRunning !== undefined && typeof options.drainRunning !== 'boolean')) {
+      fail('PROCESS_IDENTITY_INVALID', 'bound drain options are invalid')
+    }
+    const matches = [...this.groups.values()].filter(record =>
+      record.reservationId === binding.reservationId && record.sessionId === binding.sessionId &&
+      record.targetKey === binding.targetKey && record.launchBindingHash === binding.launchBindingHash)
+    if (matches.length !== 1) fail('PROCESS_IDENTITY_INVALID', 'bound drain record is absent, foreign, duplicated, or unbound')
+    let record = matches[0]
+    if (record.status === 'RESERVED') {
+      const probe = await this._probeReservation(record)
+      if (!probe || typeof probe !== 'object' || !['LIVE', 'DEAD', 'PENDING', 'UNKNOWN'].includes(probe.state)) {
+        fail('OWNERSHIP_RECOVERY_FATAL', 'bound launch reservation returned an invalid recovery state', {
+          evidence: { state: probe && typeof probe.state === 'string' ? probe.state : null },
+        })
+      }
+      if (probe.state === 'LIVE') record = this._attachRecovered(record, probe.ownership, 'bound-drain-recover-attach')
+      else if (probe.state === 'DEAD') {
+        this._terminal(record, 'FAILED', 'bound launch reservation is conclusively dead')
+      } else {
+        fail(probe.state === 'PENDING' ? 'OWNERSHIP_RECOVERY_PENDING' : 'OWNERSHIP_RECOVERY_FATAL',
+          `bound launch reservation remains ${probe.state.toLowerCase()}`, { evidence: probe.evidence || null })
+      }
+    }
+    if (record.status === 'RUNNING') {
+      if (options.drainRunning !== true) fail('PROCESS_DRAIN_TIMEOUT', 'bound process group is still running')
+      await this.cancelGroup(record.ownershipId, {
+        reason: 'bound resource cleanup requires exact process drain',
+        graceMs: 0,
+        killMs: Math.max(1, this.startupTimeoutMs),
+        terminalStatus: 'LOST',
+      })
+    }
+    if (['RUNNING', 'RESERVED'].includes(record.status) || !record.terminal) {
+      fail('PROCESS_DRAIN_TIMEOUT', 'bound process record has no durable terminal state')
+    }
+    const identities = [{ kind: `${record.adapterKind}-reservation`, id: record.reservationIdentity }]
+    if (record.groupIdentity) identities.push({ kind: record.adapterKind, id: record.groupIdentity })
+    const evidence = await this.verifyDrainedIdentities(identities)
+    const body = Object.freeze(canonicalize({
+      schemaVersion: 1,
+      ...binding,
+      ownershipId: record.ownershipId,
+      reservationIdentity: record.reservationIdentity,
+      groupIdentity: record.groupIdentity,
+      terminalStatus: record.status,
+      evidence,
+    }))
+    BOUND_DRAIN_RECEIPTS.get(this).set(body, stableStringify(binding))
+    return body
+  }
+
+  verifyBoundDrainReceipt(receipt, expected) {
+    const binding = this._boundDrainExpected(expected)
+    if (!receipt || typeof receipt !== 'object' || BOUND_DRAIN_RECEIPTS.get(this).get(receipt) !== stableStringify(binding)) {
+      fail('PROCESS_IDENTITY_INVALID', 'bound drain receipt is foreign or forged')
+    }
+    return true
+  }
+
   _restoreRegistry() {
     if (!this.fs.existsSync(this.registryPath)) return
     let registry
@@ -1208,7 +1332,8 @@ class ProcessOwner {
           typeof saved.sessionId !== 'string' || !saved.sessionId ||
           Number.isNaN(Date.parse(saved.startupDeadlineAt)) ||
           (!reserved && !hasOwnedIdentity && !saved.terminal) ||
-          saved.adapterKind !== this.adapter.kind || typeof saved.targetKey !== 'string' || !saved.targetKey) {
+          saved.adapterKind !== this.adapter.kind || typeof saved.targetKey !== 'string' || !saved.targetKey ||
+          (Object.hasOwn(saved, 'launchBindingHash') && !isSha256(saved.launchBindingHash))) {
         fail('PROCESS_REGISTRY_FAILURE', 'persisted process ownership identity is invalid')
       }
       const expectedReservationIdentity = typeof this.adapter.reservationIdentity === 'function'
@@ -1267,6 +1392,7 @@ class ProcessOwner {
       startupDeadlineAt: record.startupDeadlineAt,
       reservationIdentity: record.reservationIdentity,
       reservationBinding: record.reservationBinding,
+      ...(record.launchBindingHash !== undefined ? { launchBindingHash: record.launchBindingHash } : {}),
       status: record.status,
       rootExit: record.rootExit,
       terminal: record.terminal || this.terminalRecords.get(record.ownershipId) || null,
@@ -1494,23 +1620,32 @@ $ErrorActionPreference = 'Stop'
 $requestPath = $env:AUTOPROMPT_JOB_REQUEST
 $statusPath = $env:AUTOPROMPT_JOB_STATUS
 $killPath = $env:AUTOPROMPT_JOB_KILL
-$encoding = New-Object System.Text.UTF8Encoding($false)
+$phaseClock = [Diagnostics.Stopwatch]::StartNew()
+function Write-JobPhase([string]$name) { [Console]::Error.WriteLine(('WINDOWS_JOB_PHASE:{0}:{1}' -f $name,$phaseClock.ElapsedMilliseconds)) }
+Write-JobPhase 'start'
 trap {
+  $failureText = [string]$_.Exception.ToString()
+  if ($failureText.Length -gt 2048) { $failureText = $failureText.Substring(0, 2048) }
   try {
     $failure = [ordered]@{ schemaVersion = 1; reservationId = ''; helperPid = $PID; rootPid = $null;
       ready = $false; assigned = $false; status = 'FAILED'; pids = @();
-      error = $_.Exception.ToString(); updatedAt = [DateTime]::UtcNow.ToString('o') }
-    [IO.File]::WriteAllText($statusPath, ($failure | ConvertTo-Json -Compress -Depth 5), $encoding)
-  } catch {}
+      error = $failureText; cwdBridgeRequired = $false; cwdBridgeCleaned = $false; updatedAt = [DateTime]::UtcNow.ToString('o') }
+    $temporary = "$statusPath.$PID.tmp"; $backup = "$statusPath.previous"
+    [AutopromptOwnedJob]::PublishText($statusPath, $temporary, $backup, ($failure | ConvertTo-Json -Compress -Depth 5))
+  } catch { [Console]::Error.WriteLine("WINDOWS_JOB_HELPER_FAILED:$failureText") }
   exit 126
 }
+Write-JobPhase 'compile-start'
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.IO;
 using System.Linq;
+using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Security.Cryptography;
 
 public sealed class AutopromptOwnedJob : IDisposable {
   const UInt32 CREATE_SUSPENDED = 0x00000004;
@@ -1561,11 +1696,131 @@ public sealed class AutopromptOwnedJob : IDisposable {
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass,
     IntPtr info, UInt32 length, out UInt32 returnedLength);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern IntPtr CreateFileW(string path, UInt32 access, UInt32 share, IntPtr security,
+    UInt32 creation, UInt32 flags, IntPtr template);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern UInt32 GetFileAttributesW(string path);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool DeleteFileW(string path);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool RemoveDirectoryW(string path);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool ReplaceFileW(string replaced, string replacement, string backup, UInt32 flags, IntPtr exclude, IntPtr reserved);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool MoveFileExW(string existing, string replacement, UInt32 flags);
 
   IntPtr job;
   IntPtr process;
   IntPtr thread;
   public Int32 RootPid { get; private set; }
+
+  [StructLayout(LayoutKind.Sequential)]
+  struct FileIdentity { public UInt32 attributes, creationLow, creationHigh, accessLow, accessHigh, writeLow, writeHigh, volume, sizeHigh, sizeLow, links, indexHigh, indexLow; }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileIdentity identity);
+  public sealed class ImmutableReadLease : IDisposable {
+    internal readonly List<IDisposable> handles = new List<IDisposable>();
+    public void Dispose() { for (int i=handles.Count-1;i>=0;i--) handles[i].Dispose(); handles.Clear(); }
+  }
+  public static ImmutableReadLease HoldReadFiles(string root, string[] paths, string[] hashes) {
+    if (paths==null || hashes==null || paths.Length<1 || paths.Length>4 || paths.Length!=hashes.Length)
+      throw new InvalidOperationException("immutable read bindings invalid");
+    root=Path.GetFullPath(root).TrimEnd('\\');
+    var lease=new ImmutableReadLease(); var directories=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    try {
+      for(int i=0;i<paths.Length;i++) {
+        string file=Path.GetFullPath(paths[i]);
+        if(!file.StartsWith(root+"\\",StringComparison.OrdinalIgnoreCase) || hashes[i]==null || hashes[i].Length!=64 || hashes[i].Any(c=>!((c>='0'&&c<='9')||(c>='a'&&c<='f'))))
+          throw new InvalidOperationException("immutable read binding escaped");
+        string parent=Path.GetDirectoryName(file); var ancestors=new List<string>();
+        for(string dir=parent;;dir=Path.GetDirectoryName(dir)) { ancestors.Add(dir); if(String.Equals(dir,root,StringComparison.OrdinalIgnoreCase))break; if(dir==null || !dir.StartsWith(root+"\\",StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("immutable ancestor escaped"); }
+        ancestors.Reverse();
+        foreach(string dir in ancestors) if(directories.Add(dir)) {
+          IntPtr raw=CreateFileW(NativePath(dir),0x80,3,IntPtr.Zero,3,0x02200000,IntPtr.Zero);
+          if(raw==new IntPtr(-1)||raw==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error(),"immutable ancestor open failed");
+          var handle=new SafeFileHandle(raw,true); lease.handles.Add(handle); FileIdentity info;
+          if(!GetFileInformationByHandle(handle,out info))throw new Win32Exception(Marshal.GetLastWin32Error(),"immutable ancestor identity failed");
+          if((info.attributes&0x410)!=0x10)throw new InvalidOperationException("immutable ancestor is linked or non-directory");
+        }
+        IntPtr fileRaw=CreateFileW(NativePath(file),0x80000000,1,IntPtr.Zero,3,0x00200080,IntPtr.Zero);
+        if(fileRaw==new IntPtr(-1)||fileRaw==IntPtr.Zero)throw new Win32Exception(Marshal.GetLastWin32Error(),"immutable file open failed");
+        var fileHandle=new SafeFileHandle(fileRaw,true); lease.handles.Add(fileHandle); FileIdentity identity;
+        if(!GetFileInformationByHandle(fileHandle,out identity))throw new Win32Exception(Marshal.GetLastWin32Error(),"immutable file identity failed");
+        if((identity.attributes&0x410)!=0 || identity.links!=1 || identity.sizeHigh!=0 || identity.sizeLow>2097152)
+          throw new InvalidOperationException("immutable file is linked, non-regular or oversized");
+        var stream=new FileStream(fileHandle,FileAccess.Read,4096,false); lease.handles.Add(stream);
+        if(stream.Length>2097152)throw new InvalidOperationException("immutable file oversized");
+        string actual; using(var hash=SHA256.Create())actual=String.Concat(hash.ComputeHash(stream).Select(b=>b.ToString("x2")));
+        if(actual!=hashes[i])throw new InvalidOperationException("immutable file hash mismatch");
+      }
+      return lease;
+    } catch { lease.Dispose(); throw; }
+  }
+
+  static string NativePath(string value) {
+    if (String.IsNullOrEmpty(value) || value.IndexOf('\0') >= 0) throw new ArgumentException("An absolute local or UNC path is required");
+    value = value.Replace('/', '\\');
+    if (value.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) {
+      string[] parts = value.Substring(8).Split('\\');
+      if (parts.Length < 2 || parts[0].Length == 0 || parts[1].Length == 0) throw new ArgumentException("A complete UNC path is required");
+      return value;
+    }
+    if (value.StartsWith(@"\\?\", StringComparison.Ordinal)) {
+      if (value.Length < 7 || !Char.IsLetter(value[4]) || value[5] != ':' || value[6] != '\\') throw new ArgumentException("Unsupported extended path");
+      return value;
+    }
+    if (value.StartsWith(@"\\", StringComparison.Ordinal)) {
+      string[] parts = value.Substring(2).Split('\\');
+      if (parts.Length < 2 || parts[0].Length == 0 || parts[1].Length == 0) throw new ArgumentException("A complete UNC path is required");
+      return @"\\?\UNC\" + value.Substring(2);
+    }
+    if (value.Length < 3 || !Char.IsLetter(value[0]) || value[1] != ':' || value[2] != '\\') throw new ArgumentException("An absolute drive path is required");
+    return @"\\?\" + value;
+  }
+  static SafeFileHandle OpenFile(string value, UInt32 access, UInt32 share, UInt32 creation) {
+    IntPtr raw = CreateFileW(NativePath(value), access, share, IntPtr.Zero, creation, 0x80, IntPtr.Zero);
+    if (raw == new IntPtr(-1) || raw == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateFileW failed");
+    return new SafeFileHandle(raw, true);
+  }
+  public static bool FileExists(string value) {
+    if (GetFileAttributesW(NativePath(value)) != 0xffffffff) return true;
+    int error = Marshal.GetLastWin32Error();
+    if (error == 2 || error == 3) return false;
+    throw new Win32Exception(error, "GetFileAttributesW failed");
+  }
+  public static string ReadText(string value) {
+    using (var handle = OpenFile(value, 0x80000000, 1, 3))
+    using (var stream = new FileStream(handle, FileAccess.Read, 4096, false))
+    using (var reader = new StreamReader(stream, new UTF8Encoding(false, true), true, 4096)) return reader.ReadToEnd();
+  }
+  static void WriteNew(string value, string text, ref bool owned) {
+    using (var handle = OpenFile(value, 0x40000000, 1, 1)) {
+      owned = true;
+      using (var stream = new FileStream(handle, FileAccess.Write, 4096, false)) {
+        byte[] bytes = new UTF8Encoding(false, true).GetBytes(text); stream.Write(bytes, 0, bytes.Length); stream.Flush(true);
+      }
+    }
+  }
+  static void DeleteIfPresent(string value) {
+    if (DeleteFileW(NativePath(value))) return;
+    int error = Marshal.GetLastWin32Error(); if (error != 2 && error != 3) throw new Win32Exception(error, "DeleteFileW failed");
+  }
+  public static void PublishText(string destination, string temporary, string backup, string text) {
+    bool ownsTemporary = false;
+    try {
+      WriteNew(temporary, text, ref ownsTemporary);
+      if (FileExists(destination)) {
+        DeleteIfPresent(backup);
+        if (!ReplaceFileW(NativePath(destination), NativePath(temporary), NativePath(backup), 1, IntPtr.Zero, IntPtr.Zero))
+          throw new Win32Exception(Marshal.GetLastWin32Error(), "ReplaceFileW failed");
+        ownsTemporary = false;
+        DeleteIfPresent(backup);
+      } else if (!MoveFileExW(NativePath(temporary), NativePath(destination), 8)) {
+        throw new Win32Exception(Marshal.GetLastWin32Error(), "MoveFileExW failed");
+      } else ownsTemporary = false;
+    } catch { if (ownsTemporary) { try { DeleteIfPresent(temporary); } catch {} } throw; }
+  }
+  public static void RemoveDirectoryLink(string value) {
+    if (RemoveDirectoryW(NativePath(value))) return;
+    int error = Marshal.GetLastWin32Error(); if (error != 2 && error != 3) throw new Win32Exception(error, "RemoveDirectoryW failed");
+  }
 
   static string Quote(string value) {
     if (value.Length == 0) return "\"\"";
@@ -1606,8 +1861,12 @@ public sealed class AutopromptOwnedJob : IDisposable {
     try {
       if (!CreateProcess(executable, command, IntPtr.Zero, IntPtr.Zero, false,
           CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-          environmentPointer, cwd, ref startup, out created))
-        throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateProcess suspended failed");
+          environmentPointer, cwd, ref startup, out created)) {
+        int error = Marshal.GetLastWin32Error();
+        owned.Dispose();
+        throw new Win32Exception(error, String.Format("CreateProcess suspended failed (nativeError={0}, applicationLength={1}, commandLength={2}, cwdLength={3}, environmentLength={4})",
+          error, executable == null ? 0 : executable.Length, command.Length, cwd == null ? 0 : cwd.Length, environmentText.Length));
+      }
     } finally { Marshal.FreeHGlobal(environmentPointer); }
     owned.process = created.hProcess; owned.thread = created.hThread; owned.RootPid = (Int32)created.dwProcessId;
     if (!AssignProcessToJobObject(owned.job, owned.process)) {
@@ -1669,6 +1928,15 @@ public sealed class AutopromptOwnedJob : IDisposable {
   }
 }
 '@
+Write-JobPhase 'compile-done'
+
+$compilerDirectory = [string]$env:AUTOPROMPT_JOB_COMPILER_DIRECTORY
+$runtimeTemp = [string]$env:AUTOPROMPT_JOB_RUNTIME_TEMP
+if (-not $compilerDirectory -or -not $runtimeTemp) { throw 'Windows Job compiler environment unavailable' }
+$env:TEMP = $runtimeTemp
+$env:TMP = $runtimeTemp
+[IO.Directory]::Delete($compilerDirectory, $true)
+Write-JobPhase 'compiler-cleanup-done'
 
 if ($env:AUTOPROMPT_JOB_PROBE -eq '1') {
   $probeEnvironment = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -1679,28 +1947,36 @@ if ($env:AUTOPROMPT_JOB_PROBE -eq '1') {
   exit 0
 }
 
-$request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$request = [AutopromptOwnedJob]::ReadText($requestPath) | ConvertFrom-Json
+Write-JobPhase 'request-loaded'
 function Write-JobStatus([string]$state, [bool]$ready, [bool]$assigned, [object[]]$pids, [string]$errorText) {
   $script:observedPids = @($script:observedPids + @($pids) | Where-Object { $_ -is [ValueType] } | Sort-Object -Unique)
   $record = [ordered]@{ schemaVersion = 1; reservationId = [string]$request.reservationId;
     reservationIdentity = [string]$request.reservationIdentity; requestChecksum = [string]$request.checksum; helperPid = $PID;
     rootPid = if ($script:owned) { $script:owned.RootPid } else { $null }; ready = $ready; assigned = $assigned;
     status = $state; pids = @($pids); observedPids = @($script:observedPids); error = $errorText;
+    cwdBridgeRequired = [bool]$request.physicalCwd;
+    cwdBridgeCleaned = $script:cwdBridgeCleaned;
     updatedAt = [DateTime]::UtcNow.ToString('o') }
   $json = $record | ConvertTo-Json -Compress -Depth 5
   $temporary = "$statusPath.$PID.tmp"
-  [IO.File]::WriteAllText($temporary, $json, $encoding)
-  if (Test-Path -LiteralPath $statusPath) {
-    $backup = "$statusPath.previous"
-    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-    [IO.File]::Replace($temporary, $statusPath, $backup, $true)
-    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-  }
-  else { [IO.File]::Move($temporary, $statusPath) }
+  $backup = "$statusPath.previous"
+  [AutopromptOwnedJob]::PublishText($statusPath, $temporary, $backup, $json)
 }
 
 $script:owned = $null
 $script:observedPids = @()
+$script:cwdBridgeCleaned = $false
+$script:immutableReadLease = $null
+function Remove-JobCwdBridge {
+  if ($script:cwdBridgeCleaned) { return }
+  $alias = [string]$request.physicalCwd
+  $root = [string]$request.cwdBridgeRoot
+  if (-not $alias -and -not $root) { return }
+  if ($alias) { [AutopromptOwnedJob]::RemoveDirectoryLink($alias) }
+  if ($root) { [AutopromptOwnedJob]::RemoveDirectoryLink($root) }
+  $script:cwdBridgeCleaned = $true
+}
 try {
   $startupDelay = [int]$request.startupDelayMilliseconds
   if ($startupDelay -gt 0) { Start-Sleep -Milliseconds $startupDelay }
@@ -1708,11 +1984,20 @@ try {
   foreach ($property in $request.environment.PSObject.Properties) { $environment[[string]$property.Name] = [string]$property.Value }
   $arguments = @($request.argv | ForEach-Object { [string]$_ })
   $startupDeadline = [DateTime]::Parse([string]$request.startupDeadlineAt).ToUniversalTime()
+  if ($request.immutableReadFiles) {
+    $readPaths = @($request.immutableReadFiles | ForEach-Object { [string]$_.path })
+    $readHashes = @($request.immutableReadFiles | ForEach-Object { [string]$_.sha256 })
+    $script:immutableReadLease = [AutopromptOwnedJob]::HoldReadFiles([string]$request.immutableReadRoot, [string[]]$readPaths, [string[]]$readHashes)
+    Write-JobPhase 'immutable-read-files-held'
+  }
+  Write-JobPhase 'job-start'
   $script:owned = [AutopromptOwnedJob]::Start([string]$request.executable, [string[]]$arguments,
-    [string]$request.cwd, $environment, $startupDeadline)
+    $(if ($request.physicalCwd) { [string]$request.physicalCwd } else { [string]$request.cwd }), $environment, $startupDeadline)
+  Write-JobPhase 'job-assigned-resumed'
   Write-JobStatus 'RUNNING' $true $true @($script:owned.ProcessIds()) $null
+  Write-JobPhase 'status-published'
   while ($true) {
-    if (Test-Path -LiteralPath $killPath) {
+    if ([AutopromptOwnedJob]::FileExists($killPath)) {
       $terminating = @($script:owned.ProcessIds())
       Write-JobStatus 'STOPPING' $true $true $terminating $null
       $script:owned.Terminate(143)
@@ -1722,14 +2007,50 @@ try {
     Write-JobStatus 'RUNNING' $true $true $pids $null
     Start-Sleep -Milliseconds 50
   }
+  if ($request.physicalCwd) { Write-JobStatus 'CLEANING' $true $true @() $null }
+  Remove-JobCwdBridge
+  Write-JobPhase 'cwd-bridge-cleanup-done'
+  if ($script:immutableReadLease) { $script:immutableReadLease.Dispose(); $script:immutableReadLease = $null }
   Write-JobStatus 'EXITED' $true $true @() $null
 } catch {
-  try { Write-JobStatus 'FAILED' $false $false @() $_.Exception.ToString() } catch {}
+  $failureText = $_.Exception.ToString()
+  $remaining = @()
+  $drainConfirmed = -not [bool]$script:owned
+  if ($script:owned) {
+    try { $script:owned.Terminate(126) } catch { $failureText += [Environment]::NewLine + 'Job termination failed: ' + $_.Exception.ToString() }
+    $drainDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+      try { $remaining = @($script:owned.ProcessIds()); if ($remaining.Count -eq 0) { $drainConfirmed = $true } } catch { $failureText += [Environment]::NewLine + 'Job drain query failed: ' + $_.Exception.ToString(); break }
+      if ($remaining.Count -gt 0) { Start-Sleep -Milliseconds 25 }
+    } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $drainDeadline)
+  }
+  if ($drainConfirmed) {
+    try { Remove-JobCwdBridge } catch { $failureText += [Environment]::NewLine + 'CWD bridge cleanup failed: ' + $_.Exception.ToString() }
+    if ($script:immutableReadLease) { $script:immutableReadLease.Dispose(); $script:immutableReadLease = $null }
+  }
+  try { Write-JobStatus 'FAILED' $false $false $remaining $failureText } catch {}
+  if (-not $drainConfirmed -and $script:immutableReadLease -and $script:owned) {
+    # Keep the Job and immutable file handles owned until native membership
+    # confirms drain. A failed query must never voluntarily unlock the files.
+    while (-not $drainConfirmed) {
+      try { $script:owned.Terminate(126) } catch {}
+      try {
+        $remaining = @($script:owned.ProcessIds())
+        $drainConfirmed = $remaining.Count -eq 0
+      } catch {}
+      if (-not $drainConfirmed) { Start-Sleep -Milliseconds 250 }
+    }
+    try { Remove-JobCwdBridge } catch { $failureText += [Environment]::NewLine + 'CWD bridge cleanup failed: ' + $_.Exception.ToString() }
+    $script:immutableReadLease.Dispose(); $script:immutableReadLease = $null
+    try { Write-JobStatus 'FAILED' $false $false @() $failureText } catch {}
+  }
   exit 126
 } finally {
   if ($script:owned) { $script:owned.Dispose() }
+  if ($script:immutableReadLease) { $script:immutableReadLease.Dispose() }
 }
 `
+const WINDOWS_JOB_BOOTSTRAP = "$ErrorActionPreference='Stop';$source=[Console]::In.ReadToEnd();& ([ScriptBlock]::Create($source))"
 
 function createWindowsJobAdapter(options = {}) {
   if (options && REQUIRED_PROCESS_ADAPTER_METHODS.every((method) => typeof options[method] === 'function')) {
@@ -1743,7 +2064,10 @@ function createWindowsJobAdapter(options = {}) {
   const fsImpl = options.fsImpl || fs
   const spawn = options.spawn || childProcess.spawn
   const execFileSync = options.execFileSync || childProcess.execFileSync
-  const powershellPath = options.powershellPath || 'powershell.exe'
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  const powershellPath = options.powershellPath || (typeof systemRoot === 'string' ? path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell.exe')
+  const createCompilerDirectory = options.createWindowsCompilerDirectory || createWindowsCompilerDirectory
+  const controllerEnvironment = options.windowsControllerEnvironment || windowsControllerEnvironment
   const wallNowMs = options.wallNowMs || Date.now
   const monotonicMs = options.monotonicMs || (() => Number(process.hrtime.bigint() / 1000000n))
   const startupDelayMilliseconds = options.startupDelayMilliseconds === undefined ? 0 : options.startupDelayMilliseconds
@@ -1767,6 +2091,30 @@ function createWindowsJobAdapter(options = {}) {
       fail('PROVIDER_UNSUPPORTED', 'Windows Job controlRoot must be contained by providerPrivateOwnershipRoot')
     }
     if (fsImpl === fs) auditPrivatePermissions(providerPrivateOwnershipRoot, { recurse: false })
+  }
+  const immutableReadFiles = options.immutableReadFiles === undefined ? [] : options.immutableReadFiles
+  if (!Array.isArray(immutableReadFiles) || immutableReadFiles.length > 4 ||
+      (immutableReadFiles.length && (!providerPrivateOwnershipRoot || fsImpl !== fs))) {
+    fail('PROCESS_OWNER_CONFIG_INVALID', 'Windows immutable read files require a bounded physical private root')
+  }
+  const validateImmutableReadFile = entry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+        Object.keys(entry).sort().join(',') !== 'path,sha256' ||
+        typeof entry.path !== 'string' || !path.isAbsolute(entry.path) || !isSha256(entry.sha256)) {
+      fail('PROCESS_OWNER_CONFIG_INVALID', 'Windows immutable read file requires an exact path and SHA-256')
+    }
+    const resolved = path.resolve(entry.path), captured = inspectPathNoFollow(resolved, { mustBeDirectory: false })
+    const item = fsImpl.lstatSync(resolved)
+    if (!pathIsInside(providerPrivateOwnershipRoot, resolved) || !captured.exists || !captured.realpath ||
+        captured.realpath.toLowerCase() !== resolved.toLowerCase() || !item.isFile() || item.isSymbolicLink() ||
+        Number(item.nlink) !== 1 || item.size > 2 * 1024 * 1024 || crypto.createHash('sha256').update(fsImpl.readFileSync(resolved)).digest('hex') !== entry.sha256) {
+      fail('PROCESS_OWNER_CONFIG_INVALID', 'Windows immutable read file binding changed or escaped')
+    }
+    return Object.freeze({ path: resolved, sha256: entry.sha256 })
+  }
+  const immutableReadBindings = Object.freeze(immutableReadFiles.map(validateImmutableReadFile))
+  if (new Set(immutableReadBindings.map(entry => entry.path.toLowerCase())).size !== immutableReadBindings.length) {
+    fail('PROCESS_OWNER_CONFIG_INVALID', 'Windows immutable read file bindings must be distinct')
   }
   const trustedOwnershipRoots = (options.trustedOwnershipRoots || [providerPrivateOwnershipRoot || controlRoot]).map((entry) => {
     if (typeof entry !== 'string' || !path.isAbsolute(entry)) {
@@ -1829,6 +2177,42 @@ function createWindowsJobAdapter(options = {}) {
     }
     return null
   }
+  const removeCwdBridge = (bridge) => {
+    if (!bridge) return
+    if (fsImpl.existsSync(bridge.physicalCwd)) fsImpl.unlinkSync(bridge.physicalCwd)
+    if (fsImpl.existsSync(bridge.root)) fsImpl.rmdirSync(bridge.root)
+  }
+  const createCwdBridge = (requestedCwd, requireShortCwd = false) => {
+    if (!requireShortCwd && requestedCwd.length < 260) return null
+    const before = inspectPathNoFollow(requestedCwd, { fsImpl })
+    if (!before.exists || !before.realpath || !before.identity) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job requested cwd is not one physical directory')
+    }
+    const requestedItem = fsImpl.lstatSync(requestedCwd)
+    if (!requestedItem.isDirectory() || requestedItem.isSymbolicLink()) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job requested cwd is not a physical directory')
+    }
+    const root = createCompilerDirectory('autoprompt-job-cwd-')
+    const physicalCwd = path.join(root, 'cwd')
+    try {
+      fsImpl.symlinkSync(before.realpath, physicalCwd, 'junction')
+      const alias = fsImpl.lstatSync(physicalCwd)
+      const resolved = fsImpl.realpathSync.native(physicalCwd)
+      const after = inspectPathNoFollow(requestedCwd, { fsImpl })
+      if (!alias.isSymbolicLink() || resolved.toLowerCase() !== before.realpath.toLowerCase() ||
+          !after.exists || stableStringify(after.identity) !== stableStringify(before.identity)) {
+        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job cwd bridge does not bind the requested physical directory')
+      }
+      if (physicalCwd.length >= 260) fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job cwd bridge is not shallow')
+      return { root, physicalCwd, requestedCwd, requestedIdentity: before.identity }
+    } catch (error) {
+      try { removeCwdBridge({ root, physicalCwd }) } catch {
+        error.cleanupConfirmed = false
+        error.retainedCwdBridgeRoot = root
+      }
+      throw error
+    }
+  }
   const processAlive = (pid) => {
     if (!Number.isSafeInteger(pid) || pid < 1) return false
     try { process.kill(pid, 0); return true } catch (error) { return Boolean(error && error.code === 'EPERM') }
@@ -1878,11 +2262,41 @@ function createWindowsJobAdapter(options = {}) {
     }
     return request
   }
+  const validateCwdBridgeRecord = (request, status) => {
+    const fields = [request.physicalCwd, request.cwdBridgeRoot, request.cwdIdentity]
+    const present = fields.filter(value => value !== undefined).length
+    if (present === 0) return
+    if (present !== fields.length || typeof request.cwd !== 'string' || !path.isAbsolute(request.cwd) ||
+        (request.cwd.length < 260 && request.requireShortCwd !== true) ||
+        (request.requireShortCwd !== undefined && request.requireShortCwd !== true) ||
+        typeof request.physicalCwd !== 'string' || !path.isAbsolute(request.physicalCwd) || request.physicalCwd.length >= 260 ||
+        typeof request.cwdBridgeRoot !== 'string' || !path.isAbsolute(request.cwdBridgeRoot) ||
+        path.dirname(request.physicalCwd) !== request.cwdBridgeRoot || !request.cwdIdentity || typeof request.cwdIdentity !== 'object') {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job immutable request has an invalid cwd bridge binding')
+    }
+    if (typeof status.cwdBridgeRequired !== 'boolean' || typeof status.cwdBridgeCleaned !== 'boolean' ||
+        status.cwdBridgeRequired !== true) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job status has an invalid cwd bridge state')
+    }
+    if (status.cwdBridgeCleaned === true) {
+      if (fsImpl.existsSync(request.physicalCwd) || fsImpl.existsSync(request.cwdBridgeRoot)) {
+        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job claimed cwd bridge cleanup while the bridge remained')
+      }
+    }
+  }
   const validateControlRecord = (directory, status) => {
     const request = readRequestRecord(directory)
     if (status.reservationId !== request.reservationId || status.reservationIdentity !== request.reservationIdentity ||
         status.requestChecksum !== request.checksum) {
       fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job status does not bind its exact immutable request record')
+    }
+    if (request.physicalCwd !== undefined) {
+      if (status.cwdBridgeRequired !== true || typeof status.cwdBridgeCleaned !== 'boolean') {
+        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job status does not bind its cwd bridge requirement')
+      }
+      validateCwdBridgeRecord(request, status)
+    } else if (status.cwdBridgeRequired === true) {
+      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job status claims an unbound cwd bridge')
     }
     return request
   }
@@ -1916,7 +2330,7 @@ function createWindowsJobAdapter(options = {}) {
     // Windows PowerShell cold-starts and compiles the native Job bridge before
     // it can create the suspended child. Keep that platform preparation inside
     // one explicit durable deadline rather than a shorter hidden adapter timer.
-    startupTimeoutMs: 30000,
+    startupTimeoutMs: 120000,
     capabilities: Object.fromEntries(REQUIRED_PROCESS_CAPABILITIES.map((field) => [field, true])),
     reservationIdentity(reservationId) { return persistentIdentity(reservationId) },
     prepareReservation(input) { return reservationBindingFor(input) },
@@ -1975,7 +2389,30 @@ function createWindowsJobAdapter(options = {}) {
             !Number.isSafeInteger(launcher.helperPid) || launcher.helperPid < 1) {
           return { state: 'UNKNOWN', evidence: { reason: 'launcher-foreign' } }
         }
-        if (!processAlive(launcher.helperPid) && wallNowMs() >= Date.parse(record.startupDeadlineAt)) {
+        const request = readRequestRecord(files.directory)
+        const requestBridge = request.physicalCwd === undefined ? null : {
+          requestedCwd: request.cwd, physicalCwd: request.physicalCwd,
+          cwdBridgeRoot: request.cwdBridgeRoot, cwdIdentity: request.cwdIdentity,
+          requireShortCwd: request.requireShortCwd === true,
+        }
+        const launcherBridge = launcher.physicalCwd === undefined ? null : {
+          requestedCwd: launcher.requestedCwd, physicalCwd: launcher.physicalCwd,
+          cwdBridgeRoot: launcher.cwdBridgeRoot, cwdIdentity: launcher.cwdIdentity,
+          requireShortCwd: launcher.requireShortCwd === true,
+        }
+        if (stableStringify(requestBridge) !== stableStringify(launcherBridge)) {
+          return { state: 'UNKNOWN', evidence: { reason: 'launcher-cwd-bridge-foreign' } }
+        }
+        const helperAlive = processAlive(launcher.helperPid)
+        try {
+          if (requestBridge) validateCwdBridgeRecord(request, { cwdBridgeRequired: true, cwdBridgeCleaned: false })
+        } catch (error) {
+          return { state: 'UNKNOWN', evidence: { reason: 'launcher-cwd-bridge-invalid', cause: error.message } }
+        }
+        if (!helperAlive && requestBridge) {
+          return { state: 'UNKNOWN', evidence: { reason: 'launcher-dead-with-unproven-cwd-bridge-cleanup', helperPid: launcher.helperPid } }
+        }
+        if (!helperAlive && wallNowMs() >= Date.parse(record.startupDeadlineAt)) {
           return { state: 'DEAD', evidence: { reason: 'launcher-dead-after-deadline', helperPid: launcher.helperPid } }
         }
       }
@@ -2042,7 +2479,7 @@ function createWindowsJobAdapter(options = {}) {
           encoding: 'utf8',
           windowsHide: true,
           timeout: 10000,
-          env: process.env,
+          env: { ...controllerEnvironment(systemRoot), ComSpec: path.win32.join(systemRoot, 'System32', 'cmd.exe') },
         })
         return { supported: true }
       } catch (error) {
@@ -2058,49 +2495,108 @@ function createWindowsJobAdapter(options = {}) {
       })
       const files = filesForReservation(spec.reservationId)
       fsImpl.mkdirSync(files.directory, { recursive: true, mode: 0o700 })
-      atomicWriteJson(files.requestPath, {
-        schemaVersion: 1,
-        reservationId: spec.reservationId,
-        reservationIdentity: spec.reservationIdentity,
-        reservationBindingHash: sha256(stableStringify(reservationBinding)),
-        reservationBinding,
-        startupDeadlineAt: spec.startupDeadlineAt,
-        startupDelayMilliseconds,
-        targetKey: spec.targetKey,
-        executable: spec.executable,
-        argv: spec.argv,
-        cwd: spec.cwd || process.cwd(),
-        // The helper has its own inherited control environment. The owned
-        // child receives exactly the caller-authorized map and no ambient
-        // supervisor variables.
-        environment: { ...(spec.env || {}) },
-      }, { fsImpl })
+      const requestedCwd = path.resolve(spec.cwd || process.cwd())
+      let cwdBridge
+      try {
+        cwdBridge = createCwdBridge(requestedCwd, spec.requireShortCwd === true)
+        for (const entry of immutableReadBindings) validateImmutableReadFile(entry)
+        atomicWriteJson(files.requestPath, {
+          schemaVersion: 1,
+          reservationId: spec.reservationId,
+          reservationIdentity: spec.reservationIdentity,
+          reservationBindingHash: sha256(stableStringify(reservationBinding)),
+          reservationBinding,
+          startupDeadlineAt: spec.startupDeadlineAt,
+          startupDelayMilliseconds,
+          targetKey: spec.targetKey,
+          executable: spec.executable,
+          argv: spec.argv,
+          cwd: requestedCwd,
+          ...(spec.requireShortCwd === true ? { requireShortCwd: true } : {}),
+          ...(cwdBridge ? { physicalCwd: cwdBridge.physicalCwd, cwdBridgeRoot: cwdBridge.root,
+            cwdIdentity: cwdBridge.requestedIdentity } : {}),
+          // The helper has its own inherited control environment. The owned
+          // child receives exactly the caller-authorized map and no ambient
+          // supervisor variables.
+          environment: { ...(spec.env || {}) },
+          ...(immutableReadBindings.length ? { immutableReadRoot: providerPrivateOwnershipRoot, immutableReadFiles: immutableReadBindings } : {}),
+        }, { fsImpl })
+      } catch (error) {
+        if (cwdBridge) {
+          try { removeCwdBridge(cwdBridge) } catch {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
+        }
+        throw error
+      }
       try { fsImpl.unlinkSync(files.killPath) } catch {}
       const diagnosticDescriptor = fsImpl.openSync(files.stderrPath, 'a', 0o600)
-      let helper
+      let helper, compilerDirectory, helperInputError = null, helperError = null, helperExit = null
       try {
+        compilerDirectory = createCompilerDirectory('autoprompt-job-')
+        const environment = controllerEnvironment(systemRoot)
         helper = spawn(powershellPath, [
           '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-          '-File', helperPath,
+          '-Command', WINDOWS_JOB_BOOTSTRAP,
         ], {
           windowsHide: true,
           // Windows processes are independently owned after creation; keeping
-          // this false avoids Node's detached-console launch losing -File on
-          // legacy Windows PowerShell while unref still releases the JS loop.
+          // this false avoids detached-console launch differences in legacy
+          // Windows PowerShell while unref still releases the JS loop.
           detached: false,
-          stdio: ['ignore', 'ignore', diagnosticDescriptor],
+          stdio: ['pipe', 'ignore', diagnosticDescriptor],
           env: {
-            ...process.env,
+            ...environment,
+            TEMP: compilerDirectory,
+            TMP: compilerDirectory,
+            ComSpec: path.win32.join(systemRoot, 'System32', 'cmd.exe'),
             AUTOPROMPT_JOB_REQUEST: files.requestPath,
             AUTOPROMPT_JOB_STATUS: files.statusPath,
             AUTOPROMPT_JOB_KILL: files.killPath,
+            AUTOPROMPT_JOB_COMPILER_DIRECTORY: compilerDirectory,
+            AUTOPROMPT_JOB_RUNTIME_TEMP: environment.TEMP,
           },
         })
+        helper.once('error', (error) => { helperError = error })
+        helper.once('exit', (code, signal) => { helperExit = { code, signal } })
+        if (!helper.stdin || typeof helper.stdin.end !== 'function') fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper has no owned source pipe')
+        helper.stdin.on('error', (error) => { helperInputError ||= error })
+        helper.stdin.end(WINDOWS_JOB_HELPER, 'utf8', (error) => { if (error) helperInputError ||= error })
+      } catch (error) {
+        if (compilerDirectory && (!helper || !Number.isSafeInteger(helper.pid)) && fsImpl.existsSync(compilerDirectory)) {
+          fsImpl.rmSync(compilerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+        }
+        if (compilerDirectory && helper && Number.isSafeInteger(helper.pid) && fsImpl.existsSync(compilerDirectory)) {
+          error.cleanupConfirmed = false
+          error.retainedCompilerRoot = compilerDirectory
+        }
+        if (cwdBridge && (!helper || !Number.isSafeInteger(helper.pid))) {
+          try { removeCwdBridge(cwdBridge) } catch {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
+        } else if (cwdBridge && helper && Number.isSafeInteger(helper.pid) && fsImpl.existsSync(cwdBridge.root)) {
+          error.cleanupConfirmed = false
+          error.retainedCwdBridgeRoot = cwdBridge.root
+        }
+        throw error
       } finally {
         fsImpl.closeSync(diagnosticDescriptor)
       }
       if (!helper || !Number.isSafeInteger(helper.pid) || helper.pid < 1) {
-        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper launch returned no stable helper identity')
+        const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper launch returned no stable helper identity')
+        if (compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+          error.cleanupConfirmed = false
+          error.retainedCompilerRoot = compilerDirectory
+        }
+        if (cwdBridge && fsImpl.existsSync(cwdBridge.root)) {
+          try { removeCwdBridge(cwdBridge) } catch {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
+        }
+        throw error
       }
       atomicWriteJson(files.launcherPath, {
         schemaVersion: 1,
@@ -2109,16 +2605,20 @@ function createWindowsJobAdapter(options = {}) {
         reservationBindingHash: sha256(stableStringify(reservationBinding)),
         startupDeadlineAt: spec.startupDeadlineAt,
         helperPid: helper.pid,
+        ...(spec.requireShortCwd === true ? { requireShortCwd: true } : {}),
+        ...(cwdBridge ? { requestedCwd, physicalCwd: cwdBridge.physicalCwd, cwdBridgeRoot: cwdBridge.root,
+          cwdIdentity: cwdBridge.requestedIdentity } : {}),
       }, { fsImpl })
-      let helperError = null
-      let helperExit = null
-      helper.once('error', (error) => { helperError = error })
-      helper.once('exit', (code, signal) => { helperExit = { code, signal } })
       helper.unref()
       const startupDeadlineMs = Date.parse(spec.startupDeadlineAt)
       const startupBudgetMs = startupDeadlineMs - wallNowMs()
       if (!Number.isFinite(startupDeadlineMs) || !Number.isFinite(startupBudgetMs) || startupBudgetMs <= 0) {
-        fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job startup deadline expired before helper launch')
+        const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job startup deadline expired before helper launch')
+        if (compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+          error.cleanupConfirmed = false
+          error.retainedCompilerRoot = compilerDirectory
+        }
+        throw error
       }
       const started = monotonicMs()
       while (true) {
@@ -2127,17 +2627,40 @@ function createWindowsJobAdapter(options = {}) {
           return { rootPid: status.rootPid, groupIdentity: files.groupIdentity, helperPid: status.helperPid }
         }
         if (status && status.status === 'FAILED') {
-          fail('PROCESS_ASSIGNMENT_ESCAPED', `Windows Job assignment failed before resume: ${status.error}`)
+          const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', `Windows Job assignment failed before resume: ${status.error}`)
+          if (compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+            error.cleanupConfirmed = false
+            error.retainedCompilerRoot = compilerDirectory
+          }
+          if (cwdBridge && fsImpl.existsSync(cwdBridge.root)) {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
+          throw error
         }
-        if (helperError || helperExit) {
+        if (helperInputError || helperError || helperExit) {
+          let compilerCleanupError = null
+          if (helperExit && compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+            try { fsImpl.rmSync(compilerDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) } catch (error) { compilerCleanupError = error }
+          }
           const diagnostic = fsImpl.existsSync(files.stderrPath)
             ? fsImpl.readFileSync(files.stderrPath, 'utf8').slice(-8192)
             : ''
-          fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper exited before proving suspended assignment', {
-            cause: helperError && helperError.message,
+          const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper exited before proving suspended assignment', {
+            cause: (helperInputError || helperError) && (helperInputError || helperError).message,
             exit: helperExit,
             diagnostic,
           })
+          if ((!helperExit && compilerDirectory && fsImpl.existsSync(compilerDirectory)) || compilerCleanupError) {
+            error.cleanupConfirmed = false
+            error.retainedCompilerRoot = compilerDirectory
+            if (compilerCleanupError) error.cleanupCode = String(compilerCleanupError.code || 'cleanup-failed').slice(0, 64)
+          }
+          if (cwdBridge && fsImpl.existsSync(cwdBridge.root)) {
+            error.cleanupConfirmed = false
+            error.retainedCwdBridgeRoot = cwdBridge.root
+          }
+          throw error
         }
         // Always observe status once before enforcing the local polling
         // deadline. Synchronous Windows work (notably an ACL audit in a
@@ -2151,9 +2674,14 @@ function createWindowsJobAdapter(options = {}) {
       const diagnostic = fsImpl.existsSync(files.stderrPath)
         ? fsImpl.readFileSync(files.stderrPath, 'utf8').slice(-8192)
         : ''
-      fail('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper did not prove suspended assignment before timeout', {
+      const error = new ProcessOwnerError('PROCESS_ASSIGNMENT_ESCAPED', 'Windows Job helper did not prove suspended assignment before timeout', {
         diagnostic,
       })
+      if (compilerDirectory && fsImpl.existsSync(compilerDirectory)) {
+        error.cleanupConfirmed = false
+        error.retainedCompilerRoot = compilerDirectory
+      }
+      throw error
     },
     async recoverReservation(reservationId) {
       const files = filesForReservation(reservationId)
@@ -2223,6 +2751,17 @@ function createPlatformProcessAdapter(options = {}) {
     const create = options.createWindowsJobAdapter || createWindowsJobAdapter
     if (typeof create !== 'function') fail('PROCESS_OWNER_CONFIG_INVALID', 'Windows process adapter factory is invalid')
     return create(options.windows || {})
+  }
+  if (platform === 'darwin') {
+    const darwin = options.darwin
+    if (!darwin || typeof darwin !== 'object' || Array.isArray(darwin) || !path.isAbsolute(darwin.controlRoot || '') || !path.isAbsolute(darwin.providerPrivateOwnershipRoot || '')) fail('PROCESS_OWNER_CONFIG_INVALID', 'Darwin process adapter requires explicit private control and ownership roots')
+    const load = options.loadDarwinCoalitionHelper || require('./darwin-coalition-loader.js').loadDarwinCoalitionHelper
+    const loadListener = options.loadDarwinListenerSupervisor || require('./darwin-listener-loader.js').loadDarwinListenerSupervisor
+    const create = options.createDarwinCoalitionAdapter || require('./darwin-launchd-process.js').createDarwinCoalitionAdapter
+    if (typeof load !== 'function' || typeof loadListener !== 'function' || typeof create !== 'function') fail('PROCESS_OWNER_CONFIG_INVALID', 'Darwin process adapter factories are invalid')
+    const helper = load()
+    const listenerSupervisor = loadListener()
+    return create({ ...darwin, helper, listenerSupervisor })
   }
   const create = options.createPosixProcessAdapter || createPosixProcessAdapter
   if (typeof create !== 'function') fail('PROCESS_OWNER_CONFIG_INVALID', 'POSIX process adapter factory is invalid')

@@ -268,6 +268,10 @@ Autoprompt turns one explicit goal into a closed plan, build, test, review, repa
 
 ## Highlights
 
+- Native Windows runtime support without WSL2 or a VM, including Claude Code 2.1.270
+- OpenCode activation through npm-generated native executable shims and PowerShell argument forwarding
+- Platform fixes and native verification on Windows, macOS, and Linux, including x64 and ARM64
+- Windows Codex activation-bound network enforcement, credential isolation, and process cleanup
 - Benchmark claims remain withheld until a preregistered run has complete independently verifiable evidence
 - State-aware CLI scans eleven coding agents, reports installed versions, and offers install, update, repair, doctor, and uninstall flows
 - Older Codex installs are detected and updated in place
@@ -309,7 +313,11 @@ autoprompt
 
 Node.js 20 or newer, Python 3.11 or newer with PyYAML (available as `python3` or `python`), and Bash 4.3 or newer on Linux or macOS.
 
-Installer support and native runtime admission are separate. Native command execution currently requires Linux bubblewrap; macOS and Windows runtime admission is not established. See the README and v2 verification guide for exact provider requirements and local conformance.
+Installer support and native runtime admission are separate. Native Windows execution does not require WSL2 or a VM. Windows Codex requires an administrator-started controller and an initialized official sandbox. Codex verification covers native activation, sandbox enforcement, and cleanup with zero model calls; it does not certify live-model missions. See the README and v2 verification guide for provider requirements.
+
+## Contributors
+
+Thanks to @Oscar-Williams for the native Windows npm-shim fix in PR #29. His original commit and authorship are preserved.
 '@
 $releaseNotes = $releaseNotes.Replace('__VERSION__', $version)
 Set-Content -LiteralPath (Join-Path $output 'RELEASE_NOTES.md') -Value $releaseNotes -Encoding utf8

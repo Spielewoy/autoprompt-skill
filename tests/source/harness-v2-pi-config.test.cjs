@@ -89,13 +89,14 @@ test('OMP imports its actual YAML registry while rejecting duplicate keys, custo
 test('OMP production launch projects only its verified extension and bounded native registry', t => {
   const dir = root(t), target = path.join(dir, 'target'), scratch = path.join(dir, 'scratch'), control = path.join(dir, 'control')
   for (const location of [target, scratch, control]) fs.mkdirSync(location, { mode: 0o700 })
+  const hostileConnection = { ...connection(), extensionHandlers: { toolCallTimeoutMs: 1 } }
   const prepared = boundary.prepareBoundary({ provider: 'omp', root: control, policy: {
     sessionId: 'test-session', reservationId: 'test-reservation', targetPath: target, scratchPath: scratch,
     readableRoots: [target, scratch], writableRoots: [scratch], readOnly: true,
     commandBoundary: true, nestedDispatch: false, externalWrites: false,
   } })
   const spec = native.createLaunch({ provider: 'omp', home: path.join(dir, 'home'), sessionRoot: path.join(dir, 'session'),
-    targetPath: target, cwd: path.join(dir, 'cwd'), prompt: 'Bounded assignment', input: 'Read only', connection: connection(),
+    targetPath: target, cwd: path.join(dir, 'cwd'), prompt: 'Bounded assignment', input: 'Read only', connection: hostileConnection,
     toolBoundary: prepared, readOnly: true, commandBoundary: true, credentials: { COMPANY_GATEWAY_KEY: 'fixture-key' },
     environment: { PATH: process.env.PATH, NODE_OPTIONS: '--import=untrusted' } })
   for (const flag of ['--no-tools', '--no-extensions', '--no-skills', '--no-rules', '--no-lsp', '--no-pty', '--no-title', '--no-prewalk']) assert.ok(spec.argv.includes(flag), flag)
@@ -105,6 +106,9 @@ test('OMP production launch projects only its verified extension and bounded nat
   assert.equal(spec.env.NODE_OPTIONS, undefined)
   assert.equal(spec.env.AUTOPROMPT_TOOL_POLICY_SHA256, prepared.policySha256)
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(spec.env.PI_CODING_AGENT_DIR, 'models.yml'))), { providers: connection().providers })
+  const ompConfig = JSON.parse(fs.readFileSync(path.join(spec.env.PI_CODING_AGENT_DIR, 'config.yml')))
+  assert.deepEqual(ompConfig.extensionHandlers, { toolCallTimeoutMs: 180000 })
+  assert.equal(ompConfig.extensionHandlers.toolCallTimeoutMs, 180000)
 })
 
 test('OMP privately aliases only its built-in OpenRouter provider while preserving the configured model binding', () => {
@@ -145,6 +149,8 @@ test('Prime production launch uses its owned worker with only the explicit contr
   assert.equal(spec.env.NODE_OPTIONS, undefined)
   assert.equal(spec.env.AUTOPROMPT_TOOL_POLICY_SHA256, prepared.policySha256)
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(spec.env.PRIME_AGENT_CODING_AGENT_DIR, 'models.json'))), { providers: connection().providers })
+  const primeSettings = JSON.parse(fs.readFileSync(path.join(spec.env.PRIME_AGENT_CODING_AGENT_DIR, 'settings.json')))
+  assert.equal(Object.hasOwn(primeSettings, 'extensionHandlers'), false)
 })
 
 for (const provider of ['prime', 'omp']) {

@@ -30,7 +30,7 @@ Usa la CLI siguiente o descarga un instalador desde [GitHub Releases](https://gi
 ### 1. Instala la CLI
 
 ```bash
-npm install -g https://github.com/Spielewoy/autoprompt-skill/releases/download/v2.0.0/autoprompt-skill-2.0.0.tgz
+npm install -g https://github.com/Spielewoy/autoprompt-skill/releases/download/v2.1.0/autoprompt-skill-2.1.0.tgz
 ```
 
 ### 2. Inicia el instalador

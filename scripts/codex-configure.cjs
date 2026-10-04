@@ -526,7 +526,7 @@ function validateOwnedProcessConformanceEvidence(record) {
         'adapterKind', 'drained', 'groupIdentity', 'kind', 'ownershipId', 'probeHash',
         'schemaVersion', 'targetKey', 'terminalStatus',
       ]) || probe.schemaVersion !== 1 || probe.kind !== 'owned-process-conformance' ||
-      !['posix-process-group', 'windows-job-object'].includes(probe.adapterKind) ||
+      !['posix-process-group', 'windows-job-object', 'darwin-launchd-coalition'].includes(probe.adapterKind) ||
       probe.drained !== true || probe.terminalStatus !== 'DONE' ||
       typeof probe.ownershipId !== 'string' || !probe.ownershipId ||
       typeof probe.groupIdentity !== 'string' || !probe.groupIdentity ||
@@ -556,6 +556,7 @@ function runLocalOwnedProcessConformance(record, environment) {
     path.join(record.activationRoot, 'local-conformance'),
     true,
   )
+  if (process.platform === 'win32') safeRunRoot.ensureWindowsPrivateAcl(directory)
   const generation = Number(record.capability?.generation || 0)
   if (!Number.isSafeInteger(generation) || generation < 1) {
     unsupported('local-conformance-generation-invalid')
@@ -575,14 +576,26 @@ function runLocalOwnedProcessConformance(record, environment) {
   const runner = String.raw`
 'use strict'
 const input = JSON.parse(Buffer.from(process.argv[1], 'base64url').toString('utf8'))
+const phase = value => process.stderr.write(JSON.stringify({kind:'local-conformance-phase',mode:process.argv[2]||'run',phase:value})+'\n')
+phase('module-load')
 const ownerModule = require(input.modulePath)
+phase('adapter-construction')
 const adapter = process.platform === 'win32'
   ? ownerModule.createWindowsJobAdapter({
       controlRoot: input.controlRoot,
       providerPrivateOwnershipRoot: input.activationRoot,
       trustedOwnershipRoots: [input.activationRoot],
     })
+  : process.platform === 'darwin'
+    ? ownerModule.createPlatformProcessAdapter({
+        platform: 'darwin',
+        darwin: {
+          controlRoot: input.controlRoot,
+          providerPrivateOwnershipRoot: input.activationRoot,
+        },
+      })
   : ownerModule.createPosixProcessAdapter()
+phase('owner-construction')
 const processOwner = new ownerModule.ProcessOwner({
   adapter,
   registryPath: input.registryPath,
@@ -591,16 +604,20 @@ const processOwner = new ownerModule.ProcessOwner({
 ;(async () => {
   try {
     if (process.argv[2] === 'cleanup') {
+      phase('owned-recovery-and-cancellation')
       await processOwner.cancelAll({
         reason: 'activation local process conformance recovery',
         graceMs: 0,
         killMs: 1000,
         terminalStatus: 'FAILED',
+        waitForPending: true,
       })
+      phase('drain-verification')
       await processOwner.assertTargetDrained(input.targetKey)
       process.stdout.write('{"drained":true}\n')
       return
     }
+    phase('owned-conformance-launch')
     const probe = await ownerModule.runOwnedProcessConformanceProbe({
       adapter,
       processOwner,
@@ -611,6 +628,7 @@ const processOwner = new ownerModule.ProcessOwner({
       reason: 'activation local process conformance',
       killMs: 1000,
     })
+    phase('owned-conformance-drained')
     process.stdout.write(JSON.stringify(probe) + '\n')
   } catch (error) {
     try {
@@ -619,6 +637,7 @@ const processOwner = new ownerModule.ProcessOwner({
         graceMs: 0,
         killMs: 1000,
         terminalStatus: 'FAILED',
+        waitForPending: true,
       })
     } catch {}
     process.stderr.write(String(error && (error.code || error.message) || error) + '\n')
@@ -631,7 +650,7 @@ const processOwner = new ownerModule.ProcessOwner({
     env: environment,
     encoding: 'utf8',
     shell: false,
-    timeout: 30_000,
+    timeout: process.platform === 'win32' ? 240_000 : 30_000,
     windowsHide: true,
     maxBuffer: 1024 * 1024,
   }
@@ -639,7 +658,7 @@ const processOwner = new ownerModule.ProcessOwner({
   if (!result || result.status !== 0 || result.error) {
     const cleanup = childProcess.spawnSync(process.execPath, ['-e', runner, input, 'cleanup'], {
       ...spawnOptions,
-      timeout: 10_000,
+      timeout: process.platform === 'win32' ? 180_000 : 10_000,
     })
     unsupported('local-conformance-process-probe-failed', {
       expected: 'one bounded owned process must drain and crash recovery must leave no target process',
@@ -647,12 +666,12 @@ const processOwner = new ownerModule.ProcessOwner({
         status: result?.status ?? null,
         error: result?.error?.code || null,
         signal: result?.signal || null,
-        stderr: String(result?.stderr || '').trim().slice(0, 768),
+        stderr: String(result?.stderr || '').trim().slice(0, 4096),
         cleanup: {
           status: cleanup?.status ?? null,
           error: cleanup?.error?.code || null,
           signal: cleanup?.signal || null,
-          stderr: String(cleanup?.stderr || '').trim().slice(0, 256),
+          stderr: String(cleanup?.stderr || '').trim().slice(0, 4096),
         },
       }),
     })
@@ -946,6 +965,40 @@ function readRegularBound(file, label) {
   return bytes
 }
 
+function readBoundedRegular(file, label, maximumBytes) {
+  const initial = assertRegularUnlinked(file, label)
+  if (initial.size < 1n || initial.size > BigInt(maximumBytes)) unsupported(`${label}-invalid`)
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+  let opened
+  let completed
+  let bytes
+  try {
+    opened = fs.fstatSync(descriptor, { bigint: true })
+    if (!opened.isFile() || opened.nlink !== 1n || !sameFileIdentity(initial, opened) ||
+        opened.size !== initial.size || opened.mtimeNs !== initial.mtimeNs ||
+        opened.ctimeNs !== initial.ctimeNs) unsupported(`${label}-raced`)
+    const buffer = Buffer.allocUnsafe(Number(initial.size) + 1)
+    let offset = 0
+    while (offset < buffer.length) {
+      const count = fs.readSync(descriptor, buffer, offset, buffer.length - offset, null)
+      if (count === 0) break
+      offset += count
+    }
+    bytes = buffer.subarray(0, offset)
+    completed = fs.fstatSync(descriptor, { bigint: true })
+  } finally {
+    fs.closeSync(descriptor)
+  }
+  const rebound = assertRegularUnlinked(file, label)
+  if (!sameFileIdentity(opened, completed) || !sameFileIdentity(completed, rebound) ||
+      completed.size !== opened.size || rebound.size !== completed.size ||
+      BigInt(bytes.length) !== completed.size ||
+      completed.mtimeNs !== opened.mtimeNs || completed.ctimeNs !== opened.ctimeNs ||
+      rebound.mtimeNs !== completed.mtimeNs || rebound.ctimeNs !== completed.ctimeNs ||
+      bytes.length < 1 || bytes.length > maximumBytes) unsupported(`${label}-raced`)
+  return bytes
+}
+
 function validateWindowsSandboxIdentity(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length === 0 || bytes.length > 1024 * 1024) {
     unsupported('codex-windows-sandbox-identity-invalid')
@@ -966,6 +1019,356 @@ function validateWindowsSandboxIdentity(bytes) {
     unsupported('codex-windows-sandbox-identity-invalid')
   }
   return identity
+}
+
+const WINDOWS_SANDBOX_SETUP_VERSION = 5
+const WINDOWS_SANDBOX_OFFLINE_USER = 'CodexSandboxOffline'
+const WINDOWS_SANDBOX_ONLINE_USER = 'CodexSandboxOnline'
+
+function validateWindowsSandboxSetupState(markerBytes, usersBytes, ownedLease = null) {
+  let marker
+  let users
+  try {
+    marker = JSON.parse(markerBytes.toString('utf8'))
+    users = JSON.parse(usersBytes.toString('utf8'))
+  } catch { unsupported('codex-windows-sandbox-setup-state-invalid') }
+  const record = value => value && typeof value === 'object' && !Array.isArray(value)
+  const userRecord = value => record(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify(['password', 'username']) &&
+    typeof value.password === 'string' && value.password.length > 0 &&
+    value.password.length <= 1024 * 1024 && /^[A-Za-z0-9+/]+={0,2}$/.test(value.password)
+  if (!record(marker) || JSON.stringify(Object.keys(marker).sort()) !== JSON.stringify([
+    'allow_local_binding', 'created_at', 'offline_username', 'online_username',
+    'proxy_ports', 'read_roots', 'version', 'write_roots',
+  ]) || marker.version !== WINDOWS_SANDBOX_SETUP_VERSION ||
+      marker.offline_username !== WINDOWS_SANDBOX_OFFLINE_USER ||
+      marker.online_username !== WINDOWS_SANDBOX_ONLINE_USER ||
+      !Array.isArray(marker.proxy_ports) || marker.proxy_ports.length !== 0 ||
+      marker.allow_local_binding !== false ||
+      typeof marker.created_at !== 'string' || !Number.isFinite(Date.parse(marker.created_at)) ||
+      !Array.isArray(marker.read_roots) || !Array.isArray(marker.write_roots) ||
+      !record(users) || JSON.stringify(Object.keys(users).sort()) !==
+        JSON.stringify(['offline', 'online', 'version']) ||
+      users.version !== WINDOWS_SANDBOX_SETUP_VERSION ||
+      !userRecord(users.offline) || !userRecord(users.online) ||
+      users.offline.username !== (ownedLease ? ownedLease.accountName : marker.offline_username) ||
+      users.online.username !== marker.online_username) {
+    unsupported('codex-windows-sandbox-setup-state-invalid')
+  }
+  return { marker, users }
+}
+
+function windowsSandboxSetupPaths(home) {
+  return {
+    marker: path.join(home, '.sandbox', 'setup_marker.json'),
+    users: path.join(home, '.sandbox-secrets', 'sandbox_users.json'),
+  }
+}
+
+function readWindowsSandboxSetupSource(root) {
+  const setup = windowsSandboxSetupPaths(root)
+  const bindings = [
+    [root, directoryBinding(root, 'codex-windows-sandbox-source-root'),
+      'codex-windows-sandbox-source-root'],
+    [path.dirname(setup.marker), directoryBinding(path.dirname(setup.marker),
+      'codex-windows-sandbox-marker-parent'), 'codex-windows-sandbox-marker-parent'],
+    [path.dirname(setup.users), directoryBinding(path.dirname(setup.users),
+      'codex-windows-sandbox-users-parent'), 'codex-windows-sandbox-users-parent'],
+  ]
+  const markerBytes = readBoundedRegular(
+    setup.marker, 'codex-windows-sandbox-setup-marker', 64 * 1024,
+  )
+  const usersBytes = readBoundedRegular(
+    setup.users, 'codex-windows-sandbox-users', 2 * 1024 * 1024,
+  )
+  const markerRecheck = readBoundedRegular(
+    setup.marker, 'codex-windows-sandbox-setup-marker', 64 * 1024,
+  )
+  const usersRecheck = readBoundedRegular(
+    setup.users, 'codex-windows-sandbox-users', 2 * 1024 * 1024,
+  )
+  for (const [directory, binding, label] of bindings) {
+    assertDirectoryBinding(directory, binding, label)
+  }
+  if (markerBytes.length !== markerRecheck.length ||
+      !crypto.timingSafeEqual(markerBytes, markerRecheck) ||
+      usersBytes.length !== usersRecheck.length ||
+      !crypto.timingSafeEqual(usersBytes, usersRecheck)) {
+    unsupported('codex-windows-sandbox-setup-state-raced')
+  }
+  validateWindowsSandboxSetupState(markerBytes, usersBytes)
+  return { markerBytes, usersBytes }
+}
+
+function windowsSandboxStateIdentities(paths) {
+  const values = [...paths.parents, ...paths.files].map(file => {
+    const stat = fs.lstatSync(file, { bigint: true })
+    if (stat.isSymbolicLink() || (paths.parents.includes(file) ? !stat.isDirectory() :
+      !stat.isFile() || stat.nlink !== 1n)) unsupported('codex-windows-sandbox-setup-state-raced')
+    return { file, device: String(stat.dev), inode: String(stat.ino), size: String(stat.size) }
+  })
+  return values
+}
+
+function windowsSandboxStateFileIdentity(file) {
+  const stat = assertRegularUnlinked(file, 'codex-windows-sandbox-setup-state')
+  return { device: String(stat.dev), inode: String(stat.ino) }
+}
+
+function validateWindowsPeArchitecture(bytes, architecture) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 512 || bytes.length > 256 * 1024 * 1024 ||
+      bytes.subarray(0, 2).toString('ascii') !== 'MZ') {
+    unsupported('codex-windows-public-helper-invalid')
+  }
+  const pe = bytes.readUInt32LE(0x3c)
+  const machine = architecture === 'x64' ? 0x8664 : architecture === 'arm64' ? 0xaa64 : 0
+  if (!machine || pe < 0x40 || pe > bytes.length - 26 ||
+      bytes.subarray(pe, pe + 4).toString('binary') !== 'PE\0\0' ||
+      bytes.readUInt16LE(pe + 4) !== machine ||
+      !(bytes.readUInt16LE(pe + 22) & 0x0002) || bytes.readUInt16LE(pe + 24) !== 0x20b) {
+    unsupported('codex-windows-public-helper-invalid')
+  }
+}
+
+function windowsSandboxGroupSid() {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  const environment = safeRunRoot.windowsControllerEnvironment(systemRoot)
+  const powershell = path.win32.join(
+    environment.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
+  )
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)",
+    "$account=[Security.Principal.NTAccount]::new('CodexSandboxUsers')",
+    '$account.Translate([Security.Principal.SecurityIdentifier]).Value',
+  ].join(';')
+  const result = childProcess.spawnSync(powershell, [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script,
+  ], {
+    cwd: path.win32.dirname(powershell), env: environment, encoding: 'utf8', windowsHide: true,
+    shell: false, timeout: 60000, maxBuffer: 64 * 1024,
+  })
+  const sid = String(result.stdout || '').trim()
+  if (result.error || result.signal || result.status !== 0 || result.stderr ||
+      !/^S-\d+(?:-\d+){2,}$/u.test(sid)) unsupported('codex-windows-public-helper-group-invalid')
+  return sid
+}
+
+function officialWindowsHelperSource(codexExecutable) {
+  if (codexExecutable?.source !== 'official-package-runtime' ||
+      codexExecutable.identity?.platform !== 'win32' ||
+      !['x64', 'arm64'].includes(codexExecutable.identity?.arch) ||
+      comparable(codexExecutable.executable) !== comparable(codexExecutable.identity.realpath)) {
+    unsupported('codex-windows-public-helper-runtime-invalid')
+  }
+  const executableDirectory = path.dirname(codexExecutable.executable)
+  const candidates = [path.join(executableDirectory, 'codex-command-runner.exe')]
+  if (path.basename(executableDirectory).toLowerCase() === 'bin') {
+    candidates.push(path.join(path.dirname(executableDirectory), 'codex-resources',
+      'codex-command-runner.exe'))
+  }
+  candidates.push(path.join(executableDirectory, 'codex-resources', 'codex-command-runner.exe'))
+  const source = candidates.find(candidate => fs.existsSync(candidate))
+  if (!source || !isWithin(path.dirname(executableDirectory), source)) {
+    unsupported('codex-windows-public-helper-source-missing')
+  }
+  const parentPath = path.dirname(source)
+  const parent = directoryBinding(parentPath, 'codex-windows-public-helper-source-parent')
+  return { path: source, parent: { path: parentPath, ...parent } }
+}
+
+function inspectWindowsPublicHelperClosure(activationRoot, codexExecutable) {
+  if (process.platform !== 'win32') return null
+  const version = /^codex-cli ([0-9]+\.[0-9]+\.[0-9]+)$/u.exec(
+    codexExecutable?.identity?.version || '',
+  )?.[1]
+  if (!version) unsupported('codex-windows-public-helper-runtime-invalid')
+  const source = officialWindowsHelperSource(codexExecutable)
+  const sourcePath = source.path
+  const sourceBytes = readBoundedRegular(
+    sourcePath, 'codex-windows-public-helper-source', 256 * 1024 * 1024,
+  )
+  assertDirectoryBinding(source.parent.path, source.parent,
+    'codex-windows-public-helper-source-parent')
+  validateWindowsPeArchitecture(sourceBytes, codexExecutable.identity.arch)
+  const directoryPath = path.join(nativeCodexHomePath(activationRoot), '.sandbox-bin')
+  const filePath = path.join(directoryPath, `codex-command-runner-${version}.exe`)
+  const names = fs.readdirSync(directoryPath)
+  if (JSON.stringify(names) !== JSON.stringify([path.basename(filePath)])) {
+    unsupported('codex-windows-public-helper-inventory-invalid')
+  }
+  const fileBytes = readBoundedRegular(
+    filePath, 'codex-windows-public-helper', 256 * 1024 * 1024,
+  )
+  validateWindowsPeArchitecture(fileBytes, codexExecutable.identity.arch)
+  if (sha256(fileBytes) !== sha256(sourceBytes)) unsupported('codex-windows-public-helper-drift')
+  const directory = directoryBinding(directoryPath, 'codex-windows-public-helper-directory')
+  return {
+    kind: 'windows-codex-public-helper-v1',
+    architecture: codexExecutable.identity.arch,
+    readExecuteSid: windowsSandboxGroupSid(),
+    directory: { path: directoryPath, device: directory.device, inode: directory.inode },
+    file: {
+      path: filePath,
+      ...windowsSandboxStateFileIdentity(filePath),
+      sha256: sha256(fileBytes),
+    },
+    source: {
+      path: sourcePath,
+      ...windowsSandboxStateFileIdentity(sourcePath),
+      sha256: sha256(sourceBytes),
+      parent: source.parent,
+    },
+  }
+}
+
+function verifyWindowsPublicHelperClosure(activationRoot, binding, codexExecutable) {
+  if (process.platform !== 'win32') {
+    if (binding !== null) unsupported('codex-windows-public-helper-unexpected')
+    return null
+  }
+  if (!binding || binding.kind !== 'windows-codex-public-helper-v1' ||
+      binding.architecture !== codexExecutable?.identity?.arch ||
+      !/^S-\d+(?:-\d+){2,}$/u.test(binding.readExecuteSid || '')) {
+    unsupported('codex-windows-public-helper-invalid')
+  }
+  const expectedSourceBinding = officialWindowsHelperSource(codexExecutable)
+  const expectedSource = expectedSourceBinding.path
+  const version = /^codex-cli ([0-9]+\.[0-9]+\.[0-9]+)$/u.exec(
+    codexExecutable.identity.version,
+  )?.[1]
+  const expectedDirectory = path.join(nativeCodexHomePath(activationRoot), '.sandbox-bin')
+  const expectedFile = path.join(expectedDirectory, `codex-command-runner-${version}.exe`)
+  if (comparable(binding.source?.path) !== comparable(expectedSource) ||
+      comparable(binding.directory?.path) !== comparable(expectedDirectory) ||
+      comparable(binding.file?.path) !== comparable(expectedFile) ||
+      binding.readExecuteSid !== windowsSandboxGroupSid() ||
+      comparable(binding.source?.parent?.path) !== comparable(expectedSourceBinding.parent.path) ||
+      binding.source?.parent?.device !== expectedSourceBinding.parent.device ||
+      binding.source?.parent?.inode !== expectedSourceBinding.parent.inode ||
+      comparable(binding.source?.parent?.realpath) !==
+        comparable(expectedSourceBinding.parent.realpath) ||
+      JSON.stringify(fs.readdirSync(expectedDirectory)) !==
+        JSON.stringify([path.basename(expectedFile)])) {
+    unsupported('codex-windows-public-helper-invalid')
+  }
+  const directory = directoryBinding(expectedDirectory, 'codex-windows-public-helper-directory')
+  if (directory.device !== binding.directory.device || directory.inode !== binding.directory.inode) {
+    unsupported('codex-windows-public-helper-drift')
+  }
+  for (const [label, expected, state] of [
+    ['source', expectedSource, binding.source], ['file', expectedFile, binding.file],
+  ]) {
+    if (!state || !/^[a-f0-9]{64}$/u.test(state.sha256 || '')) {
+      unsupported('codex-windows-public-helper-invalid')
+    }
+    const identity = windowsSandboxStateFileIdentity(expected)
+    const bytes = readBoundedRegular(
+      expected, `codex-windows-public-helper-${label}`, 256 * 1024 * 1024,
+    )
+    validateWindowsPeArchitecture(bytes, binding.architecture)
+    if (identity.device !== state.device || identity.inode !== state.inode ||
+        sha256(bytes) !== state.sha256) unsupported('codex-windows-public-helper-drift')
+  }
+  if (binding.source.sha256 !== binding.file.sha256) {
+    unsupported('codex-windows-public-helper-drift')
+  }
+  assertDirectoryBinding(expectedSourceBinding.parent.path, expectedSourceBinding.parent,
+    'codex-windows-public-helper-source-parent')
+  return binding
+}
+
+function sealWindowsSandboxSetupState(nativeHome, verifyOnly = false) {
+  if (process.platform !== 'win32') return
+  const setup = windowsSandboxSetupPaths(nativeHome)
+  const selected = {
+    parents: [path.dirname(setup.marker), path.dirname(setup.users)],
+    files: [setup.marker, setup.users],
+  }
+  const before = windowsSandboxStateIdentities(selected)
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  const environment = safeRunRoot.windowsControllerEnvironment(systemRoot)
+  const powershell = path.win32.join(
+    environment.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
+  )
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process)",
+    '$paths=$env:AUTOPROMPT_CODEX_SANDBOX_STATE_PATHS|ConvertFrom-Json',
+    '$identity=[Security.Principal.WindowsIdentity]::GetCurrent()',
+    '$user=$identity.User',
+    "$system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
+    '$parentRights=[Security.AccessControl.FileSystemRights]([int][Security.AccessControl.FileSystemRights]::FullControl -band (-bnot [int][Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles))',
+    '$fileOwnerRights=[Security.AccessControl.FileSystemRights]([int][Security.AccessControl.FileSystemRights]::Read -bor [int][Security.AccessControl.FileSystemRights]::ChangePermissions)',
+    '$fileSystemRights=[Security.AccessControl.FileSystemRights]::Read',
+    "function Assert-Physical($p,$directory){$a=[IO.File]::GetAttributes($p);if(($a-band[IO.FileAttributes]::ReparsePoint)-ne 0 -or ((($a-band[IO.FileAttributes]::Directory)-ne 0)-ne $directory)){throw 'sandbox state path changed'}}",
+    'foreach($p in $paths.parents){Assert-Physical $p $true;if($env:AUTOPROMPT_CODEX_SANDBOX_STATE_ESTABLISH -eq \'1\'){$acl=[Security.AccessControl.DirectorySecurity]::new();$acl.SetAccessRuleProtection($true,$false);$acl.SetOwner($user);foreach($sid in @($user,$system)){$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,$parentRights,[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Allow))};[IO.Directory]::SetAccessControl($p,$acl)}}',
+    'foreach($p in $paths.files){Assert-Physical $p $false;if($env:AUTOPROMPT_CODEX_SANDBOX_STATE_ESTABLISH -eq \'1\'){$acl=[Security.AccessControl.FileSecurity]::new();$acl.SetAccessRuleProtection($true,$false);$acl.SetOwner($user);$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($user,$fileOwnerRights,[Security.AccessControl.AccessControlType]::Allow));$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system,$fileSystemRights,[Security.AccessControl.AccessControlType]::Allow));[IO.File]::SetAccessControl($p,$acl)}}',
+    '$all=@();foreach($p in @($paths.parents)+@($paths.files)){Assert-Physical $p ($paths.parents -contains $p);$acl=Get-Acl -LiteralPath $p;$rules=@($acl.Access|ForEach-Object{[pscustomobject]@{sid=$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;type=$_.AccessControlType.ToString();inherited=$_.IsInherited;rights=[int]$_.FileSystemRights;inheritance=[int]$_.InheritanceFlags;propagation=[int]$_.PropagationFlags}});$all+=[pscustomobject]@{path=$p;owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;protected=$acl.AreAccessRulesProtected;rules=$rules}}',
+    '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
+    '[pscustomobject]@{currentSid=$user.Value;items=$all}|ConvertTo-Json -Compress -Depth 6',
+  ].join(';')
+  const result = childProcess.spawnSync(powershell, [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script,
+  ], {
+    cwd: path.win32.dirname(powershell), env: {
+      ...environment,
+      AUTOPROMPT_CODEX_SANDBOX_STATE_ESTABLISH: verifyOnly ? '0' : '1',
+      AUTOPROMPT_CODEX_SANDBOX_STATE_PATHS: JSON.stringify(selected),
+    }, encoding: 'utf8', windowsHide: true, shell: false, timeout: 60000,
+    maxBuffer: 1024 * 1024,
+  })
+  if (result.error || result.signal || result.status !== 0 || result.stderr) {
+    unsupported('codex-windows-sandbox-setup-state-seal-failed', { actual: JSON.stringify({ stage: 'acl-helper', status: result.status, signal: result.signal, error: result.error?.code || null, stderr: String(result.stderr || '').slice(0, 4096) }) })
+  }
+  let snapshot
+  try { snapshot = JSON.parse(result.stdout) } catch {
+    unsupported('codex-windows-sandbox-setup-state-seal-failed')
+  }
+  const sealMismatch = stage => unsupported('codex-windows-sandbox-setup-state-seal-failed', { actual: JSON.stringify({
+    stage, currentSid: snapshot.currentSid, items: Array.isArray(snapshot.items) ? snapshot.items.slice(0, 4).map(item => ({
+      path: item.path, role: selected.parents.some(file => comparable(file) === comparable(item.path)) ? 'parent' : 'file',
+      owner: item.owner, protected: item.protected, rules: Array.isArray(item.rules) ? item.rules.slice(0, 32) : null,
+    })) : null,
+  }).slice(0, 16384) })
+  const sandboxGroupSid = windowsSandboxGroupSid()
+  const expected = new Map([
+    ...selected.parents.map(file => [comparable(file), { inheritance: 3, optionalSandboxRead: true, rules: new Map([
+      [snapshot.currentSid, 2032063], ['S-1-5-18', 2032063],
+    ]) }]),
+    ...selected.files.map(file => [comparable(file), { inheritance: 0, rules: new Map([
+      [snapshot.currentSid, 1441929], ['S-1-5-18', 1179785],
+    ]) }]),
+  ])
+  if (!snapshot.currentSid || !Array.isArray(snapshot.items) ||
+      snapshot.items.length !== expected.size) sealMismatch('snapshot-shape')
+  for (const item of snapshot.items) {
+    const expectedItem = expected.get(comparable(item.path))
+    if (!expectedItem || item.owner !== snapshot.currentSid || item.protected !== true ||
+        !Array.isArray(item.rules) || (item.rules.length !== 2 && !(expectedItem?.optionalSandboxRead && item.rules.length === 3))) {
+      sealMismatch('owner-protection-rule-count')
+    }
+    let optionalReadSeen = false
+    for (const rule of item.rules) {
+      if (expectedItem.optionalSandboxRead && rule.sid === sandboxGroupSid && !optionalReadSeen &&
+          rule.type === 'Allow' && rule.inherited === false && rule.rights === 1179817 && rule.inheritance === 3 && rule.propagation === 0) {
+        optionalReadSeen = true
+        continue
+      }
+      const rights = expectedItem.rules.get(rule.sid)
+      if (rights === undefined || rule.type !== 'Allow' || rule.inherited !== false ||
+          rule.rights !== rights || rule.inheritance !== expectedItem.inheritance ||
+          rule.propagation !== 0) {
+        sealMismatch('rule-semantics')
+      }
+      expectedItem.rules.delete(rule.sid)
+    }
+    if (expectedItem.rules.size) sealMismatch('missing-rule')
+  }
+  const after = windowsSandboxStateIdentities(selected)
+  if (JSON.stringify(after) !== JSON.stringify(before)) {
+    unsupported('codex-windows-sandbox-setup-state-raced')
+  }
 }
 
 function windowsSandboxIdentityPath(activationRoot) {
@@ -992,15 +1395,49 @@ function installWindowsSandboxIdentity(root, activationRoot) {
   )
   const destination = windowsSandboxIdentityPath(activationRoot)
   writePrivateFile(destination, bytes)
+  const { markerBytes, usersBytes } = readWindowsSandboxSetupSource(root)
+  const destinationSetup = windowsSandboxSetupPaths(nativeHome)
+  ensurePrivateDirectory(nativeHome, path.dirname(destinationSetup.marker), true)
+  ensurePrivateDirectory(nativeHome, path.dirname(destinationSetup.users), true)
+  writePrivateFileExclusive(destinationSetup.marker, markerBytes)
+  writePrivateFileExclusive(destinationSetup.users, usersBytes)
+  sealWindowsSandboxSetupState(nativeHome)
   return {
     kind: 'windows-cap-sid-v1',
     path: destination,
     sha256: sha256(bytes),
     sourceSha256: sha256(bytes),
+    setupState: {
+      kind: 'windows-elevated-sandbox-state-v1',
+      marker: {
+        path: destinationSetup.marker,
+        sha256: sha256(markerBytes),
+        sourceSha256: sha256(markerBytes),
+        identity: windowsSandboxStateFileIdentity(destinationSetup.marker),
+      },
+      users: {
+        path: destinationSetup.users,
+        sha256: sha256(usersBytes),
+        sourceSha256: sha256(usersBytes),
+        identity: windowsSandboxStateFileIdentity(destinationSetup.users),
+      },
+    },
   }
 }
 
+function assertWindowsAdministrator() {
+  if (process.platform !== 'win32') return
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR
+  const environment = safeRunRoot.windowsControllerEnvironment(systemRoot)
+  const command = '$id=[Security.Principal.WindowsIdentity]::GetCurrent();$p=[Security.Principal.WindowsPrincipal]::new($id);if(-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){exit 1}'
+  const result = childProcess.spawnSync(path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(command, 'utf16le').toString('base64')],
+    { env: environment, encoding: 'utf8', timeout: 30000, windowsHide: true, shell: false })
+  if (result.error || result.signal || result.status !== 0) unsupported('codex-windows-administrator-required')
+}
+
 function inspectActivationPrerequisites(options = {}) {
+  assertWindowsAdministrator()
   const env = options.env || process.env
   const root = resolveRoot(env)
   if (process.platform === 'win32') {
@@ -1016,6 +1453,7 @@ function inspectActivationPrerequisites(options = {}) {
       unsupported('codex-windows-sandbox-identity-invalid')
     }
     validateWindowsSandboxIdentity(bytes)
+    readWindowsSandboxSetupSource(root)
   }
   let runtime
   try {
@@ -1037,7 +1475,7 @@ function inspectActivationPrerequisites(options = {}) {
   }
 }
 
-function verifyWindowsSandboxIdentity(activationRoot, binding) {
+function verifyWindowsSandboxIdentity(activationRoot, binding, codexExecutable = null, options = {}) {
   if (process.platform !== 'win32') {
     if (binding !== null) unsupported('codex-windows-sandbox-identity-unexpected')
     return null
@@ -1046,12 +1484,48 @@ function verifyWindowsSandboxIdentity(activationRoot, binding) {
   if (!binding || binding.kind !== 'windows-cap-sid-v1' ||
       comparable(binding.path) !== comparable(expectedPath) ||
       !/^[a-f0-9]{64}$/.test(binding.sha256 || '') ||
-      !/^[a-f0-9]{64}$/.test(binding.sourceSha256 || '')) {
+      !/^[a-f0-9]{64}$/.test(binding.sourceSha256 || '') ||
+      binding.setupState?.kind !== 'windows-elevated-sandbox-state-v1') {
     unsupported('codex-windows-sandbox-identity-invalid')
   }
   const bytes = readRegularBound(expectedPath, 'codex-windows-sandbox-identity')
   validateWindowsSandboxIdentity(bytes)
   if (sha256(bytes) !== binding.sha256) unsupported('codex-windows-sandbox-identity-drift')
+  const expectedSetup = windowsSandboxSetupPaths(nativeCodexHomePath(activationRoot))
+  const markerBinding = binding.setupState.marker
+  const usersBinding = binding.setupState.users
+  for (const [name, expected, state] of [
+    ['marker', expectedSetup.marker, markerBinding], ['users', expectedSetup.users, usersBinding],
+  ]) {
+    if (!state || comparable(state.path) !== comparable(expected) ||
+        !/^[a-f0-9]{64}$/.test(state.sha256 || '') ||
+        !/^[a-f0-9]{64}$/.test(state.sourceSha256 || '') ||
+        !state.identity || typeof state.identity.device !== 'string' ||
+        typeof state.identity.inode !== 'string') {
+      unsupported('codex-windows-sandbox-setup-state-invalid')
+    }
+    const stateBytes = readBoundedRegular(
+      expected, `codex-windows-sandbox-setup-${name}`, name === 'marker' ? 64 * 1024 : 2 * 1024 * 1024,
+    )
+    if (sha256(stateBytes) !== state.sha256) unsupported('codex-windows-sandbox-setup-state-drift')
+    const identity = windowsSandboxStateFileIdentity(expected)
+    if (identity.device !== state.identity.device || identity.inode !== state.identity.inode) {
+      unsupported('codex-windows-sandbox-setup-state-drift')
+    }
+  }
+  const markerBytes = readBoundedRegular(expectedSetup.marker,
+    'codex-windows-sandbox-setup-marker', 64 * 1024)
+  const usersBytes = readBoundedRegular(expectedSetup.users,
+    'codex-windows-sandbox-users', 2 * 1024 * 1024)
+  const lease = binding.networkLease
+  if (lease) require('../agents/codex/workflow/windows-codex-network-lease.js').verifyWindowsCodexNetworkLease({ activationId: lease.activationId, activationRoot, codexHome: nativeCodexHomePath(activationRoot), targetPath: lease.targetPath, allowReleased: options.allowReleased === true, controllerEnv: safeRunRoot.windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR), lease })
+  validateWindowsSandboxSetupState(markerBytes, usersBytes, lease)
+  sealWindowsSandboxSetupState(nativeCodexHomePath(activationRoot), true)
+  if (binding.publicHelperClosure != null) {
+    verifyWindowsPublicHelperClosure(
+      activationRoot, binding.publicHelperClosure, codexExecutable,
+    )
+  }
   return binding
 }
 
@@ -1095,21 +1569,121 @@ function ensurePrivateDirectory(root, directory, create = false) {
   return current
 }
 
-function protectActivationRoot(activationRoot, recurse = false) {
+function auditWindowsCodexPublicHelperClosure(activationRoot, closure) {
+  const absolute = path.resolve(activationRoot)
+  const before = directoryBinding(absolute, 'activation-private-audit-root')
+  const script = [
+    "$ErrorActionPreference='Stop';[Environment]::SetEnvironmentVariable('PSModulePath',[IO.Path]::Combine($PSHOME,'Modules'),[EnvironmentVariableTarget]::Process);[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=targets');[Console]::Error.Flush()",
+    '$root=$env:AUTOPROMPT_ACL_AUDIT_ROOT',
+    '$targets=@($root)',
+    '$targets+=@(Get-ChildItem -LiteralPath $root -Force -Recurse | ForEach-Object { $_.FullName })',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=enumerated');[Console]::Error.Flush()",
+    '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=identity');[Console]::Error.Flush()",
+    '$items=@()',
+    '$seen=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=dedupe');[Console]::Error.Flush()",
+    'foreach($p in $targets){if(!$seen.Add([string]$p)){continue}',
+    "  [Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=get-acl');[Console]::Error.Flush()",
+    '  $acl=Get-Acl -LiteralPath $p',
+    "  [Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=owner');[Console]::Error.Flush()",
+    '  $ownerSid=(New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate([System.Security.Principal.SecurityIdentifier]).Value',
+    "  [Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=rules');[Console]::Error.Flush()",
+    '  $rules=@($acl.Access | ForEach-Object {$sid=$null;try{$sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value}catch{};[pscustomobject]@{identity=$_.IdentityReference.Value;sid=$sid;type=$_.AccessControlType.ToString();inherited=$_.IsInherited;rights=$_.FileSystemRights.ToString();rightsValue=[int]$_.FileSystemRights;inheritance=[int]$_.InheritanceFlags;propagation=[int]$_.PropagationFlags}})',
+    '  $items+=[pscustomobject]@{path=$p;owner=$acl.Owner;ownerSid=$ownerSid;protected=$acl.AreAccessRulesProtected;rules=$rules}',
+    '}',
+    "[Console]::Error.WriteLine('AUTOPROMPT_ACL_AUDIT_PHASE=emit');[Console]::Error.Flush()",
+    '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)',
+    '[pscustomobject]@{currentName=$identity.Name;currentSid=$identity.User.Value;items=$items}|ConvertTo-Json -Compress -Depth 7',
+  ].join(';')
+  const environment = safeRunRoot.windowsControllerEnvironment(
+    process.env.SystemRoot || process.env.WINDIR,
+  )
+  environment.AUTOPROMPT_ACL_AUDIT_ROOT = absolute
+  const powershell = path.win32.join(
+    environment.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe',
+  )
+  const result = childProcess.spawnSync(powershell, [
+    '-NoProfile', '-NonInteractive', '-Command', script,
+  ], {
+    encoding: 'utf8', windowsHide: true, timeout: 60000,
+    stdio: ['ignore', 'pipe', 'pipe'], env: environment,
+  })
+  assertDirectoryBinding(absolute, before, 'activation-private-audit-root')
+  if (result.error || result.signal || result.status !== 0) {
+    unsupported('activation-private-permissions-unavailable')
+  }
+  let snapshot
+  try { snapshot = JSON.parse(result.stdout) } catch {
+    unsupported('activation-private-permissions-unavailable')
+  }
+  if (!snapshot || !Array.isArray(snapshot.items)) {
+    unsupported('activation-private-permissions-unavailable')
+  }
+  const allowedPaths = new Map([
+    [comparable(closure.directory.path), closure.readExecuteSid.toLowerCase()],
+    [comparable(closure.file.path), closure.readExecuteSid.toLowerCase()],
+  ])
+  const sandboxState = windowsSandboxSetupPaths(nativeCodexHomePath(activationRoot))
+  const sandboxParents = new Set([path.dirname(sandboxState.marker), path.dirname(sandboxState.users)].map(comparable))
+  const observed = new Set()
+  const filtered = snapshot.items.map(item => {
+    const selectedSid = typeof item?.path === 'string'
+      ? allowedPaths.get(comparable(item.path)) : null
+    if (selectedSid) observed.add(comparable(item.path))
+    const rules = Array.isArray(item?.rules) ? item.rules.filter(rule => {
+      const sid = String(rule?.sid || '').toLowerCase()
+      const rights = Number(rule?.rightsValue)
+      if (sandboxParents.has(comparable(item.path)) && item.protected === true && item.ownerSid === snapshot.currentSid &&
+          sid === closure.readExecuteSid.toLowerCase() && rule.type === 'Allow' && rule.inherited === false &&
+          rights === 1179817 && rule.inheritance === 3 && rule.propagation === 0) return false
+      if (!selectedSid || String(rule?.type).toLowerCase() !== 'allow') return true
+      if (!Number.isSafeInteger(rights) || rights <= 0) return true
+      return !((sid === selectedSid && (rights & ~1179817) === 0) ||
+        (sid === 's-1-5-32-544' && (rights & ~1245631) === 0))
+    }) : item?.rules
+    return { ...item, rules }
+  })
+  if (observed.size !== allowedPaths.size) unsupported('activation-private-permissions-unavailable')
+  const failures = []
+  let failureCount = 0
+  for (let index = 0; index < filtered.length; index++) {
+    const item = filtered[index]
+    try {
+      safeRunRoot.validateWindowsAclSnapshot({ ...snapshot, items: [item] }, {
+        expectedPaths: [item.path], requiredProtectedPaths: comparable(item.path) === comparable(absolute) ? [absolute] : [],
+      })
+    } catch (error) {
+      failureCount++
+      if (failures.length < 32) {
+        const original = snapshot.items[index]
+        failures.push({ path: original.path, owner: original.owner, ownerSid: original.ownerSid,
+          protected: original.protected, rules: Array.isArray(original.rules) ? original.rules.slice(0, 32) : null,
+          code: error.code || 'ACL_INVALID', message: String(error.message || '').slice(0, 512) })
+      }
+    }
+  }
+  if (failureCount) unsupported('activation-private-permissions-invalid', { actual: JSON.stringify({
+    currentSid: snapshot.currentSid, failureCount, failures,
+  }).slice(0, 32768) })
+  return safeRunRoot.validateWindowsAclSnapshot({ ...snapshot, items: filtered }, {
+    expectedPaths: [absolute], requiredProtectedPaths: [absolute],
+  })
+}
+
+function protectActivationRoot(activationRoot, recurse = false, publicHelperClosure = null,
+  codexExecutable = null) {
   try {
     const established = safeRunRoot.ensureWindowsPrivateAcl(activationRoot)
-    const audited = safeRunRoot.auditPrivatePermissions(activationRoot, {
-      recurse,
-      allowedOwnerReadableFiles: [
-        path.join(activationRoot, 'installation_id'),
-        path.join(nativeCodexHomePath(activationRoot), 'installation_id'),
-      ],
-    })
+    const audited = auditActivationRoot(
+      activationRoot, recurse, publicHelperClosure, codexExecutable,
+    )
     return {
       auditedPaths: audited.paths || 1,
       mechanism: audited.mechanism || established.mechanism,
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof ProviderUnsupportedError) throw error
     unsupported('activation-private-permissions-unavailable')
   }
 }
@@ -1330,8 +1904,18 @@ function removeInactiveCodexProbeHelpers(activationRoot, executable, darwinRunti
   return removed
 }
 
-function auditActivationRoot(activationRoot, recurse = false) {
+function auditActivationRoot(activationRoot, recurse = false, publicHelperClosure = null,
+  codexExecutable = null) {
   try {
+    if (publicHelperClosure) {
+      verifyWindowsPublicHelperClosure(activationRoot, publicHelperClosure, codexExecutable)
+      const audited = auditWindowsCodexPublicHelperClosure(activationRoot, publicHelperClosure)
+      verifyWindowsPublicHelperClosure(activationRoot, publicHelperClosure, codexExecutable)
+      return audited
+    }
+    if (process.platform === 'darwin' && recurse) {
+      return auditDarwinCodexPrivateActivation(activationRoot)
+    }
     return safeRunRoot.auditPrivatePermissions(activationRoot, {
       recurse,
       // Native Codex writes its own installation identifier below its mutable
@@ -1343,12 +1927,98 @@ function auditActivationRoot(activationRoot, recurse = false) {
       ],
     })
   } catch (error) {
+    if (error instanceof ProviderUnsupportedError) throw error
     unsupported('activation-private-permissions-invalid', {
       file: error && error.details && error.details.path || activationRoot,
       expected: JSON.stringify(error && error.details && error.details.expected || 'owner-only'),
       actual: JSON.stringify(error && error.details && error.details.actual || error && error.code || 'unknown'),
     })
   }
+}
+
+function darwinPrivacyDetails(activationRoot, file, stat = null) {
+  let mode = 'unavailable'
+  try { mode = `0${Number((stat || fs.lstatSync(file, { bigint: true })).mode & 0o7777n).toString(8).padStart(3, '0')}` } catch {}
+  return { path: path.relative(activationRoot, file) || '.', mode }
+}
+
+function auditDarwinMaterializedHelper(activationRoot, file, binding, label) {
+  let initial
+  try { initial = fs.lstatSync(file, { bigint: true }) } catch {
+    unsupported('activation-private-permissions-invalid', { ...darwinPrivacyDetails(activationRoot, file), expected: '0500 regular file', actual: 'missing' })
+  }
+  if (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1n ||
+      (initial.mode & 0o7777n) !== 0o500n ||
+      (typeof process.getuid === 'function' && initial.uid !== BigInt(process.getuid()))) {
+    unsupported('activation-private-permissions-invalid', { ...darwinPrivacyDetails(activationRoot, file, initial), expected: '0500 regular file owned by current user', actual: label })
+  }
+  if (!binding || !/^[a-f0-9]{64}$/.test(binding.sha256 || '')) {
+    unsupported('activation-private-permissions-invalid', { ...darwinPrivacyDetails(activationRoot, file, initial), expected: 'authenticated helper binding', actual: label })
+  }
+  let bytes
+  try { bytes = readBoundedRegular(file, `${label}-darwin-helper`, 32 * 1024 * 1024) } catch {
+    unsupported('activation-private-permissions-invalid', { ...darwinPrivacyDetails(activationRoot, file, initial), expected: 'unchanged authenticated helper bytes', actual: label })
+  }
+  const after = fs.lstatSync(file, { bigint: true })
+  if (!after.isFile() || after.isSymbolicLink() || after.nlink !== 1n ||
+      !sameFileIdentity(initial, after) || initial.size !== after.size ||
+      initial.mtimeNs !== after.mtimeNs || initial.ctimeNs !== after.ctimeNs ||
+      (after.mode & 0o7777n) !== 0o500n ||
+      (typeof process.getuid === 'function' && after.uid !== BigInt(process.getuid())) ||
+      sha256(bytes) !== binding.sha256) {
+    unsupported('activation-private-permissions-invalid', { ...darwinPrivacyDetails(activationRoot, file, after), expected: 'unchanged authenticated helper bytes', actual: label })
+  }
+}
+
+function auditDarwinCodexPrivateActivation(activationRoot) {
+  let paths = 0
+  const allowedOwnerReadableFiles = [
+    path.join(activationRoot, 'installation_id'),
+    path.join(nativeCodexHomePath(activationRoot), 'installation_id'),
+  ]
+  const auditOne = file => {
+    try {
+      const result = safeRunRoot.auditPrivatePermissions(file, { recurse: false, allowedOwnerReadableFiles })
+      paths++
+      return result
+    } catch (error) {
+      let stat = null
+      try { stat = fs.lstatSync(file, { bigint: true }) } catch {}
+      unsupported('activation-private-permissions-invalid', { ...darwinPrivacyDetails(activationRoot, file, stat), expected: 'owner-only private entry', actual: error?.code || 'audit failed' })
+    }
+  }
+  const bindings = new Map()
+  const helperPath = file => {
+    const relative = path.relative(activationRoot, file).split(path.sep)
+    if (relative.length !== 3 || relative[0] !== 'local-conformance' ||
+        !/^process-control-[1-9][0-9]*$/.test(relative[1])) return null
+    const match = /^(coalition-helper|listener-supervisor)-([a-f0-9]{64})$/.exec(relative[2])
+    if (!match) return null
+    const key = match[1]
+    if (!bindings.has(key)) bindings.set(key, key === 'coalition-helper'
+      ? require('../agents/codex/workflow/darwin-coalition-loader.js').loadDarwinCoalitionHelper()
+      : require('../agents/codex/workflow/darwin-listener-loader.js').loadDarwinListenerSupervisor())
+    const binding = bindings.get(key)
+    if (binding.sha256 !== match[2]) unsupported('activation-private-permissions-invalid', { ...darwinPrivacyDetails(activationRoot, file), expected: `${key}-${binding.sha256}`, actual: relative[2] })
+    return { binding, label: key }
+  }
+  const walk = directory => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name)
+      const helper = !entry.isDirectory() && !entry.isSymbolicLink() ? helperPath(file) : null
+      if (helper) {
+        auditDarwinMaterializedHelper(activationRoot, file, helper.binding, helper.label)
+        paths++
+      }
+      else {
+        auditOne(file)
+        if (entry.isDirectory() && !entry.isSymbolicLink()) walk(file)
+      }
+    }
+  }
+  auditOne(activationRoot)
+  walk(activationRoot)
+  return { paths, mechanism: 'posix-mode' }
 }
 
 function targetIdentity(target) {
@@ -1815,6 +2485,9 @@ function projectSkillFiles(target) {
 function renderActivationConfig(skillPath, disabledSkills) {
   const lines = [
     '# Autoprompt v2 activation root. Ambient configuration is intentionally absent.',
+    ...(process.platform === 'win32'
+      ? ['', '[windows]', 'sandbox = "elevated"', '']
+      : []),
     '[[skills.config]]',
     `path = ${tomlString(skillPath)}`,
     'enabled = true',
@@ -1920,6 +2593,11 @@ function renderSecurityProfile(environment, sandboxMode = 'workspace-write') {
     '',
     ...(sandboxMode === 'workspace-write'
       ? ['[sandbox_workspace_write]', 'network_access = false', '']
+      : []),
+    // --profile replaces the base config rather than inheriting its Windows
+    // backend. Bind the elevated backend into each selected sealed profile.
+    ...(process.platform === 'win32'
+      ? ['[windows]', 'sandbox = "elevated"', '']
       : []),
     '[shell_environment_policy]',
     'inherit = "core"',
@@ -2137,9 +2815,58 @@ function rewriteSupervisorEntrypoints(skillRoot) {
   }
 }
 
+function windowsPreflightContext(activationId, activationRoot, sandboxIdentity) {
+  return { activationId, activationRoot, sandboxIdentity }
+}
+
+function runWindowsPreflightSync(context, operation, spec = null) {
+  const directory = ensurePrivateDirectory(context.activationRoot, path.join(context.activationRoot, 'windows-preflight'), true)
+  safeRunRoot.ensureWindowsPrivateAcl(directory)
+  const inputPath = path.join(directory, `request-${crypto.randomBytes(12).toString('hex')}.json`)
+  const input = { operation, activationId: context.activationId, activationRoot: context.activationRoot,
+    registryPath: path.join(directory, 'registry.json'), controlRoot: path.join(directory, 'control'),
+    immutableReadFiles: [{ path: context.sandboxIdentity.setupState.users.path, sha256: context.sandboxIdentity.setupState.users.sha256 }],
+    timeoutMs: 60000, spec, supervisor: operation === 'drain' ? context.supervisor || null : null }
+  writePrivateFileExclusive(inputPath, Buffer.from(JSON.stringify(input), 'utf8'))
+  try {
+    const result = childProcess.spawnSync(process.execPath, [path.join(PACKAGE_ROOT, 'agents/codex/workflow/windows-codex-preflight.js'), inputPath], {
+      env: safeRunRoot.windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR), encoding: 'utf8', shell: false,
+      timeout: 180000, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+    })
+    let receipt
+    try { receipt = JSON.parse(result.stdout) } catch {}
+    if (!receipt || receipt.schemaVersion !== 1 || receipt.activationId !== context.activationId ||
+        receipt.drain?.drained !== true || receipt.drain.registryPath !== input.registryPath || receipt.drain.controlRoot !== input.controlRoot) {
+      const diagnostic = { operation, status: result.status, signal: result.signal, error: result.error?.code || null,
+        helperStderr: String(result.stderr || '').slice(0, 8192), helperStdoutBytes: Buffer.byteLength(String(result.stdout || '')) }
+      if (operation === 'run') {
+        try { runWindowsPreflightSync(context, 'drain') } catch (recoveryError) {
+          unsupported('codex-windows-preflight-drain-unproven', { actual: JSON.stringify({ ...diagnostic, recovery: recoveryError.message }) })
+        }
+      }
+      unsupported('codex-windows-preflight-drain-unproven', { actual: JSON.stringify(diagnostic) })
+    }
+    if (result.error || result.signal || result.status !== 0 || receipt.error) {
+      unsupported('codex-windows-preflight-failed', { actual: JSON.stringify({ operation, status: result.status,
+        signal: result.signal, error: result.error?.code || null,
+        helperError: receipt.error ? { code: receipt.error.code, message: String(receipt.error.message || '').slice(0, 4096) } : null,
+        helperStderr: String(result.stderr || '').slice(0, 8192) }) })
+    }
+    return operation === 'drain' ? { schemaVersion: 1, activationId: context.activationId, preflight: receipt.drain, supervisor: receipt.supervisor || [], localConformance: receipt.localConformance || [] } : receipt.result
+  } finally { try { fs.unlinkSync(inputPath) } catch {} }
+}
+
+function codexPreflightSpawn(options) {
+  const fallback = options.spawnSync || childProcess.spawnSync
+  if (process.platform !== 'win32' || !options.windowsPreflight) return fallback
+  return (executable, argv, settings) => runWindowsPreflightSync(options.windowsPreflight, 'run', {
+    executable, argv, cwd: settings.cwd, env: settings.env,
+  })
+}
+
 function probeCodexLauncher(options) {
   const executable = options.codexRuntime?.executable || 'codex'
-  const result = (options.spawnSync || childProcess.spawnSync)(executable, ['--help'], {
+  const result = codexPreflightSpawn(options)(executable, ['--help'], {
     cwd: options.target, env: options.env, encoding: 'utf8', shell: false,
   })
   if (result.error && result.error.code === 'ENOENT') unsupported('codex-cli-missing')
@@ -2170,6 +2897,11 @@ function activationChildEnvironment(baseEnvironment, activationRoot, target, bou
   const nativeHome = ensurePrivateDirectory(
     activationRoot, nativeCodexHomePath(activationRoot), true,
   )
+  // Codex enumerates USERPROFILE children as sandbox read roots. Its
+  // controller CODEX_HOME contains private credentials and configuration.
+  const windowsUserProfile = process.platform === 'win32'
+    ? ensurePrivateDirectory(activationRoot, path.join(activationRoot, 'u'), true)
+    : nativeHome
   const candidate = {
     ...baseEnvironment,
     APPDATA: boundary.appData,
@@ -2178,7 +2910,7 @@ function activationChildEnvironment(baseEnvironment, activationRoot, target, bou
     GH_PROMPT_DISABLED: '1',
     HOME: nativeHome,
     LOCALAPPDATA: boundary.localAppData,
-    USERPROFILE: nativeHome,
+    USERPROFILE: windowsUserProfile,
     XDG_CONFIG_HOME: boundary.xdgConfigHome,
     ...pointers,
   }
@@ -2316,6 +3048,12 @@ function probeCodexCommandNetwork(options, spawn) {
         endpoint.port < 1 || endpoint.port > 65535) unsupported('codex-network-probe-listener-invalid')
     const clientScript = [
       'const fs=require("node:fs"),net=require("node:net")',
+      ...(process.platform === 'win32' ? [
+        'const cp=require("node:child_process")',
+        `const whoami=${JSON.stringify(path.win32.join(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows', 'System32', 'whoami.exe'))}`,
+        'let account="unknown",sid=null,identityStatus=null,identityError=null;try{const identity=cp.spawnSync(whoami,["/user","/fo","csv","/nh"],{encoding:"utf8",timeout:2000,windowsHide:true,maxBuffer:16384});identityStatus=identity.status;identityError=identity.error?.code||null;if(identity.status===0){const text=String(identity.stdout).toLowerCase();sid=String(identity.stdout).match(/S-1-5-(?:[0-9]+-)*[0-9]+/)?.[0]||null;account=text.includes("codexsandboxoffline")?"offline":text.includes("codexsandboxonline")?"online":"other"}}catch{}',
+        'process.stdout.write("AUTOPROMPT_NETWORK_IDENTITY="+JSON.stringify({account,sid,identityStatus,identityError})+"\\n")',
+      ] : []),
       'const [port,address,token,result]=process.argv.slice(1)',
       'let finished=false',
       'function finish(value,status,output=""){',
@@ -2336,7 +3074,7 @@ function probeCodexCommandNetwork(options, spawn) {
       '})',
       'setTimeout(()=>finish("TIMEOUT",7),3000)',
     ].join(';')
-    const baseline = spawn(process.execPath, [
+    const baseline = (options.spawnSync || childProcess.spawnSync)(process.execPath, [
       '-e', clientScript, String(endpoint.port), address, baselineToken, baselineResultPath,
     ], {
       cwd: options.target,
@@ -2374,7 +3112,20 @@ function probeCodexCommandNetwork(options, spawn) {
     try { sandboxResult = readRegularBound(sandboxResultPath, 'codex-network-sandbox-result').toString('utf8') } catch {}
     if (waitForProbeToken(evidencePath, sandboxToken, 250) || result?.status === 9 ||
         sandboxResult === 'OPEN' || output.includes('AUTOPROMPT_NETWORK_OPEN')) {
-      unsupported('codex-command-sandbox-network-open')
+      const marker = /^AUTOPROMPT_NETWORK_IDENTITY=(.+)$/m.exec(String(result?.stdout || ''))
+      let identity = null
+      try {
+        const parsed = JSON.parse(marker?.[1] || 'null')
+        if (parsed && ['offline', 'online', 'other', 'unknown'].includes(parsed.account) &&
+            (parsed.sid === null || /^S-1-5-(?:[0-9]+-)*[0-9]+$/.test(parsed.sid))) {
+          identity = { account: parsed.account, sid: parsed.sid,
+            status: Number.isInteger(parsed.identityStatus) ? parsed.identityStatus : null,
+            error: /^[A-Z0-9_]{1,40}$/.test(parsed.identityError || '') ? parsed.identityError : null }
+        }
+      } catch {}
+      unsupported('codex-command-sandbox-network-open', {
+        actual: JSON.stringify({ status: result?.status ?? null, identity }),
+      })
     }
     if (!result || result.error || result.status !== 0 ||
         sandboxResult !== 'DENIED') {
@@ -2399,7 +3150,7 @@ function probeCodexCommandNetwork(options, spawn) {
 }
 
 function probeCodexProfile(options) {
-  const spawn = options.spawnSync || childProcess.spawnSync
+  const spawn = codexPreflightSpawn(options)
   const missingSchema = path.join(
     options.env.CODEX_HOME,
     `.strict-config-probe-${process.pid}-${crypto.randomBytes(8).toString('hex')}.schema.json`,
@@ -3115,11 +3866,30 @@ function resolveActivationRecord(root, activationId, options = {}) {
     boundary?.supervisorAdapter,
     boundary?.payloadManifest,
   ]
-  if (process.platform === 'win32') boundaryPaths.push(boundary?.sandboxIdentity?.path)
+  if (process.platform === 'win32') boundaryPaths.push(
+    boundary?.sandboxIdentity?.path,
+    boundary?.sandboxIdentity?.setupState?.marker?.path,
+    boundary?.sandboxIdentity?.setupState?.users?.path,
+    boundary?.sandboxIdentity?.publicHelperClosure?.directory?.path,
+    boundary?.sandboxIdentity?.publicHelperClosure?.file?.path,
+  )
   const sandboxIdentityValid = process.platform === 'win32'
     ? boundary?.sandboxIdentity?.kind === 'windows-cap-sid-v1' &&
       /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.sha256 || '') &&
-      /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.sourceSha256 || '')
+      /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.sourceSha256 || '') &&
+      boundary.sandboxIdentity.setupState?.kind === 'windows-elevated-sandbox-state-v1' &&
+      /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.setupState.marker?.sha256 || '') &&
+      /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.setupState.marker?.sourceSha256 || '') &&
+      typeof boundary.sandboxIdentity.setupState.marker?.identity?.device === 'string' &&
+      typeof boundary.sandboxIdentity.setupState.marker?.identity?.inode === 'string' &&
+      /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.setupState.users?.sha256 || '') &&
+      /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.setupState.users?.sourceSha256 || '') &&
+      typeof boundary.sandboxIdentity.setupState.users?.identity?.device === 'string' &&
+      typeof boundary.sandboxIdentity.setupState.users?.identity?.inode === 'string' &&
+      boundary.sandboxIdentity.publicHelperClosure?.kind ===
+        'windows-codex-public-helper-v1' &&
+      /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.publicHelperClosure?.file?.sha256 || '') &&
+      /^[a-f0-9]{64}$/.test(boundary.sandboxIdentity.publicHelperClosure?.source?.sha256 || '')
     : boundary?.sandboxIdentity === null
   const boundaryValid = boundaryPaths.every(candidate => typeof candidate === 'string' &&
     path.isAbsolute(candidate) && isWithin(activationRoot, path.resolve(candidate))) &&
@@ -3221,7 +3991,9 @@ function resolveActivationRecord(root, activationId, options = {}) {
     fail('activation record binding is invalid')
   }
   verifyActivationPayload(activationRoot)
-  verifyWindowsSandboxIdentity(activationRoot, boundary.sandboxIdentity || null)
+  verifyWindowsSandboxIdentity(
+    activationRoot, boundary.sandboxIdentity || null, boundary.codexExecutable || null, { allowReleased: true },
+  )
   if (record.modelSelection.registry) {
     assertRegularUnlinked(record.modelSelection.registry.path, 'activation-model-registry')
     if (sha256(fs.readFileSync(record.modelSelection.registry.path)) !==
@@ -3258,7 +4030,10 @@ function resolveActivationRecord(root, activationId, options = {}) {
   if (fs.readdirSync(boundary.ghConfigDir).length !== 0) {
     fail('activation GitHub config is not empty')
   }
-  auditActivationRoot(activationRoot, true)
+  auditActivationRoot(
+    activationRoot, true, boundary.sandboxIdentity?.publicHelperClosure || null,
+    boundary.codexExecutable || null,
+  )
   verifyProviderAttestation(record, { env: options.env })
   validateSupervisorRuntimeReceipt(activationRoot, record)
   return { activationRoot, record, recordPath }
@@ -3591,6 +4366,7 @@ function providerApiBaseUrl(environment) {
 }
 
 function prepareActivation(options = {}) {
+  assertWindowsAdministrator()
   if (options.compatibilityAlias === true) {
     unsupported('compatibility-alias-telemetry-path-unregistered')
   }
@@ -3625,6 +4401,7 @@ function prepareActivation(options = {}) {
   let launcherHelp
   let freshActivation = false
   let resumeRollback = null
+  let windowsOwnedContext = null
   if (options.resume) {
     const resolved = resolveActivationRecord(root, options.resume, { env })
     activationId = options.resume
@@ -3677,15 +4454,33 @@ function prepareActivation(options = {}) {
     const initialPrivacy = protectActivationRoot(activationRoot)
     const boundary = createPrivateBoundary(activationRoot)
     const sandboxIdentity = options.resume
-      ? verifyWindowsSandboxIdentity(activationRoot, record.activationBoundary?.sandboxIdentity || null)
+      ? verifyWindowsSandboxIdentity(activationRoot,
+          record.activationBoundary?.sandboxIdentity || null,
+          record.activationBoundary?.codexExecutable || null)
       : installWindowsSandboxIdentity(root, activationRoot)
+    if (process.platform === 'win32') {
+      const leaseModule = require('../agents/codex/workflow/windows-codex-network-lease.js')
+      windowsOwnedContext = windowsPreflightContext(activationId, activationRoot, sandboxIdentity)
+      const leaseOptions = { activationId, activationRoot, codexHome: nativeCodexHomePath(activationRoot), targetPath: target.realpath,
+        controllerEnv: { ...safeRunRoot.windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR), USERNAME: os.userInfo().username } }
+      if (options.resume) {
+        if (!sandboxIdentity.networkLease) unsupported('codex-windows-network-lease-missing')
+        leaseModule.verifyWindowsCodexNetworkLease({ ...leaseOptions, lease: sandboxIdentity.networkLease })
+      } else {
+        sandboxIdentity.networkLease = leaseModule.ensureWindowsCodexNetworkLease(leaseOptions)
+        const usersPath = sandboxIdentity.setupState.users.path
+        sandboxIdentity.setupState.users.sha256 = sha256(readRegularBound(usersPath, 'codex-windows-sandbox-users'))
+        sandboxIdentity.setupState.users.identity = windowsSandboxStateFileIdentity(usersPath)
+      }
+      verifyWindowsSandboxIdentity(activationRoot, sandboxIdentity, codexExecutable)
+    }
     const initialBoundaryEnvironment = activationChildEnvironment(env, activationRoot, target, boundary)
     const codexRuntime = canonicalTrust.codexRuntime
     const boundaryEnvironment = withCodexManagedEnvironment(
       initialBoundaryEnvironment, codexRuntime,
     )
     launcherHelp = spawnWithPrivateActivationUmask(() => probeCodexLauncher({
-      ...options, codexRuntime, env: boundaryEnvironment, target: target.realpath,
+      ...options, codexRuntime, env: boundaryEnvironment, target: target.realpath, windowsPreflight: windowsPreflightContext(activationId, activationRoot, sandboxIdentity),
     }))
     if (options.resume) {
       const manifestPath = path.join(activationRoot, ACTIVATION_PAYLOAD_MANIFEST)
@@ -3840,12 +4635,17 @@ function prepareActivation(options = {}) {
       ? withCodexManagedEnvironment(rawProbeEnvironment, codexRuntime)
       : rawProbeEnvironment
     const profileProbe = spawnWithPrivateActivationUmask(() => probeCodexProfile({
-      ...options, codexRuntime, env: probeEnvironment, target: target.realpath,
+      ...options, codexRuntime, env: probeEnvironment, target: target.realpath, windowsPreflight: windowsPreflightContext(activationId, activationRoot, sandboxIdentity),
       profilePath, profileSha256,
     }))
     removeInactiveCodexProbeHelpers(
       nativeCodexHomePath(activationRoot), codexRuntime.executable, record.darwinRuntimeClosure,
     )
+    if (process.platform === 'win32') {
+      sandboxIdentity.publicHelperClosure = inspectWindowsPublicHelperClosure(
+        activationRoot, codexExecutable,
+      )
+    }
     if (process.platform === 'win32') {
       const identityBytes = readRegularBound(
         sandboxIdentity.path, 'codex-windows-sandbox-identity',
@@ -3856,6 +4656,9 @@ function prepareActivation(options = {}) {
         unsupported('codex-windows-sandbox-identity-drift')
       }
       record.activationBoundary.sandboxIdentity.sha256 = identitySha256
+      verifyWindowsSandboxIdentity(
+        activationRoot, record.activationBoundary.sandboxIdentity, codexExecutable,
+      )
     }
     record.providerProbe = {
       schemaVersion: 1,
@@ -3894,7 +4697,9 @@ function prepareActivation(options = {}) {
         : 'unproven',
     modelApiTransport: 'codex-service-outside-command-sandbox',
     }
-    const finalPrivacy = protectActivationRoot(activationRoot, true)
+    const finalPrivacy = protectActivationRoot(
+      activationRoot, true, sandboxIdentity?.publicHelperClosure || null, codexExecutable,
+    )
     record.activationBoundary.privatePermissions = {
       auditedAt: now.toISOString(),
       auditedPaths: finalPrivacy.auditedPaths,
@@ -3929,7 +4734,9 @@ function prepareActivation(options = {}) {
       resumeActivationId,
     }
     writeJsonPrivate(recordPath, record)
-    protectActivationRoot(activationRoot, true)
+    protectActivationRoot(
+      activationRoot, true, sandboxIdentity?.publicHelperClosure || null, codexExecutable,
+    )
     resumeRollback = null
     return {
       activationId, activationRoot, boundary, probeEnvironment, record, recordPath,
@@ -3956,7 +4763,22 @@ function prepareActivation(options = {}) {
         fail(`activation resume failed and rollback failed: ${rollbackError.message}`)
       }
     }
-    if (freshActivation && activationRoot && fs.existsSync(activationRoot)) {
+    let windowsCleanupConfirmed = process.platform !== 'win32' || !windowsOwnedContext
+    if (freshActivation && windowsOwnedContext) {
+      try {
+        const leaseOptions = { activationId, activationRoot, codexHome: nativeCodexHomePath(activationRoot), targetPath: target.realpath, controllerEnv: safeRunRoot.windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR) }
+        const lease = windowsOwnedContext.sandboxIdentity.networkLease || require('../agents/codex/workflow/windows-codex-network-lease.js').readWindowsCodexNetworkLease(leaseOptions)
+        if (lease) require('../agents/codex/workflow/windows-codex-network-lease.js').cleanupWindowsCodexNetworkLease({
+          activationId, activationRoot, codexHome: nativeCodexHomePath(activationRoot), targetPath: target.realpath,
+          controllerEnv: safeRunRoot.windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR), lease, permanent: true,
+          verifyDrain: () => runWindowsPreflightSync(windowsOwnedContext, 'drain'),
+        })
+        windowsCleanupConfirmed = true
+      } catch (cleanupError) {
+        error.message += `; Windows account/network cleanup unconfirmed; recovery authority retained at ${activationRoot}: ${cleanupError.code || cleanupError.message}`
+      }
+    }
+    if (freshActivation && activationRoot && fs.existsSync(activationRoot) && windowsCleanupConfirmed) {
       const activationParent = path.join(root, ACTIVATION_DIRECTORY)
       if (path.dirname(activationRoot) === activationParent && isWithin(activationParent, activationRoot)) {
         fs.rmSync(activationRoot, { recursive: true, force: true })
@@ -4292,6 +5114,19 @@ function revokeAllActivations(options = {}) {
         revokeActivation(resolved.recordPath, resolved.record, options.reason || 'provider-uninstalled')
         revoked += 1
       }
+      const identity = resolved.record.activationBoundary?.sandboxIdentity
+      if (process.platform === 'win32' && identity?.networkLease) {
+        const context = windowsPreflightContext(resolved.record.activationId, resolved.activationRoot, identity)
+        if (resolved.record.supervisorRuntime) context.supervisor = {
+          runPath: resolved.record.supervisorRuntime.runPath, generation: resolved.record.capability.generation,
+        }
+        require('../agents/codex/workflow/windows-codex-network-lease.js').cleanupWindowsCodexNetworkLease({
+          activationId: resolved.record.activationId, activationRoot: resolved.activationRoot,
+          codexHome: nativeCodexHomePath(resolved.activationRoot), targetPath: resolved.record.target.realpath,
+          controllerEnv: safeRunRoot.windowsControllerEnvironment(process.env.SystemRoot || process.env.WINDIR),
+          lease: identity.networkLease, permanent: true, verifyDrain: () => runWindowsPreflightSync(context, 'drain'),
+        })
+      }
     } catch (error) {
       malformed.push({ activationId: entry.name, error: String(error.message || error) })
     }
@@ -4385,7 +5220,9 @@ function configureCodex(options = {}) {
     desired.set(profilePath, fs.readFileSync(stageProfile))
     const nextHashes = { ...hashes }
     for (const [file, bytes] of desired) nextHashes[hashKeys.get(comparable(file))] = sha256(bytes)
-    desired.set(hashesPath, Buffer.from(`${JSON.stringify(nextHashes, null, 2)}\n`))
+    // Match the canonical ownership document emitted by both installers. The
+    // PowerShell reader deliberately rejects alternate indentation on reinstall.
+    desired.set(hashesPath, Buffer.from(`${JSON.stringify(nextHashes, null, 4)}\n`))
     const unchanged = [...desired].every(([file, bytes]) => originals.get(file).equals(bytes))
     if (unchanged) return { status: 'unchanged', selector: selection.selector, models: selection.models, agents: agentPaths.length }
       const committed = []
@@ -4542,6 +5379,7 @@ module.exports = {
   run,
   runMaintenance,
   stableJsonV1,
+  validateOwnedProcessConformanceEvidence,
   verifyProviderAttestation,
   validateRuntimeRoleProjection,
   verifyWindowsSandboxIdentity,
