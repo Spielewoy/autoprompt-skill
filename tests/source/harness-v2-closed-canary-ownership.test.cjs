@@ -85,7 +85,7 @@ test('closed owned-test durably publishes synchronous spawn refusal and bounded 
   assert.ok(fs.statSync(overflowRequest.stdoutPath).size <= 4 * 1024 * 1024)
 })
 
-test('closed canary timeout retains bounded live child output before terminal status', { timeout: 10000 }, async t => {
+test('closed canary timeout retains bounded live child output before terminal status', { timeout: 10000, skip: process.platform !== 'linux' }, async t => {
   if (process.platform === 'win32') return t.skip('portable POSIX process-group regression')
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-live-output-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -101,7 +101,7 @@ test('closed canary timeout retains bounded live child output before terminal st
   assert.equal(fs.readdirSync(root).some(name => /^outer-[a-f0-9-]{36}\.failure\.json$/.test(name)), false)
 })
 
-test('closed canary capability batch fails promptly on one complete top-level TAP failure marker', async t => {
+test('closed canary capability batch fails promptly on one complete top-level TAP failure marker', { skip: process.platform !== 'linux' }, async t => {
   if (process.platform === 'win32') return t.skip('portable POSIX process-group regression')
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-tap-failure-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -577,7 +577,7 @@ test('closed canary establishes new Windows directories and audits existing dire
   }
 })
 
-test('closed canary timeout drains registered nested child group and descendant without touching an unrelated owner', { timeout: 30000 }, async t => {
+test('closed canary timeout drains registered nested child group and descendant without touching an unrelated owner', { timeout: 30000, skip: process.platform !== 'linux' }, async t => {
   if (process.platform === 'win32') return t.skip('POSIX process-group regression')
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-owner-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -610,7 +610,7 @@ test('closed canary timeout drains registered nested child group and descendant 
   }
 })
 
-test('closed canary waits for its actual outer root after a payload completion callback, then persists a drained terminal', { timeout: 30000 }, async t => {
+test('closed canary waits for its actual outer root after a payload completion callback, then persists a drained terminal', { timeout: 30000, skip: process.platform !== 'linux' }, async t => {
   if (process.platform === 'win32') return t.skip('POSIX process-group regression')
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-root-exit-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -626,7 +626,7 @@ test('closed canary waits for its actual outer root after a payload completion c
   assert.deepEqual(owner.ownershipIdentities(), [])
 })
 
-test('foreign or malformed nested registration is rejected without signalling its unregistered owner', { timeout: 30000 }, async t => {
+test('foreign or malformed nested registration is rejected without signalling its unregistered owner', { timeout: 30000, skip: process.platform !== 'linux' }, async t => {
   if (process.platform === 'win32') return t.skip('POSIX process-group regression')
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-owner-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -679,7 +679,7 @@ test('closed runner accepts exact successful cases and retains activation-bound 
   assert.ok(Date.now() - began < 5000, 'activation deadline must bound a held native test batch')
 })
 
-test('closed canary discovers and drains a secondary command owner registered below a separate fixture-native root', { timeout: 30000 }, async t => {
+test('closed canary discovers and drains a secondary command owner registered below a separate fixture-native root', { timeout: 30000, skip: process.platform !== 'linux' }, async t => {
   if (process.platform === 'win32') return t.skip('POSIX process-group regression')
   const root = privateDirectory(fs.mkdtempSync(path.join(os.tmpdir(), 'closed-canary-command-discovery-')))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

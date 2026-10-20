@@ -833,7 +833,7 @@ test('terminal finalization intent authority fails closed before named access wi
   assert.equal(namedPathInspections, 0)
 })
 
-test('descriptor-anchored terminal finalization intent publication survives a transient parent swap-back', t => {
+test('descriptor-anchored terminal finalization intent publication survives a transient parent swap-back', { skip: process.platform === 'darwin' }, t => {
   const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
     .find(candidate => fs.existsSync(candidate))
   if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
@@ -896,7 +896,7 @@ test('descriptor-anchored terminal finalization intent publication survives a tr
   assert.deepEqual(fs.readdirSync(foreignRuntimePath), [])
 })
 
-test('descriptor-anchored terminal finalization intent read ignores transient foreign swap-back bytes', t => {
+test('descriptor-anchored terminal finalization intent read ignores transient foreign swap-back bytes', { skip: process.platform === 'darwin' }, t => {
   const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
     .find(candidate => fs.existsSync(candidate))
   if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||

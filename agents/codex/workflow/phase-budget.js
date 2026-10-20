@@ -21564,6 +21564,27 @@ function nativeWindowsResourceFilesystem() {
   return windowsResourceFilesystem
 }
 
+// The Darwin capture backend is activation-scoped: its Python interpreter and
+// helper are bound by the verified runtime closure, so the shim is published
+// here by createDefaultRuntimeOptions rather than constructed lazily.
+let darwinResourceFilesystem = null
+function nativeDarwinResourceFilesystem() {
+  if (process.platform !== 'darwin') return null
+  return darwinResourceFilesystem && darwinResourceFilesystem.darwinCapture ? darwinResourceFilesystem : null
+}
+
+function nativePlatformResourceFilesystem() {
+  return nativeWindowsResourceFilesystem() || nativeDarwinResourceFilesystem()
+}
+
+function nativeResourceCapture(fsImpl) {
+  return fsImpl.windowsCapture || fsImpl.darwinCapture || null
+}
+
+function nativeResourceInspection(fsImpl) {
+  return fsImpl.windowsCapture || fsImpl.darwinMutations || null
+}
+
 function readStableExternalLocalFile(absolute, expectedStat = null) {
   const initial = expectedStat || externalLocalLstat(absolute)
   if (!initial || !initial.isFile() || initial.isSymbolicLink() ||
@@ -21633,7 +21654,7 @@ function readStableExternalLocalFile(absolute, expectedStat = null) {
 }
 
 function hashDirectoryState(directory, expectedRootStat = null) {
-  const nativeFs = nativeWindowsResourceFilesystem()
+  const nativeFs = nativePlatformResourceFilesystem()
   if (nativeFs) return hashDirectoryStateStrict(directory, nativeFs, expectedRootStat)
   let digest = crypto.createHash('sha256')
   const capturedEntries = new Map()
@@ -22046,17 +22067,19 @@ function renameExternalLocalTreeNoReplace(source, destination) {
 
 function externalLocalPhysicalState(absolute) {
   const resolved = path.resolve(absolute)
-  const nativeFs = nativeWindowsResourceFilesystem()
+  const nativeFs = nativePlatformResourceFilesystem()
   if (nativeFs) {
+    const capture = nativeResourceCapture(nativeFs), inspection = nativeResourceInspection(nativeFs)
+    if (!capture || !inspection) throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `native resource capture is unavailable: ${resolved}`)
     let inspected
-    try { inspected = nativeFs.windowsCapture.inspectOwnedTarget(resolved) } catch (error) {
+    try { inspected = inspection.inspectOwnedTarget(resolved) } catch (error) {
       if (error?.code === 'ENOENT') return Object.freeze({ path: resolved, hash: MISSING_RESOURCE_PREIMAGE_HASH, type: 'missing', mode: null })
       throw error
     }
     const type = inspected.targetIdentity.type
-    const captured = type === 'directory' ? nativeFs.windowsCapture.captureTree(resolved) : nativeFs.windowsCapture.captureFileBytes(resolved)
+    const captured = type === 'directory' ? capture.captureTree(resolved) : capture.captureFileBytes(resolved)
     const stat = captured.entries[0]?.stat
-    if (!stat || stat.dev !== inspected.targetIdentity.dev || stat.ino !== inspected.targetIdentity.ino) {
+    if (!stat || String(stat.dev) !== String(inspected.targetIdentity.dev) || String(stat.ino) !== String(inspected.targetIdentity.ino)) {
       throw new SupervisorIntegrationError('PREIMAGE_UNSAFE', `external local resource changed before native capture: ${resolved}`)
     }
     return Object.freeze({ path: resolved, hash: captured.hash, type, mode: stat.mode & 0o777 })
@@ -31277,6 +31300,7 @@ function createDefaultRuntimeOptions(input) {
     })
     return shim
   })()
+  if (process.platform === 'darwin' && runtimeFs.darwinCapture) darwinResourceFilesystem = runtimeFs
   const targetPath = activationRecord.target.realpath
   const generation = activationRecord.capability.generation
   const missionHash = hashText(activationRecord.request.canonicalJson)

@@ -552,7 +552,12 @@ class CleanupRegistry {
   }
 
   _removeOwnedDirectoryContents(descriptor, registeredPath) {
-    const anchor = directoryDescriptorAnchor(descriptor, this.fs)
+    // Darwin fdesc does not resolve `<fd>/child`; the registered path is the
+    // canonical component path already bound by _withCleanupTarget, and each
+    // child is rebound by lstat/open identity below.
+    const anchor = process.platform === 'darwin' && path.isAbsolute(registeredPath)
+      ? registeredPath
+      : directoryDescriptorAnchor(descriptor, this.fs)
     const names = this.fs.readdirSync(anchor).sort((left, right) => left.localeCompare(right))
     for (const name of names) {
       if (typeof name !== 'string' || !name || name === '.' || name === '..' || path.basename(name) !== name) {

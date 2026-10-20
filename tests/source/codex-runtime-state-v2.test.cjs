@@ -63,8 +63,15 @@ const {
 const { OwnedCodexProxyRunner, applyProductionRuntimeTransition } = require(path.join(WORKFLOW, 'phase-budget.js'))
 const TEST_CAPABILITIES = new WeakMap()
 
+// Darwin fdesc exposes a directory descriptor but cannot traverse
+// `<fd>/child`; production reaches these paths through the verified darwin
+// mutations authority. These tests exercise the POSIX descriptor anchor with
+// plain fs, so they only assert the Linux guarantee.
+const DARWIN_ANCHOR_TRAVERSAL_SKIP = process.platform === 'darwin'
+
 function temporary(t) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-runtime-v2-'))
+  // os.tmpdir() is /var/folders/... on macOS and /var is a symlink.
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-runtime-v2-')))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   return directory
 }
@@ -960,7 +967,7 @@ test('typed directory manifests use the execution tree digest for authorized mut
   assert.equal(mutationEvent.details.postimages[0].type, 'directory')
 })
 
-test('terminal binding rejects file and directory manifests after a parent-prefix link swap', t => {
+test('terminal binding rejects file and directory manifests after a parent-prefix link swap', { skip: DARWIN_ANCHOR_TRAVERSAL_SKIP }, t => {
   const root = temporary(t)
   const linkType = process.platform === 'win32' ? 'junction' : 'dir'
   const probeTarget = path.join(root, 'link-probe-target')
@@ -1779,7 +1786,7 @@ test('target lease conflicts touch no owner bytes and verified stale owners are 
 test('mission takeover distinguishes an exact live root from a reused PID by OS process epoch', (t) => {
   const currentProcessIdentity = processIdentityForPid(process.pid)
   assert.equal(typeof currentProcessIdentity, 'string')
-  assert.match(currentProcessIdentity, process.platform === 'win32' ? /^windows-process-v1:/ : /^posix-process-v1:/)
+  assert.match(currentProcessIdentity, process.platform === 'win32' ? /^windows-process-v1:/ : process.platform === 'darwin' ? /^darwin-process-v1:/ : /^posix-process-v1:/)
   const directory = temporary(t)
   const target = path.join(directory, 'target')
   fs.mkdirSync(target)
@@ -4181,7 +4188,7 @@ test('AP-RUN-032 process and cleanup registries bind activation generation and m
   }).load(), (error) => error.code === 'CLEANUP_CONTROL_BINDING_MISMATCH')
 })
 
-test('cleanup removes the registered physical target through its descriptor while a parent link swaps away and back', t => {
+test('cleanup removes the registered physical target through its descriptor while a parent link swaps away and back', { skip: DARWIN_ANCHOR_TRAVERSAL_SKIP }, t => {
   const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
     .find(candidate => fs.existsSync(candidate))
   if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
@@ -4238,7 +4245,7 @@ test('cleanup removes the registered physical target through its descriptor whil
   assert.equal(readChecksummedJson(registryPath).entries[0].status, 'CLEANED')
 })
 
-test('cleanup never recursively deletes a foreign basename replacement after the owned directory is opened', t => {
+test('cleanup never recursively deletes a foreign basename replacement after the owned directory is opened', { skip: DARWIN_ANCHOR_TRAVERSAL_SKIP }, t => {
   const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
     .find(candidate => fs.existsSync(candidate))
   if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
@@ -4710,7 +4717,7 @@ test('POSIX group liveness excludes unreaped zombies without hiding executable m
 })
 
 test('reopened POSIX ownership drains an exact reservation descendant that escapes with setsid', {
-  skip: process.platform === 'win32',
+  skip: process.platform !== 'linux',
   timeout: 30000,
 }, async (t) => {
   const directory = temporary(t)
@@ -4798,7 +4805,7 @@ test('reopened POSIX ownership drains an exact reservation descendant that escap
 })
 
 test('natural root exit drains only its escaped reservation descendant and preserves a legal sibling', {
-  skip: process.platform === 'win32',
+  skip: process.platform !== 'linux',
   timeout: 30000,
 }, async (t) => {
   const directory = temporary(t)
@@ -5757,7 +5764,7 @@ test('finalizer terminal record publication fails closed without an anchor befor
   assert.deepEqual(fs.readdirSync(foreignRuntimePath), [])
 })
 
-test('descriptor-anchored terminal publication survives a transient parent swap-back without foreign writes', t => {
+test('descriptor-anchored terminal publication survives a transient parent swap-back without foreign writes', { skip: DARWIN_ANCHOR_TRAVERSAL_SKIP }, t => {
   const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
     .find(candidate => fs.existsSync(candidate))
   if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||
@@ -5803,7 +5810,7 @@ test('descriptor-anchored terminal publication survives a transient parent swap-
   assert.deepEqual(fs.readdirSync(foreignRuntimePath), [])
 })
 
-test('descriptor-anchored terminal read ignores a transient parent swap-back to foreign bytes', t => {
+test('descriptor-anchored terminal read ignores a transient parent swap-back to foreign bytes', { skip: DARWIN_ANCHOR_TRAVERSAL_SKIP }, t => {
   const descriptorRoot = (process.platform === 'linux' ? ['/proc/self/fd'] : ['/dev/fd', '/proc/self/fd'])
     .find(candidate => fs.existsSync(candidate))
   if (!descriptorRoot || !Number.isInteger(fs.constants.O_DIRECTORY) ||

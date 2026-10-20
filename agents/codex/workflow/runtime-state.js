@@ -733,6 +733,15 @@ function closeStrictDirectoryLineage(authority, fsImpl) {
   }
 }
 
+// Darwin's fdesc exposes the directory descriptor itself but does not resolve
+// `<fd>/child`; Linux procfs does. Callers that already hold the canonical
+// component path use it there, and every component is still rebound by
+// lstat/open/fstat identity before the lineage is accepted.
+function lineageAnchor(item, fsImpl) {
+  if (process.platform === 'darwin' && typeof item.path === 'string' && path.isAbsolute(item.path)) return item.path
+  return directoryDescriptorAnchor(item.descriptor, fsImpl)
+}
+
 function openStrictDirectoryLineage(directory, fsImpl) {
   const resolved = path.resolve(directory)
   const root = path.parse(resolved).root
@@ -756,12 +765,13 @@ function openStrictDirectoryLineage(directory, fsImpl) {
     descriptors.push(Object.freeze({
       descriptor: rootDescriptor,
       name: root,
+      path: root,
       dev: String(openedRoot.dev),
       ino: String(openedRoot.ino),
     }))
     for (const part of parts) {
       const parent = descriptors.at(-1)
-      const nextPath = path.join(directoryDescriptorAnchor(parent.descriptor, fsImpl), part)
+      const nextPath = path.join(lineageAnchor(parent, fsImpl), part)
       const stat = fsImpl.lstatSync(nextPath)
       if (!stat.isDirectory() || stat.isSymbolicLink()) {
         fail('PREIMAGE_UNSAFE', `absolute manifest path traverses a linked or non-directory component: ${resolved}`)
@@ -775,6 +785,7 @@ function openStrictDirectoryLineage(directory, fsImpl) {
       descriptors.push(Object.freeze({
         descriptor,
         name: part,
+        path: nextPath,
         dev: String(opened.dev),
         ino: String(opened.ino),
       }))
@@ -830,7 +841,7 @@ function withStrictAnchoredManifestPath(absolute, fsImpl, operation) {
   const isRoot = resolved === root
   const authority = openStrictDirectoryLineage(isRoot ? root : path.dirname(resolved), fsImpl)
   try {
-    const parentAnchor = directoryDescriptorAnchor(authority.descriptors.at(-1).descriptor, fsImpl)
+    const parentAnchor = lineageAnchor(authority.descriptors.at(-1), fsImpl)
     const anchored = isRoot ? `${parentAnchor}${path.sep}.` : path.join(parentAnchor, path.basename(resolved))
     const verify = () => verifyStrictDirectoryLineage(authority, fsImpl)
     const parent = authority.descriptors.at(-1)
@@ -886,7 +897,7 @@ function hashDirectoryStateStrict(directory, fsImpl = fs, expectedRootStat = nul
     const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW
     let rootDescriptor
     const visit = (descriptor, relative, displayedPath, opened) => {
-      const anchor = directoryDescriptorAnchor(descriptor, fsImpl)
+      const anchor = lineageAnchor({ descriptor, path: displayedPath }, fsImpl)
       const entries = fsImpl.readdirSync(anchor, { withFileTypes: true })
         .sort((left, right) => left.name.localeCompare(right.name))
       for (const entry of entries) {
