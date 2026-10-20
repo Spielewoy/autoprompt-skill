@@ -72,6 +72,27 @@ function ledgerIdentity(ledgerPath, fsImpl) {
   return { path: comparable(resolved), identity: `${parent.identity}:new:${path.basename(resolved)}` }
 }
 
+function darwinProcessIdentity(pid) {
+  // Darwin has no /proc. ps reports the process start time to the second;
+  // combined with the pid it distinguishes a reused pid for the lifetime of a
+  // lease. LANG/LC_ALL are pinned so the spelling is stable across calls.
+  let output
+  try {
+    output = childProcess.execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8', env: { LANG: 'C', LC_ALL: 'C', PATH: '/usr/bin:/bin' },
+      timeout: 5000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'],
+    })
+  } catch {
+    try { process.kill(pid, 0) } catch (probeError) {
+      if (probeError && probeError.code === 'ESRCH') return null
+    }
+    return undefined
+  }
+  const started = output.trim()
+  if (!started) return null
+  return `darwin-process-v1:${pid}:${sha256(started)}`
+}
+
 function processIdentityForPid(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) fail('PROCESS_IDENTITY_INVALID', 'process identity requires a positive pid')
   if (process.platform === 'win32') {
@@ -101,6 +122,7 @@ function processIdentityForPid(pid) {
         typeof observed.path !== 'string' || !observed.path) return undefined
     return `windows-process-v1:${pid}:${observed.startTicks}:${sha256(comparable(observed.path))}`
   }
+  if (process.platform === 'darwin') return darwinProcessIdentity(pid)
   const procRoot = `/proc/${pid}`
   try {
     const stat = fs.readFileSync(path.join(procRoot, 'stat'), 'utf8')

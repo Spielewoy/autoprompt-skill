@@ -2,13 +2,14 @@
 'use strict'
 
 const assert = require('node:assert/strict')
+const childProcess = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
 
 const { sha256, stableStringify } = require('../../agents/codex/workflow/event-log.js')
-const { MissionLock } = require('../../agents/codex/workflow/mission-lock.js')
+const { MissionLock, processIdentityForPid } = require('../../agents/codex/workflow/mission-lock.js')
 
 const QUARANTINE_RETRY_LIMIT = 32
 
@@ -192,4 +193,15 @@ test('stale quarantine rejects a source-directory swap and retains recoverable e
   assert.equal(fs.readFileSync(path.join(quarantineLeasePath, 'attacker-source.txt'), 'utf8'),
     'different physical directory')
   assert.equal(fs.existsSync(context.description.leasePath), false)
+})
+
+test('Darwin process identity is stable for a live pid and null for a dead one', { skip: process.platform !== 'darwin' }, () => {
+  const first = processIdentityForPid(process.pid)
+  assert.match(first, /^darwin-process-v1:\d+:[a-f0-9]{64}$/)
+  assert.equal(processIdentityForPid(process.pid), first)
+
+  const dead = childProcess.spawnSync(process.execPath, ['-e', 'process.exit(0)'])
+  assert.ok(Number.isSafeInteger(dead.pid) && dead.pid > 0)
+  assert.equal(processIdentityForPid(dead.pid), null)
+  assert.throws(() => processIdentityForPid(0), error => error.code === 'PROCESS_IDENTITY_INVALID')
 })
