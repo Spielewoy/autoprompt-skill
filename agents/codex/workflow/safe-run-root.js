@@ -39,11 +39,14 @@ function pathIsInside(parent, child) {
 }
 
 function statIdentity(stats) {
+  // Directory nlink is filesystem-specific: APFS counts every entry, so
+  // creating an ordinary file inside a directory changes the value. Identity
+  // for replacement detection is dev+ino (see sameIdentity); callers that
+  // require a single hard link check stats.nlink directly.
   return {
     dev: String(stats.dev),
     ino: String(stats.ino),
     mode: Number(stats.mode),
-    nlink: Number(stats.nlink),
   }
 }
 

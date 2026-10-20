@@ -11,7 +11,9 @@ const root = path.resolve(__dirname, '..', '..')
 const safeRoot = require(path.join(root, 'agents', 'codex', 'workflow', 'safe-run-root.js'))
 
 function fixture(t) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-design-032-selection-'))
+  // os.tmpdir() is /var/folders/... on macOS; /var is a symlink, and the
+  // run-root contract rejects linked path components on every platform.
+  const directory = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'autoprompt-design-032-selection-')))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   return directory
 }
@@ -101,4 +103,20 @@ test('DESIGN-032 deterministically selects canonical sidecars for standalone arc
     nonGitFirst.rootPath,
     nonFilesystemFirst.rootPath,
   ]).size, 3, 'distinct canonical target identities must not share sidecar roots')
+})
+
+test('DESIGN-032 directory identity is stable when ordinary files are created inside it', t => {
+  // APFS increments a directory's nlink for every entry, Linux ext4 only for
+  // subdirectories. The closed canary creates its own stdout/stderr files in
+  // the parent it just bound, so nlink must not be part of the identity.
+  const directory = fixture(t)
+  const before = safeRoot.inspectPathNoFollow(directory)
+  fs.writeFileSync(path.join(directory, 'outer-stdout.log'), '')
+  fs.writeFileSync(path.join(directory, 'outer-stderr.log'), '')
+  const after = safeRoot.inspectPathNoFollow(directory)
+  assert.deepEqual(after.identity, before.identity)
+
+  fs.mkdirSync(path.join(directory, 'child'))
+  const withChild = safeRoot.inspectPathNoFollow(directory)
+  assert.deepEqual(withChild.identity, before.identity, 'subdirectory creation must not alter the bound identity either')
 })
