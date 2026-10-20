@@ -74,3 +74,17 @@ test('quota connection refuses unspecified upstreams and unreviewed protocols', 
   assert.throws(() => quotaConnection('prime', { model: 'm', modelProvider: 'p', providers: { p: { baseUrl: upstream, api: 'google-generative-ai', models: [{ id: 'm' }] } } }), { code: 'PROFILE_INVALID' })
   assert.throws(() => quotaConnection('opencode', { model: 'p/m', providers: { p: { options: { baseURL: upstream } } } }), { code: 'PROFILE_INVALID' })
 })
+
+test('quota OMP projection resolves a prefixed selection against a single-provider registry', () => {
+  const source = { providers: { owned: { baseUrl: 'https://unused.invalid', api: 'openai-completions',
+    models: [{ id: 'chosen', baseUrl: upstream, api: 'openai-responses' }] } } }
+  const projection = quotaConnection('omp', source, 'owned/chosen')
+  assert.equal(projection.protocol, 'responses')
+  assert.equal(projection.wireModel, 'chosen')
+  assert.equal(projection.upstreamBaseUrl, upstream)
+  const result = projection.project(relay)
+  assert.deepEqual(Object.keys(result.providers), ['owned'])
+  assert.equal(result.providers.owned.models.length, 1)
+  assert.equal(result.providers.owned.models[0].baseUrl, relay)
+  assert.equal(source.providers.owned.models[0].baseUrl, upstream)
+})

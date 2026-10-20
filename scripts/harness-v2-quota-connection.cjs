@@ -45,9 +45,12 @@ function quotaConnection(provider, source, selectedModel) {
     if (!wireModel) fail('Owned quota execution requires an explicit provider/model selection')
     replace = baseUrl => { selected.options.baseURL = baseUrl }
   } else if (['prime', 'omp'].includes(provider)) {
-    const providerId = connection.modelProvider, selected = connection.providers?.[providerId]
-    const definition = selected?.models?.find(value => value.id === model)
-    if (!definition) fail('Owned quota execution requires an explicit Pi model definition')
+    const { selectedModelDefinition } = require('./harness-v2-pi-config.cjs')
+    const selection = selectedModelDefinition(connection, model)
+    const providerId = selection.providerId, selected = connection.providers?.[providerId]
+    const definition = selection.definition
+    if (!selected || !definition) fail('Owned quota execution requires an explicit Pi model definition')
+    wireModel = definition.id
     upstreamBaseUrl = definition.baseUrl || selected.baseUrl
     protocol = { 'openai-completions': 'chat-completions', 'openai-responses': 'responses', 'anthropic-messages': 'anthropic-messages' }[definition.api || selected.api]
     connection.providers = { [providerId]: { ...selected, models: [definition] } }

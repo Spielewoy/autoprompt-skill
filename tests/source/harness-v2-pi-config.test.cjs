@@ -8,7 +8,7 @@ const test = require('node:test')
 const native = require('../../scripts/harness-v2-native.cjs')
 const boundary = require('../../scripts/harness-v2-tool-boundary.cjs')
 const { bindOpenAIResponseFormat } = require('../../scripts/harness-v2-bridge/pi/controller.cjs')
-const { canonicalWireProjection, outputCap, nativeConnectionProjection } = require('../../scripts/harness-v2-pi-config.cjs')
+const { canonicalWireProjection, outputCap, nativeConnectionProjection, readConnection } = require('../../scripts/harness-v2-pi-config.cjs')
 const { nativeOutcomeDescriptionProjection } = require('../../scripts/harness-v2-native-wire-projection.cjs')
 const { decodeNativeWireOutput } = require('../../scripts/harness-v2-transport.cjs')
 const { validateJsonSchema } = require('../../agents/codex/workflow/json-schema-validator.js')
@@ -202,4 +202,42 @@ test('Pi envelope composes with the checker description projection after inner d
   assert.equal(validateJsonSchema(outcomeSchema, canonical).valid, true)
   const conflicting = { ...inner, description: 'model-selected contradiction' }
   assert.throws(() => decodeNativeWireOutput({ canonicalJson: JSON.stringify(conflicting) }, envelope, outcome), { code: 'CHILD_RESULT_INVALID' })
+})
+
+test('OMP resolves an unambiguous single-provider registry without an ambient selection', t => {
+  const directory = root(t)
+  fs.writeFileSync(path.join(directory, 'models.yaml'), [
+    'providers:',
+    '  storoslop:',
+    '    baseUrl: https://upstream.invalid/v1',
+    '    api: openai-completions',
+    '    models:',
+    '      - id: deepseek-v4.1-flash',
+    '        maxTokens: 4096',
+    '',
+  ].join('\n'))
+  const connection = readConnection('omp', directory)
+  assert.equal(connection.modelProvider, 'storoslop')
+  assert.equal(connection.model, 'deepseek-v4.1-flash')
+  assert.equal(outputCap(connection, 'storoslop/deepseek-v4.1-flash', 8192).value, 4096)
+  assert.equal(outputCap(connection, 'deepseek-v4.1-flash', 8192).value, 4096)
+})
+
+test('OMP keeps a multi-provider registry unresolved without an explicit provider', t => {
+  const directory = root(t)
+  fs.writeFileSync(path.join(directory, 'models.yaml'), [
+    'providers:',
+    '  first:',
+    '    baseUrl: https://first.invalid/v1',
+    '    api: openai-completions',
+    '    models: [{ id: one }]',
+    '  second:',
+    '    baseUrl: https://second.invalid/v1',
+    '    api: openai-completions',
+    '    models: [{ id: two }]',
+    '',
+  ].join('\n'))
+  const connection = readConnection('omp', directory)
+  assert.equal(connection.modelProvider, undefined)
+  assert.equal(connection.model, undefined)
 })

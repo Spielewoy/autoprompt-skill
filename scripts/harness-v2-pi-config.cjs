@@ -125,13 +125,26 @@ function readConnection(provider, root) {
     try {
       const document = YAML.parseDocument(bytes.toString('utf8'), { uniqueKeys: true, version: '1.2', customTags: [] })
       if (document.errors.length || document.warnings.length) fail('Pi model registry contains invalid YAML, duplicate keys, or unsupported tags')
-      return sanitize(provider, document.toJS({ maxAliasCount: 32 }))
+      return normalizeConnection(provider, sanitize(provider, document.toJS({ maxAliasCount: 32 })))
     } catch (error) {
       if (error.code === 'PROFILE_INVALID') throw error
       fail(`Cannot parse Pi connection data: ${name}`)
     }
   }
-  return sanitize(provider)
+  return normalizeConnection(provider, sanitize(provider))
+}
+
+// A single-provider OMP registry has exactly one native default. Resolve it
+// here so quota routing and output-cap projection do not need an ambient
+// selection; multi-provider registries still require an explicit model.
+function normalizeConnection(provider, connection) {
+  if (provider !== 'omp' || connection.modelProvider) return connection
+  const ids = Object.keys(connection.providers || {})
+  if (ids.length !== 1) return connection
+  const providerId = ids[0]
+  const models = connection.providers[providerId].models || []
+  return { ...connection, modelProvider: providerId,
+    ...(!connection.model && models.length === 1 ? { model: models[0].id } : {}) }
 }
 function credentialNames(connection = {}) {
   return Object.values(connection.providers || {}).flatMap(provider =>
@@ -156,10 +169,21 @@ function canonicalWireProjection(canonicalSchema) {
   try { return canonicalJsonWireProjection(canonicalSchema, { provider: 'pi', label: 'Pi', version: 'pi-canonical-envelope-v1' }) }
   catch (error) { fail(error.message) }
 }
+function selectedModelDefinition(connection, model) {
+  const slash = typeof model === 'string' ? model.indexOf('/') : -1
+  const providerId = connection.modelProvider ||
+    (slash > 0 && connection.providers && Object.hasOwn(connection.providers, model.slice(0, slash))
+      ? model.slice(0, slash) : undefined)
+  const modelId = providerId && typeof model === 'string' && model.startsWith(`${providerId}/`)
+    ? model.slice(providerId.length + 1) : model
+  const definition = connection.providers?.[providerId]?.models?.find(value => value.id === modelId)
+  return { providerId, modelId, definition }
+}
+
 function outputCap(connection, model, maxTokens) {
   if (maxTokens === undefined) return null
   if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) fail('Invalid Pi controller output cap')
-  const selected = connection.providers?.[connection.modelProvider]?.models?.find(value => value.id === model)
+  const selected = selectedModelDefinition(connection, model).definition
   if (!selected) fail('Pi quota execution requires the exact selected model definition')
   const field = selected?.compat?.maxTokensField
   // A current native SDK may already select its own known output-cap spelling.
@@ -227,4 +251,4 @@ function project({ provider, home, sessionRoot, connection, toolBoundary, prompt
   return { argv, requiredResponseFormat: responseFormat, requiredOutputCap: cap }
 }
 
-module.exports = { sanitize, readConnection, credentialNames, requiredResponseFormat, canonicalWireProjection, outputCap, nativeConnectionProjection, project }
+module.exports = { sanitize, readConnection, normalizeConnection, credentialNames, requiredResponseFormat, canonicalWireProjection, selectedModelDefinition, outputCap, nativeConnectionProjection, project }
